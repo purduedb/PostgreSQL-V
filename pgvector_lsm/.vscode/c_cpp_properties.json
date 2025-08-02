@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/src/**",
+                "/home/liu4127/postgresql/postgresql-14.0/**",
+                "/usr/include/c++/11",
+                "/usr/lib/llvm-14/lib/clang/14.0.0/include",
+                "/usr/local/include",
+                "/usr/include/x86_64-linux-gnu/c++/11",
+                "/usr/include"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/clang",
+            "cStandard": "c17",
+            "cppStandard": "c++14",
+            "intelliSenseMode": "linux-clang-x64"
+        }
+    ],
+    "version": 4
+}
