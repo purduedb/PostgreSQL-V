@@ -1382,7 +1382,7 @@ recover_lsm_index(Relation index, LSMIndex lsm_index, VectorId start_vid)
                     // fetch the corresponding vector data
                     if (!table_tuple_fetch_row_version(heapRel, mt_pairs[i].hid, SnapshotAny, slot))
                     {
-                        // CLEAR_SLOT(mt->bitmap, slot_idx);
+                        CLEAR_SLOT(mt->bitmap, slot_idx);
                         elog(DEBUG1, "failed to fetch tuple for LSM index recovery due to the heap pruning, vid = %ld", mt_pairs[i].vid); 
                     }
                     
@@ -1551,11 +1551,22 @@ test_consistency(Relation heapRel, LSMIndex lsm_index, VectorId max_vid)
                     // check 1
                     if (!IS_SLOT_SET(bitmap_any, vid))
                     {
-                        // FIXME: for heap pruning
-                        // ItemPointerData tupleId = Int64ToItemPointer  
-                        // Buffer buffer = ReadBuffer(heapRel, )
-                        elog(DEBUG1, "[test_consistency] inconsistency state: a live vector in a flushed segment is not in the heap table, vid = %ld", vid);
-                        return false;
+                        // for heap pruning
+                        ItemPointerData tupleId = Int64ToItemPointer(seg_mapping[vid-lo_vid]);
+                        BlockNumber blkno = ItemPointerGetBlockNumber(&tupleId);
+                        OffsetNumber offnum = ItemPointerGetOffsetNumber(&tupleId);
+                        Buffer buffer = ReadBuffer(heapRel, blkno);
+                        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+                        Page page = BufferGetPage(buffer);
+                        ItemId itemId = PageGetItemId(page, offnum);
+                        if (!ItemIdIsUsed(itemId))
+                        {
+                            // The slot is unused
+                            elog(ERROR, "[test_consistency] inconsistency state: a dangling index entry is found, vid = %ld", vid);
+                            return false;
+                        }
+                        UnlockReleaseBuffer(buffer);
+                        elog(DEBUG1, "[test_consistency] table pruning is detected");
                     }
                     // check 2
                     if (bm_visible_vid != -1 && vid == bm_visible_vid)

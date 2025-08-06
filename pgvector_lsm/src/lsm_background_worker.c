@@ -162,7 +162,7 @@ void build_index_and_flush(Oid relId, LSMIndex lsm, ConcurrentMemTable sealed_mt
     case IVFFLAT:
     {
         int local_nlist = (int) sqrt(vector_count);
-        segment->index = FaissIvfflatBuildAllocate(lsm->dim, local_nlist, get_lsm_memtable_pointer(0, sealed_mt), sealed_mt->start_vid, sealed_mt->start_vid + vector_count - 1, vector_count, &(segment->indexSize), &index_seg);
+        segment->index = FaissIvfflatBuildAllocate(lsm->dim, local_nlist, get_lsm_memtable_pointer(0, sealed_mt), sealed_mt->bitmap, sealed_mt->start_vid, sealed_mt->start_vid + vector_count - 1, vector_count, &(segment->indexSize), &index_seg);
         segment->segment_index_cached_seg = NULL;
         elog(DEBUG1, "[build_index_and_flush] initialized the segment ivf index");
         break;
@@ -171,7 +171,7 @@ void build_index_and_flush(Oid relId, LSMIndex lsm, ConcurrentMemTable sealed_mt
     {
         int M = 32;
         int efC = 64;
-        segment->index = FaissHnswIndexBuildAllocate(lsm->dim, M, efC, get_lsm_memtable_pointer(0, sealed_mt), sealed_mt->start_vid, sealed_mt->start_vid + vector_count - 1, vector_count, &(segment->indexSize), &index_seg);
+        segment->index = FaissHnswIndexBuildAllocate(lsm->dim, M, efC, get_lsm_memtable_pointer(0, sealed_mt), sealed_mt->bitmap, sealed_mt->start_vid, sealed_mt->start_vid + vector_count - 1, vector_count, &(segment->indexSize), &index_seg);
         segment->segment_index_cached_seg = NULL;
         elog(DEBUG1, "[build_index_and_flush] initialized the segment hnsw index");
         break;

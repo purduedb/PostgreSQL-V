@@ -1192,7 +1192,8 @@ Our_InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, I
 	buildstate->hnswarea = NULL;
 
 	// Add for our hnsw index build phase
-	buildstate->vectors = VectorArrayInit(INDEX_BUILD_BATCH, buildstate->dimensions, buildstate->dimensions * sizeof(float4));
+	// TODO: avoid hardcoding vector size
+	buildstate->vectors = VectorArrayInit(INDEX_BUILD_BATCH, buildstate->dimensions, VECTOR_SIZE(buildstate->dimensions));
 
 	buildstate->lowest_vid = 0;
 	buildstate->tids = (int64_t *) palloc(sizeof(int64_t) * DEFAULT_TIDS_SIZE);

@@ -218,7 +218,7 @@ def main():
         print("Index creation done.\n")
     
     if not args.queries:
-        print("Error: --queries is required for --do-query")
+        print("Error: --queries is required")
         sys.exit(1)
     print(f"Reading query vectors from: {args.queries}")
     queries = read_fvecs(args.queries, args.nq)
@@ -246,13 +246,13 @@ def main():
         delete_vectors(conn, delete_ids)
         print("Deletion done.\n")
 
-        # # Vacuum the table
+        # Vacuum the table
         # vacuum_table(conn, "sift_vectors")
         
         # FIXME: for debugging
         if delete_time == 3:
             # time.sleep(5)
-            trigger_crash("/ssd_root/liu4127/postgresql_vec")
+            trigger_crash(args.data_dir)
         delete_time += 1
 
     # Closing connection at the end of testing
@@ -261,5 +261,5 @@ def main():
 if __name__ == "__main__":
     main()
 
-# python sift_crash_consistency.py   --file /ssd_root/liu4127/sift/sift_base.fvecs   --queries /ssd_root/liu4127/sift/sift_query.fvecs   --num 100000  --nq 1  --insert-batch 3000 --delete-batch 1000  --host localhost --port 5434 --user liu4127 --dbname postgres  --data-dir /ssd_root/liu4127/postgresql_vec  --trigger-crash
-# python sift_crash_consistency.py   --file /ssd_root/liu4127/sift/sift_base.fvecs   --queries /ssd_root/liu4127/sift/sift_query.fvecs   --num 100000  --nq 1  --insert-batch 3000 --delete-batch 1000  --host localhost --port 5434 --user liu4127 --dbname postgres  --data-dir /ssd_root/liu4127/postgresql_vec
+# python sift_crash_consistency.py   --file /ssd_root/dataset/sift/sift_base.fvecs   --queries /ssd_root/dataset/sift/sift_query.fvecs   --num 100000  --nq 1  --insert-batch 3000 --delete-batch 1000  --host localhost --port 5434 --user liu4127 --dbname postgres  --data-dir /ssd_root/liu4127/postgresql_vec  --trigger-crash
+# python sift_crash_consistency.py   --file /ssd_root/dataset/sift/sift_base.fvecs   --queries /ssd_root/dataset/sift/sift_query.fvecs   --num 100000  --nq 1  --insert-batch 3000 --delete-batch 1000  --host localhost --port 5434 --user liu4127 --dbname postgres  --data-dir /ssd_root/liu4127/postgresql_vec

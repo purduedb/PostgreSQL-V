@@ -2,6 +2,7 @@
 #include "utils/memutils.h"
 #include "storage/dsm.h"
 #include "utils/timestamp.h"
+#include "lsm_index_struct.h"
 
 #include <cassert>
 #include <cstdio>
@@ -31,7 +32,6 @@
 #include <iostream> 
 #include <omp.h>
 
-// FIXME: for debugging
 using namespace std;
 using namespace faiss;
 
@@ -208,10 +208,9 @@ deserializeIndex(const std::string &index_data)
   return index;
 }
 
-// TODO: in the current version, we still build index for vectors that are marked deleted in the bitmap
 // return the fully serialized faiss index
 extern "C" dsm_handle 
-FaissIvfflatBuildAllocate(int dim, int nlist, void *vectors, uint64_t lowest_vid, uint64_t highest_vid, 
+FaissIvfflatBuildAllocate(int dim, int nlist, void *vectors, void *bitmap, uint64_t lowest_vid, uint64_t highest_vid, 
                           int vector_num, size_t *index_size, dsm_segment **return_index_seg)
 {
     elog(DEBUG1, "enter FaissIvfflatBuildAllocate");
@@ -223,14 +222,17 @@ FaissIvfflatBuildAllocate(int dim, int nlist, void *vectors, uint64_t lowest_vid
     Assert(index->is_trained);
 
     idx_t* vids = new idx_t[vector_num];
+    uint8_t * vector_bitmap = reinterpret_cast<uint8_t*>(bitmap);
+    
     for (size_t i = 0; i < vector_num; i++)
     {
-        vids[i] = lowest_vid + i;
+        if (IS_SLOT_SET(vector_bitmap, i))
+        {
+            faiss::idx_t idx = lowest_vid + i;
+            index->add_with_ids(1, &faiss_vectors[dim * i], &idx);   
+        }
     }
-
-    index->add_with_ids(vector_num, faiss_vectors, vids);
     elog(DEBUG1, "[FaissIvfflatBuildAllocate] finish building index: ntotal = %ld", index->ntotal);
-    free(vids);
 
     // convert and return the serialized index
     std::string index_data = serializeIndex(dynamic_cast<faiss::Index *> (index));
@@ -392,7 +394,6 @@ FaissHnswIndexCreate(void* hnsw_index_ptr, int64_t lowest_vid, VectorArray vecto
         vids[i] = (idx_t)lowest_vid + i;
     }
 
-    // TODO: faiss_hnsw does not support add_with_ids currently
     map_index->add_with_ids(vectors->length, flat_data.data(), vids);
     // index->add(vectors->length, flat_data.data());
     elog(DEBUG1, "[FaissHnswIndexCreate] built the hnsw index, vectors->length = %d", vectors->length);
@@ -401,9 +402,8 @@ FaissHnswIndexCreate(void* hnsw_index_ptr, int64_t lowest_vid, VectorArray vecto
     return 0;
 }
 
-//FIXME:
 extern "C" dsm_handle 
-FaissHnswIndexBuildAllocate(int dim, int M, int efConstruction, void *vectors, uint64_t lowest_vid, uint64_t highest_vid, 
+FaissHnswIndexBuildAllocate(int dim, int M, int efConstruction, void *vectors, void *bitmap, uint64_t lowest_vid, uint64_t highest_vid, 
                             int vector_num, size_t *index_size, dsm_segment **return_index_seg)
 {
     elog(DEBUG1, "enter FaissHnswIndexBuildStore");
@@ -412,15 +412,18 @@ FaissHnswIndexBuildAllocate(int dim, int M, int efConstruction, void *vectors, u
     index->hnsw.efConstruction = efConstruction;
 
     float * faiss_vectors = reinterpret_cast<float*>(vectors);
-    idx_t* vids = new idx_t[vector_num];
+    uint8_t * vector_bitmap = reinterpret_cast<uint8_t*>(bitmap);
+    
     for (size_t i = 0; i < vector_num; i++)
     {
-        vids[i] = lowest_vid + i;
+        if (IS_SLOT_SET(vector_bitmap, i))
+        {
+            faiss::idx_t idx = lowest_vid + i;
+            index->add_with_ids(1, &faiss_vectors[dim * i], &idx);   
+        }
     }
-
-    index->add_with_ids(vector_num, faiss_vectors, vids);
+    
     elog(DEBUG1, "[FaissHnswIndexBuildStore] finish building index: ntotal = %ld", index->ntotal);
-    free(vids);
 
     std::string index_data = serializeIndex(dynamic_cast<faiss::Index *> (index));
     dsm_segment *index_seg = dsm_create(index_data.size(), 0);
