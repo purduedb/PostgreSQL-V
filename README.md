@@ -1,11 +1,6 @@
 # PostgreSQL-V
 **Open-Source Vector Similarity Search for PostgreSQL**
 
-## Note
-⚠️The `main` branch is currently under active development.  
-
-For an executable prototype, please switch to the [`cidr` branch](https://github.com/purduedb/PostgreSQL-V/tree/cidr), which contains the version used in our CIDR submission to validate the proposed design.
-
 ## Introduction
 
 **PostgreSQL-V** is a new integrated vector database system developed by **Purdue Database Group** that enables fast vector search in PostgreSQL. It achieves performance on par with specialized vector databases.
@@ -50,3 +45,8 @@ The following figure illustrates the high-level architecture of PostgreSQL-V.
 ![](figures/SIFT10M.png)
 **DEEP10M**
 ![](figures/DEEP10M.png)
+
+## Note
+⚠️The `main` branch is currently under active development.  
+
+For an executable prototype, please switch to the [`cidr` branch](https://github.com/purduedb/PostgreSQL-V/tree/cidr), which contains the version used in our CIDR submission to validate the proposed design.
