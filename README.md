@@ -15,9 +15,7 @@ Unlike prior systems (e.g., [pgvector](https://github.com/pgvector/pgvector)) th
 PostgreSQL-V is fully compatible with pgvector (by implementing the same APIs in IndexAmRoutine), making it a viable drop-in replacement.
 
 **Reference:**  
-Jiayi Liu, Yunan Zhang, Chenzhe Jin, Aditya Gupta, Shige Liu, and Jianguo Wang.  
-*Fast Vector Search in PostgreSQL: A Decoupled Approach.*  
-Conference on Innovative Data Systems Research (**CIDR**), 2026.
+Jiayi Liu, Yunan Zhang, Chenzhe Jin, Aditya Gupta, Shige Liu, and Jianguo Wang. *Fast Vector Search in PostgreSQL: A Decoupled Approach.* Conference on Innovative Data Systems Research (**CIDR**), 2026.
 
 ## Installation
 ### 1. Install PostgreSQL
