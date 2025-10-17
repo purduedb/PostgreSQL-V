@@ -1,0 +1,10 @@
+# Object files
+*.o
+*.obj
+
+# Executable files
+*.out
+*.exe
+
+# Editor/IDE settings
+.vscode/
