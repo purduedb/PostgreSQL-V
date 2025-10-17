@@ -356,7 +356,7 @@ allocate_new_memtable(LSMIndex lsm_index, VectorId start_vid, uint32 dim, uint32
 static void
 load_lsm_index(Relation index, uint32_t slot_num)
 {
-    Relation relId = index->rd_id;
+    Oid relId = index->rd_id;
     
     elog(DEBUG1, "enter load_lsm_index: relId = %d, slot_num = %d", relId, slot_num);
 
