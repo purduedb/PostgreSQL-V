@@ -50,3 +50,18 @@ The following figure illustrates the high-level architecture of PostgreSQL-V.
 ⚠️The `main` branch is currently under active development.  
 
 For an executable prototype, please switch to the [`cidr` branch](https://github.com/purduedb/PostgreSQL-V/tree/cidr), which contains the version used in our CIDR submission to validate the proposed design.
+
+## Citation
+If you find our system useful for your research, please cite the following paper:
+
+```
+@inproceedings{PostgreSQLV-CIDR26,
+  title={Fast Vector Search in PostgreSQL: A Decoupled Approach},
+  author={Jiayi Liu and Yunan Zhang and Chenzhe Jin and Aditya Gupta and Shige Liu and and Jianguo Wang},
+  booktitle={Conference on Innovative Data Systems Research (CIDR)},
+  year={2026}
+}
+```
+
+## Contact
+If you have any questions, you are more than welcome to contact Dr. [Jianguo Wang](https://cs.purdue.edu/homes/csjgwang/)
