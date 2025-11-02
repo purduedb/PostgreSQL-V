@@ -13,6 +13,7 @@
 #include "postmaster/postmaster.h"       // For BackgroundWorkerStartTime
 #include "tcop/tcopprot.h"               // For ReadyForQuery
 #include "utils/builtins.h"              // For elog(), etc.
+#include "utils/elog.h"
 #include "utils/memutils.h"              // For MemoryContext
 #include "utils/guc.h"                   // For custom GUCs if any
 #include "storage/pmsignal.h"
@@ -132,7 +133,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
 {
     switch (task_slot->type)
     {
-    case VectorSearch:
+    case VectorSearchTaskType:
     {
         // elog(DEBUG1, "[handle_task] task_slot->type = VectorSearch");
         // get the task
@@ -147,9 +148,9 @@ handle_task(TaskSlot *task_slot, int slot_idx)
         SetLatch(&client->procLatch);
         break;
     }
-    case IndexBuild:
+    case IndexBuildTaskType:
     {
-        elog(DEBUG1, "[handle_task] task_slot->type = IndexBuild");
+        elog(DEBUG1, "[handle_task] task_slot->type = IndexBuildTaskType");
         dsm_handle task_hdl = task_slot->handle;
         dsm_segment *task_seg = dsm_attach(task_hdl);
         IndexBuildTask task = (IndexBuildTask) dsm_segment_address(task_seg);
@@ -174,7 +175,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
         SetLatch(&client->procLatch);
         break;
     }
-    case SegmentUpdate:
+    case SegmentUpdateTaskType:
     {
         elog(DEBUG1, "[handle_task] task_slot->type = SegmentUpdate");
         dsm_handle task_hdl = task_slot->handle;
@@ -295,7 +296,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
         SetLatch(&client->procLatch);
         break;
     }
-    case IndexLoad:
+    case IndexLoadTaskType:
     {
         elog(DEBUG1, "[handle_task] task_slot->type = IndexLoad");
         dsm_handle task_hdl = task_slot->handle;
@@ -347,6 +348,7 @@ static void
 vector_search(VectorSearchTask task, VectorSearchResult result)
 {   
     // elog(DEBUG1, "enter vector_search");
+    
     DistancePair *final_pairs = NULL, *pairs_1 = NULL;
     int num_1;
 
@@ -365,7 +367,7 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
     // Create a local copy of segment indices to traverse
     uint32_t segment_indices[MAX_SEGMENTS_COUNT];
     uint32_t segment_count = 0;
-    uint32_t idx = 0;
+    uint32_t idx = pool->head_idx;
     
     // Build segment traversal list while holding the lock
     do {
@@ -377,7 +379,9 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
         if (idx == tail_idx_snapshot) break;
         idx = pool->flushed_segments[idx].next_idx;
     } while (true);
-    
+    // TODO: for debugging
+    elog(DEBUG1, "[vector_search] segment_count = %d", segment_count);
+
     // Release lock early to minimize contention
     pthread_rwlock_unlock(&pool->seg_lock);
     
@@ -385,7 +389,8 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
     for (uint32_t i = 0; i < segment_count; i++) {
         uint32_t idx = segment_indices[i];
         
-        // elog(DEBUG1, "[vector_search] idx = %d", idx);
+        // TODO: for debugging
+        elog(DEBUG1, "[vector_search] considering search on segment %u-%u, idx = %u", pool->flushed_segments[idx].segment_id_start, pool->flushed_segments[idx].segment_id_end, idx);
         // skip the flushed segment if its segment id is in the snapshot
         bool found = false;
         for (int j = 0; j < task->snapshot.scount; j++)
@@ -401,8 +406,9 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
         found = found || (task->snapshot.gmt_id <= pool->flushed_segments[idx].segment_id_end &&
                         task->snapshot.gmt_id >= pool->flushed_segments[idx].segment_id_start);
         if (!found)
-        {
-            // elog(DEBUG1, "[vector_search] conducting search on segment %u-%u", pool->flushed_segments[idx].segment_id_start, pool->flushed_segments[idx].segment_id_end);
+        {   
+            // TODO: for debugging
+            elog(DEBUG1, "[vector_search] conducting search on segment %u-%u", pool->flushed_segments[idx].segment_id_start, pool->flushed_segments[idx].segment_id_end);
             // conduct search
             topKVector *segment_result;
             int64_t *mapping = pool->flushed_segments[idx].map_ptr;

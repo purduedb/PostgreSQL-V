@@ -294,7 +294,7 @@ build_lsm_index(IndexType type, Oid relId, void *vector_index, int64_t *tids, ui
     // elog(DEBUG1, "[build_lsm_index] initialized the memtable, growing_memtable_idx = %d, growing_memtable_id = %d", 
     //         slot->lsmIndex.growing_memtable_idx, slot->lsmIndex.growing_memtable_id);
 
-    // index will be freed outside this function
+    // vector_index will be freed outside this function
 }
 
 static void

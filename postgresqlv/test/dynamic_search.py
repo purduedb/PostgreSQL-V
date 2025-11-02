@@ -301,29 +301,33 @@ def main():
         queries = read_fvecs(args.queries, args.nq)
         print(f"Loaded {len(queries)} queries of dimension {queries.shape[1]}")
         
+        # # sleep if needed
+        # print("Waiting 10 seconds before running queries...")
+        # time.sleep(10)
+        
         print("Running similarity search (r1)...")
         predicted = search_queries(conn, queries, args.k, 2, 100, args.tablename)
         compute_recall(predicted, ground_truth, args.k)
         
-        print("Running similarity search (r3)...")
-        predicted = search_queries(conn, queries, args.k, 3, 100, args.tablename)
-        compute_recall(predicted, ground_truth, args.k)
+        # print("Running similarity search (r3)...")
+        # predicted = search_queries(conn, queries, args.k, 3, 100, args.tablename)
+        # compute_recall(predicted, ground_truth, args.k)
         
-        print("Running similarity search (r4)...")
-        predicted = search_queries(conn, queries, args.k, 5, 200, args.tablename)
-        compute_recall(predicted, ground_truth, args.k)
+        # print("Running similarity search (r4)...")
+        # predicted = search_queries(conn, queries, args.k, 5, 200, args.tablename)
+        # compute_recall(predicted, ground_truth, args.k)
         
-        print("Running similarity search (r5)...")
-        predicted = search_queries(conn, queries, args.k, 10, 300, args.tablename)
-        compute_recall(predicted, ground_truth, args.k)
+        # print("Running similarity search (r5)...")
+        # predicted = search_queries(conn, queries, args.k, 10, 300, args.tablename)
+        # compute_recall(predicted, ground_truth, args.k)
         
-        print("Running similarity search (r6)...")
-        predicted = search_queries(conn, queries, args.k, 20, 400, args.tablename)
-        compute_recall(predicted, ground_truth, args.k)
+        # print("Running similarity search (r6)...")
+        # predicted = search_queries(conn, queries, args.k, 20, 400, args.tablename)
+        # compute_recall(predicted, ground_truth, args.k)
         
-        print("Running similarity search (r7)...")
-        predicted = search_queries(conn, queries, args.k, 30, 500, args.tablename)
-        compute_recall(predicted, ground_truth, args.k)
+        # print("Running similarity search (r7)...")
+        # predicted = search_queries(conn, queries, args.k, 30, 500, args.tablename)
+        # compute_recall(predicted, ground_truth, args.k)
 
     conn.close()
 

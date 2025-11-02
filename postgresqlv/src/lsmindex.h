@@ -183,8 +183,8 @@ bool read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *di
 bool read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, 
 					  SegmentId *out_start_sid, SegmentId *out_end_sid, uint32_t *valid_rows, IndexType *index_type);
 void load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, IndexType index_type, void **index);
-void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint8_t **bitmap);
-void load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, int64_t **mapping);
+void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint8_t **bitmap, bool pg_alloc);
+void load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, int64_t **mapping, bool pg_alloc);
 
 // helper functions (memtable)
 ConcurrentMemTable MT_FROM_SLOTIDX(int slot_num);

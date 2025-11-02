@@ -131,8 +131,9 @@ write_segment_file(const char *path, const void *data, Size size)
 
 // We use alloc instead of palloc here to avoid autovacuum in Postgres (local memory)
 // This function can only be called by the vector index worker
+// note that we use malloc instead of palloc here as this function will be called by the vector index worker
 static void *
-read_segment_file(const char *path)
+read_segment_file(const char *path, bool pg_alloc)
 {
     int fd;
     struct stat st;
@@ -166,7 +167,7 @@ read_segment_file(const char *path)
     }
 
     /* Now, allocate a large memory block to hold all the chunks */
-    void *dest = malloc(total_size);
+    void *dest = pg_alloc ? palloc(total_size) : malloc(total_size);
     if (!dest)
         elog(ERROR, "Failed to allocate memory");
 
@@ -425,6 +426,7 @@ read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *dim, ui
 	return true;
 }
 
+// Note: the index binary set will be freed in this function
 void 
 flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
 {
@@ -451,19 +453,19 @@ flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
 }
 
 void 
-load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint8_t **bitmap)
+load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint8_t **bitmap, bool pg_alloc)
 {
     char path[MAXPGPATH];
     GetLSMBitmapFilePath(path, sizeof(path), indexRelId, start_sid, end_sid);
-    *bitmap = (uint8_t *) read_segment_file(path);
+    *bitmap = (uint8_t *) read_segment_file(path, pg_alloc);
 }
 
 void 
-load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, int64_t **mapping)
+load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, int64_t **mapping, bool pg_alloc)
 {
     char path[MAXPGPATH];
     GetLSMMappingFilePath(path, sizeof(path), indexRelId, start_sid, end_sid);
-    *mapping = (int64_t *) read_segment_file(path);
+    *mapping = (int64_t *) read_segment_file(path, pg_alloc);
 }
 
 void 

@@ -43,10 +43,10 @@ topKVector* BruteForceSearch(const float* vectors, const float* query_vector, co
 // merge index
 void MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_index_type, IndexType new_index_type, void **new_index_ptr, int *new_index_count, int M, int efConstruction, int lists);
 
-// merge two indices
-void MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType index1_type, float deletion_ratio1,
-                     void *index2_ptr, uint8_t *bitmap2_ptr, int count2, IndexType index2_type, float deletion_ratio2,
-                     void **merged_index_ptr, uint8_t **merged_bitmap_ptr, int *merged_count,
+// merge two indices (also returns merged bitmap and merged mapping in the same order)
+void* MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, const int64_t *mapping1_ptr, int count1, IndexType index1_type, float deletion_ratio1,
+                     void *index2_ptr, uint8_t *bitmap2_ptr, const int64_t *mapping2_ptr, int count2, IndexType index2_type, float deletion_ratio2,
+                     uint8_t **merged_bitmap_ptr, int64_t **merged_mapping_ptr, int *merged_count,
                      IndexType *merged_index_type, float *merged_deletion_ratio);
 
 

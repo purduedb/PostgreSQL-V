@@ -302,7 +302,8 @@ IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors)
 extern "C" void
 IndexBuild(IndexType type, ConcurrentMemTable mt, uint32_t valid_rows, void** indexPtr, int M, int efConstruction, int lists)
 {
-    elog(DEBUG1, "enter IndexBuild, type = %d, relation = %d, segment id = %d, valid_rows = %d", type, mt->rel, mt->memtable_id, valid_rows);
+    elog(DEBUG1, "enter IndexBuild, type = %d, relation = %d, segment id = %d, valid_rows = %d, M = %d, efConstruction = %d, lists = %d",
+         type, mt->rel, mt->memtable_id, valid_rows, M, efConstruction, lists);
     
     // initialize
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
@@ -377,7 +378,8 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, knowhere::BitsetView bitse
         elog(ERROR, "IvfflatIndexSearch: the index is empty");
         return nullptr;
     }
-    // elog(DEBUG1, "[VectorIndexSearchImpl] index->Count() = %d", index->Count());
+    // TODO: for debugging
+    elog(DEBUG1, "[VectorIndexSearchImpl] index->Count() = %d", index->Count());
 
     // configuration
     knowhere::Json conf;
@@ -457,7 +459,8 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, knowhere::BitsetView bitse
 extern "C" topKVector*
 VectorIndexSearch(IndexType type, void *index_ptr, uint8_t *bitmap_ptr, uint32_t count, const float* query_vector, int k, int efs_nprobe)
 {
-    // elog(DEBUG1, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
+    // TODO: for debugging
+    elog(DEBUG1, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
     knowhere::BitsetView bitset_view(bitmap_ptr, count);
     return VectorIndexSearchImpl(type, index_ptr, bitset_view, count, query_vector, k, efs_nprobe);
 }
@@ -820,11 +823,10 @@ MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_index_
     elog(DEBUG1, "enter MergeIndex, index_ptr = %p, bitmap_ptr = %p, count = %d, old_index_type = %d, new_index_type = %d", 
         index_ptr, bitmap_ptr, count, old_index_type, new_index_type);
     
-    // TODO: Call IndexLoadAndSave to load the index before calling MergeIndex
     auto *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(index_ptr);
 
     // Check if the index has raw data
-    if (!index->HasRawData()) {
+    if (!index->HasRawData(knowhere::metric::L2)) {
         elog(ERROR, "MergeIndex: the index does not have raw data");
         return;
     }
@@ -840,7 +842,7 @@ MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_index_
     knowhere::BitsetView bitset_view(bitmap_ptr, count);
     int selected_count = count - bitset_view.count();
     if (selected_count <= 0) {
-        // TODO: we will handle this case in the future
+        // TODO: handle this case
         elog(ERROR, "MergeIndex: no vectors are selected");
         return;
     }
@@ -854,7 +856,8 @@ MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_index_
             selected_ids.push_back(i);
         }
     }
-    auto ids_dataset = knowhere::GenDataSet(selected_count, 1, selected_ids.data());
+    int64_t actual_selected = (int64_t) selected_ids.size();
+    auto ids_dataset = knowhere::GenIdsDataSet(actual_selected, selected_ids.data());
 
     // retrieve the selected vectors from the index
     auto vectors_result = index->GetVectorByIds(ids_dataset);
@@ -912,10 +915,10 @@ MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_index_
 }
 
 // Function to merge two built indices by inserting smaller index into larger one
-extern "C" void
-MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType index1_type, float deletion_ratio1,
-                void *index2_ptr, uint8_t *bitmap2_ptr, int count2, IndexType index2_type, float deletion_ratio2,
-                void **merged_index_ptr, uint8_t **merged_bitmap_ptr, int *merged_count,
+extern "C" void *
+MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, const int64_t *mapping1_ptr, int count1, IndexType index1_type, float deletion_ratio1,
+                void *index2_ptr, uint8_t *bitmap2_ptr, const int64_t *mapping2_ptr, int count2, IndexType index2_type, float deletion_ratio2,
+                uint8_t **merged_bitmap_ptr, int64_t **merged_mapping_ptr, int *merged_count,
                 IndexType *merged_index_type, float *merged_deletion_ratio)
 {
     elog(DEBUG1, "enter MergeTwoIndices, index1_ptr = %p, bitmap1_ptr = %p, count1 = %d, index2_ptr = %p, bitmap2_ptr = %p, count2 = %d", 
@@ -925,29 +928,30 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
     auto *index2 = static_cast<knowhere::Index<knowhere::IndexNode>*>(index2_ptr);
 
     // Check if both indices have raw data
-    if (!index1->HasRawData()) {
+    elog(DEBUG1, "MergeTwoIndices: index1_type = %d, index2_type = %d", index1_type, index2_type);
+    if (!index1->HasRawData(knowhere::metric::L2)) {
         elog(ERROR, "MergeTwoIndices: index1 does not have raw data");
-        return;
+        return NULL;
     }
-    if (!index2->HasRawData()) {
+    if (!index2->HasRawData(knowhere::metric::L2)) {
         elog(ERROR, "MergeTwoIndices: index2 does not have raw data");
-        return;
+        return NULL;
     }
 
     // Validate counts
     if (index1->Count() != count1) {
         elog(ERROR, "MergeTwoIndices: index1 count (%d) does not match count1 (%d)", index1->Count(), count1);
-        return;
+        return NULL;
     }
     if (index2->Count() != count2) {
         elog(ERROR, "MergeTwoIndices: index2 count (%d) does not match count2 (%d)", index2->Count(), count2);
-        return;
+        return NULL;
     }
 
     // Check dimension consistency
     if (index1->Dim() != index2->Dim()) {
         elog(ERROR, "MergeTwoIndices: dimension mismatch - index1: %d, index2: %d", index1->Dim(), index2->Dim());
-        return;
+        return NULL;
     }
     int dim = index1->Dim();
 
@@ -956,6 +960,8 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
     knowhere::Index<knowhere::IndexNode> *smaller_index;
     uint8_t *larger_bitmap;
     uint8_t *smaller_bitmap;
+    const int64_t *larger_mapping;
+    const int64_t *smaller_mapping;
     int larger_count;
     int smaller_count;
     
@@ -966,6 +972,8 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
         smaller_bitmap = bitmap2_ptr;
         larger_count = count1;
         smaller_count = count2;
+        larger_mapping = mapping1_ptr;
+        smaller_mapping = mapping2_ptr;
     } else {
         larger_index = index2;
         smaller_index = index1;
@@ -973,28 +981,36 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
         smaller_bitmap = bitmap1_ptr;
         larger_count = count2;
         smaller_count = count1;
+        larger_mapping = mapping2_ptr;
+        smaller_mapping = mapping1_ptr;
     }
 
     elog(DEBUG1, "MergeTwoIndices: larger_count = %d, smaller_count = %d", larger_count, smaller_count);
 
     // Get all vectors from the smaller index
-    auto smaller_vectors_result = smaller_index->GetVectorByIds();
-    if (!smaller_vectors_result.has_value()) {
-        elog(ERROR, "MergeTwoIndices: failed to retrieve vectors from smaller index");
-        return;
-    }
-    auto smaller_dataset = smaller_vectors_result.value();
+    {
+        std::vector<int64_t> all_ids(smaller_count);
+        for (int64_t i = 0; i < smaller_count; ++i) all_ids[i] = i;
+        auto id_ds = knowhere::GenIdsDataSet(smaller_count, all_ids.data());
+        auto smaller_vectors_result = smaller_index->GetVectorByIds(id_ds);
+        if (!smaller_vectors_result.has_value()) {
+            elog(ERROR, "MergeTwoIndices: failed to retrieve vectors from smaller index");
+            return NULL;
+        }
+        auto smaller_dataset = smaller_vectors_result.value();
 
-    // Insert vectors from smaller index into larger index
-    knowhere::Json add_conf;
-    add_conf[knowhere::meta::ROWS] = smaller_count;
-    add_conf[knowhere::meta::DIM] = dim;
-    add_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        // Insert vectors from smaller index into larger index
+        knowhere::Json add_conf;
+        add_conf[knowhere::meta::ROWS] = smaller_count;
+        add_conf[knowhere::meta::DIM] = dim;
+        add_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
 
-    auto add_res = larger_index->Add(smaller_dataset, add_conf);
-    if (add_res != knowhere::Status::success) {
-        elog(ERROR, "MergeTwoIndices: failed to add vectors from smaller index to larger index");
-        return;
+        auto add_res = larger_index->Add(smaller_dataset, add_conf);
+
+        if (add_res != knowhere::Status::success) {
+            elog(ERROR, "MergeTwoIndices: failed to add vectors from smaller index to larger index");
+            return NULL;
+        }
     }
 
     // Verify the merged index count
@@ -1002,7 +1018,7 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
     if (merged_count_check != larger_count + smaller_count) {
         elog(ERROR, "MergeTwoIndices: merged index count (%d) does not match expected (%d)", 
              merged_count_check, larger_count + smaller_count);
-        return;
+        return NULL;
     }
 
     // Create merged bitmap by concatenating the two original bitmaps
@@ -1019,7 +1035,7 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
             SET_SLOT(merged_bitmap, i);
         }
     }
-    
+
     // Copy bitmap from smaller index bit by bit (starting after larger_count)
     for (int i = 0; i < smaller_count; i++) {
         int merged_bit_pos = larger_count + i;
@@ -1027,7 +1043,6 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
             SET_SLOT(merged_bitmap, merged_bit_pos);
         }
     }
-    
     // Clear any unused bits in the last byte if needed
     int remaining_bits = total_bits % 8;
     if (remaining_bits != 0) {
@@ -1037,6 +1052,15 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
 
     elog(DEBUG1, "MergeTwoIndices: merged_count = %d, merged_bitmap_size = %d", 
          merged_count_check, merged_bitmap_size);
+
+    // Build merged mapping in the same order: larger first, then smaller
+    int64_t *merged_mapping = (int64_t*) palloc(sizeof(int64_t) * (Size)merged_count_check);
+    for (int i = 0; i < larger_count; i++) {
+        merged_mapping[i] = larger_mapping[i];
+    }
+    for (int i = 0; i < smaller_count; i++) {
+        merged_mapping[larger_count + i] = smaller_mapping[i];
+    }
 
     // Compute merged_index_type (use the index type of the larger segment)
     if (larger_count == count1) {
@@ -1053,8 +1077,8 @@ MergeTwoIndices(void *index1_ptr, uint8_t *bitmap1_ptr, int count1, IndexType in
          *merged_index_type, *merged_deletion_ratio);
 
     // Return results
-    *merged_index_ptr = static_cast<void*>(larger_index);
     *merged_bitmap_ptr = merged_bitmap;
+    *merged_mapping_ptr = merged_mapping;
     *merged_count = merged_count_check;
+    return larger_index;
 }
-

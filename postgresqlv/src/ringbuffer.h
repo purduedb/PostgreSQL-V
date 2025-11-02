@@ -31,10 +31,10 @@
 
 typedef enum
 {
-    VectorSearch,
-    IndexBuild,
-    IndexLoad,
-    SegmentUpdate
+    VectorSearchTaskType,
+    IndexBuildTaskType,
+    IndexLoadTaskType,
+    SegmentUpdateTaskType
 } VectorTaskType;
 
 // typedef union 

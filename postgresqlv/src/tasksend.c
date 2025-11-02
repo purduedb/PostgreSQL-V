@@ -34,7 +34,7 @@ vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int top
     
     int slot = get_ring_buffer_slot();
     TaskSlot *task_slot = vs_task_at(slot);
-    task_slot->type = VectorSearch;
+    task_slot->type = VectorSearchTaskType;
     // we do not use handle to send vector search task
     task_slot->dsm_size = 0;
     task_slot->handle = 0;
@@ -98,7 +98,7 @@ index_build_blocking(Oid indexRelId, int lsm_index_idx)
 
     int slot = get_ring_buffer_slot();
     TaskSlot *task_slot = vs_task_at(slot);
-    task_slot->type = IndexBuild;
+    task_slot->type = IndexBuildTaskType;
     task_slot->dsm_size = task_seg_size;
     task_slot->handle = task_hdl;
 
@@ -117,7 +117,7 @@ index_build_blocking(Oid indexRelId, int lsm_index_idx)
                        0  /* no wait-event reporting */);
     ResetLatch(MyLatch);
     dsm_detach(task_seg);
-    elog(DEBUG1, "[index_build_blocking] IndexBuild task completed and DSM segment detached");
+    elog(DEBUG1, "[index_build_blocking] IndexBuildTaskType task completed and DSM segment detached");
 }
 
 void
@@ -153,7 +153,7 @@ segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type, 
 
     int slot = get_ring_buffer_slot();
     TaskSlot *task_slot = vs_task_at(slot);
-    task_slot->type = SegmentUpdate;
+    task_slot->type = SegmentUpdateTaskType;
     task_slot->dsm_size = task_seg_size;
     task_slot->handle = task_hdl;
 
@@ -205,7 +205,7 @@ index_load_blocking(Oid index_relid, int lsm_index_idx)
 
     int slot = get_ring_buffer_slot();
     TaskSlot *task_slot = vs_task_at(slot);
-    task_slot->type = IndexLoad;
+    task_slot->type = IndexLoadTaskType;
     task_slot->dsm_size = task_seg_size;
     task_slot->handle = task_hdl;
 

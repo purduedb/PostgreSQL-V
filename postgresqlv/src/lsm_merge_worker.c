@@ -1,3 +1,4 @@
+#include "c.h"
 #include "postgres.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/bgworker.h"
@@ -293,21 +294,15 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     // Load the existing index from disk
     void *old_index_ptr = NULL;
     load_index_file(index_relid, segment->start_sid, segment->end_sid, segment->index_type, &old_index_ptr);
-    if (old_index_ptr == NULL) {
-        elog(ERROR, "rebuild_index: failed to load index from disk for segment %u-%u", 
-             segment->start_sid, segment->end_sid);
-        return;
-    }
-    
+    Assert(old_index_ptr != NULL);
     // Load the bitmap from disk
     uint8_t *old_bitmap_ptr = NULL;
-    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, &old_bitmap_ptr);
-    if (old_bitmap_ptr == NULL) {
-        elog(ERROR, "rebuild_index: failed to load bitmap from disk for segment %u-%u", 
-             segment->start_sid, segment->end_sid);
-        IndexFree(old_index_ptr);
-        return;
-    }
+    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, &old_bitmap_ptr, true);
+    Assert(old_bitmap_ptr != NULL);
+    // Load the mapping from disk
+    int64_t *old_mapping_ptr = NULL;
+    load_mapping_file(index_relid, segment->start_sid, segment->end_sid, &old_mapping_ptr, true);
+    Assert(old_mapping_ptr != NULL);
     
     // Create new index with filtered vectors
     void *new_index_ptr = NULL;
@@ -334,38 +329,35 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
                segment->index_type, target_type, 
                &new_index_ptr, &new_index_count,
                M, efConstruction, lists);
-    
-    if (new_index_ptr == NULL) {
-        elog(ERROR, "rebuild_index: MergeIndex failed for segment %u-%u", 
-             segment->start_sid, segment->end_sid);
-        IndexFree(old_index_ptr);
-        pfree(old_bitmap_ptr);
-        return;
-    }
+    Assert(new_index_ptr != NULL);
     
     // Serialize the new index
     void *new_index_bin = NULL;
     IndexSerialize(new_index_ptr, &new_index_bin);
-    if (new_index_bin == NULL) {
-        elog(ERROR, "rebuild_index: failed to serialize new index for segment %u-%u", 
-             segment->start_sid, segment->end_sid);
-        IndexFree(old_index_ptr);
-        IndexFree(new_index_ptr);
-        pfree(old_bitmap_ptr);
-        return;
-    }
+    Assert(new_index_bin != NULL);
     
     // Generate new bitmap since all vectors in rebuilt index are valid (deleted ones filtered out)
     uint8_t *new_bitmap_ptr = (uint8_t *) palloc0(GET_BITMAP_SIZE(new_index_count));
-    if (new_bitmap_ptr == NULL) {
-        elog(ERROR, "rebuild_index: failed to allocate memory for new bitmap");
-        IndexFree(old_index_ptr);
-        IndexFree(new_index_ptr);
-        pfree(old_bitmap_ptr);
-        return;
-    }
-    // Set all bits to 1 since all vectors in the rebuilt index are valid
+    Assert(new_bitmap_ptr != NULL);
+
+    // Set all bits to 0 since all vectors in the rebuilt index are valid
     memset(new_bitmap_ptr, 0x00, GET_BITMAP_SIZE(new_index_count));
+
+    // Generate new mapping by filtering out deleted entries from the old mapping
+    Size new_map_size = sizeof(int64_t) * (Size)new_index_count;
+    int64_t *new_mapping_ptr = (int64_t *) palloc(new_map_size);
+    Assert(new_mapping_ptr != NULL);
+    {
+        int write_idx = 0;
+        for (int i = 0; i < (int)segment->vec_count; i++)
+        {
+            if (!IS_SLOT_SET(old_bitmap_ptr, i))
+            {
+                new_mapping_ptr[write_idx++] = old_mapping_ptr[i];
+            }
+        }
+        Assert(write_idx == new_index_count);
+    }
 
     // Update the segment information in task
     task->merged_index_type = target_type;
@@ -381,17 +373,20 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     prep.index_bin = new_index_bin;
     prep.bitmap_ptr = new_bitmap_ptr;
     prep.bitmap_size = GET_BITMAP_SIZE(new_index_count); // Use new count for bitmap size
-    prep.map_ptr = NULL; // Mapping not needed for rebuild
-    prep.map_size = 0;
+    prep.map_ptr = new_mapping_ptr;
+    prep.map_size = new_map_size;
     
     // Use flush_segment_to_disk to write everything to disk
+    // note that the new_index_bin will be freed in flush_segment_to_disk
     flush_segment_to_disk(index_relid, &prep);
     
     // Cleanup
     IndexFree(old_index_ptr);
     IndexFree(new_index_ptr);
     pfree(old_bitmap_ptr);
+    pfree(old_mapping_ptr);
     pfree(new_bitmap_ptr);
+    pfree(new_mapping_ptr);
     
     elog(DEBUG1, "rebuild_index: successfully rebuilt index for segment %u-%u, new count = %d", 
          segment->start_sid, segment->end_sid, new_index_count);
@@ -409,83 +404,53 @@ merge_adjacent_segments(MergeTaskData *task)
     MergeSegmentInfo *segment0 = &seg_array->segments[task->segment_idx0];
     MergeSegmentInfo *segment1 = &seg_array->segments[task->segment_idx1];
     Oid index_relid = seg_array->current_index_relid;
+    int64_t *mapping0_ptr = NULL;
+    int64_t *mapping1_ptr = NULL;
+    int64_t *merged_mapping_ptr = NULL;
     
     // Load both indices from disk
     void *index0_ptr = NULL;
     load_index_file(index_relid, segment0->start_sid, segment0->end_sid, segment0->index_type, &index0_ptr);
-    if (index0_ptr == NULL) {
-        elog(ERROR, "merge_adjacent_segments: failed to load index0 from disk for segment %u-%u", 
-             segment0->start_sid, segment0->end_sid);
-        return;
-    }
+    Assert(index0_ptr != NULL);
     
     void *index1_ptr = NULL;
     load_index_file(index_relid, segment1->start_sid, segment1->end_sid, segment1->index_type, &index1_ptr);
-    if (index1_ptr == NULL) {
-        elog(ERROR, "merge_adjacent_segments: failed to load index1 from disk for segment %u-%u", 
-             segment1->start_sid, segment1->end_sid);
-        IndexFree(index0_ptr);
-        return;
-    }
+    Assert(index1_ptr != NULL);
     
     // Load both bitmaps from disk
     uint8_t *bitmap0_ptr = NULL;
-    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, &bitmap0_ptr);
-    if (bitmap0_ptr == NULL) {
-        elog(ERROR, "merge_adjacent_segments: failed to load bitmap0 from disk for segment %u-%u", 
-             segment0->start_sid, segment0->end_sid);
-        IndexFree(index0_ptr);
-        IndexFree(index1_ptr);
-        return;
-    }
+    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, &bitmap0_ptr, true);
+    Assert(bitmap0_ptr != NULL);
     
     uint8_t *bitmap1_ptr = NULL;
-    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, &bitmap1_ptr);
-    if (bitmap1_ptr == NULL) {
-        elog(ERROR, "merge_adjacent_segments: failed to load bitmap1 from disk for segment %u-%u", 
-             segment1->start_sid, segment1->end_sid);
-        IndexFree(index0_ptr);
-        IndexFree(index1_ptr);
-        pfree(bitmap0_ptr);
-        return;
-    }
+    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, &bitmap1_ptr, true);
+    Assert(bitmap1_ptr != NULL);
     
     // Merge the two indices
-    void *merged_index_ptr = NULL;
+    void *merged_index_ptr = NULL; // no neeed to free merged_index_ptr as it points to the larger index
     uint8_t *merged_bitmap_ptr = NULL;
     int merged_count = 0;
     IndexType merged_index_type;
     float merged_deletion_ratio;
     
     // TODO: make the parameters configurable
-    MergeTwoIndices(index0_ptr, bitmap0_ptr, segment0->vec_count, segment0->index_type, segment0->deletion_ratio,
-                    index1_ptr, bitmap1_ptr, segment1->vec_count, segment1->index_type, segment1->deletion_ratio,
-                    &merged_index_ptr, &merged_bitmap_ptr, &merged_count,
+    // Load mappings for both segments (used by MergeTwoIndices to build merged mapping)
+    load_mapping_file(index_relid, segment0->start_sid, segment0->end_sid, &mapping0_ptr, true);
+    Assert(mapping0_ptr != NULL);
+    load_mapping_file(index_relid, segment1->start_sid, segment1->end_sid, &mapping1_ptr, true);
+    Assert(mapping1_ptr != NULL);
+
+    merged_index_ptr = MergeTwoIndices(index0_ptr, bitmap0_ptr, mapping0_ptr, segment0->vec_count, segment0->index_type, segment0->deletion_ratio,
+                    index1_ptr, bitmap1_ptr, mapping1_ptr, segment1->vec_count, segment1->index_type, segment1->deletion_ratio,
+                    &merged_bitmap_ptr, &merged_mapping_ptr, &merged_count,
                     &merged_index_type, &merged_deletion_ratio);
     
-    if (merged_index_ptr == NULL) {
-        elog(ERROR, "merge_adjacent_segments: MergeTwoIndices failed for segments %u-%u and %u-%u", 
-             segment0->start_sid, segment0->end_sid, segment1->start_sid, segment1->end_sid);
-        IndexFree(index0_ptr);
-        IndexFree(index1_ptr);
-        pfree(bitmap0_ptr);
-        pfree(bitmap1_ptr);
-        return;
-    }
+    Assert(merged_index_ptr != NULL);
     
     // Serialize the merged index
     void *merged_index_bin = NULL;
     IndexSerialize(merged_index_ptr, &merged_index_bin);
-    if (merged_index_bin == NULL) {
-        elog(ERROR, "merge_adjacent_segments: failed to serialize merged index");
-        IndexFree(index0_ptr);
-        IndexFree(index1_ptr);
-        IndexFree(merged_index_ptr);
-        pfree(bitmap0_ptr);
-        pfree(bitmap1_ptr);
-        pfree(merged_bitmap_ptr);
-        return;
-    }
+    Assert(merged_index_bin != NULL);
     
     // Update the segment information in task using values computed by MergeTwoIndices
     task->merged_index_type = merged_index_type;
@@ -501,8 +466,9 @@ merge_adjacent_segments(MergeTaskData *task)
     prep.index_bin = merged_index_bin;
     prep.bitmap_ptr = merged_bitmap_ptr;
     prep.bitmap_size = GET_BITMAP_SIZE(merged_count);
-    prep.map_ptr = NULL; // Mapping not needed for merge
-    prep.map_size = 0;
+    // Provide the merged mapping aligned with merged index order
+    prep.map_ptr = merged_mapping_ptr;
+    prep.map_size = sizeof(int64_t) * (Size)merged_count;
     
     // Write the merged segment to disk
     flush_segment_to_disk(index_relid, &prep);
@@ -510,10 +476,13 @@ merge_adjacent_segments(MergeTaskData *task)
     // Cleanup
     IndexFree(index0_ptr);
     IndexFree(index1_ptr);
-    IndexFree(merged_index_ptr);
+    // no need to free merged_index_bin as it points to the larger index which is freed in one of the previous IndexFree calls
     pfree(bitmap0_ptr);
     pfree(bitmap1_ptr);
     pfree(merged_bitmap_ptr);
+    pfree(mapping0_ptr);
+    pfree(mapping1_ptr);
+    pfree(merged_mapping_ptr);
     
     elog(DEBUG1, "merge_adjacent_segments: successfully merged segments %u-%u and %u-%u into %u-%u, merged count = %d", 
          segment0->start_sid, segment0->end_sid, segment1->start_sid, segment1->end_sid,
@@ -524,6 +493,9 @@ merge_adjacent_segments(MergeTaskData *task)
 static bool
 claim_merge_task(int worker_id, int lsm_idx, uint32_t segment_idx0, uint32_t segment_idx1, int task_type)
 {
+    elog(DEBUG1, "enter claim_merge_task for worker %d, lsm_idx = %d, segment_idx0 = %u, segment_idx1 = %u, task_type = %d", 
+         worker_id, lsm_idx, segment_idx0, segment_idx1, task_type);
+
     SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
     LWLockAcquire(seg_array->lock, LW_EXCLUSIVE);
 
@@ -841,8 +813,10 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
             else
                 task_type = SEGMENT_UPDATE_MERGE;
             
-            if (claim_merge_task(worker_id, lsm_idx, cur, adj_segment, task_type))
+            if (claim_merge_task(worker_id, lsm_idx, Min(cur, adj_segment), Max(cur, adj_segment), task_type))
+            {
                 return true;
+            }
                 
             // Re-acquire lock to continue traversal
             LWLockAcquire(seg_array->lock, LW_SHARED);
@@ -981,7 +955,6 @@ unregister_merge_worker(int worker_id)
     LWLockRelease(merge_worker_manager->lock);
 }
 
-// TODO:
 // Main background worker function
 void
 lsm_merge_worker_main(Datum main_arg)
@@ -1026,21 +999,25 @@ lsm_merge_worker_main(Datum main_arg)
             switch (task->operation_type)
             {
                 case SEGMENT_UPDATE_REBUILD_FLAT:
-                    // Rebuild segment with flat index
-                    rebuild_index(task, FLAT);
-                    break;
-                    
-                case SEGMENT_UPDATE_REBUILD_DELETION:
-                    // Rebuild segment to remove deleted vectors
+                {
                     IndexType target_type = SharedLSMIndexBuffer->slots[task->lsm_idx].lsmIndex.index_type;
                     rebuild_index(task, target_type);
                     break;
+                }
                     
+                case SEGMENT_UPDATE_REBUILD_DELETION:
+                {
+                    IndexType target_type = SharedLSMIndexBuffer->slots[task->lsm_idx].lsmIndex.index_type;
+                    rebuild_index(task, target_type);
+                    break;
+                }   
+                // Merge two adjacent segments
                 case SEGMENT_UPDATE_MERGE:
+                {
                     // Merge two adjacent segments
                     merge_adjacent_segments(task);
                     break;
-                    
+                }
                 default:
                     elog(ERROR, "[lsm_merge_worker_main] Unknown operation type %d", task->operation_type);
                     break;

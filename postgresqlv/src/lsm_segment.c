@@ -345,8 +345,8 @@ load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segmen
         segment->index_type = seg_index_type;
 
         load_index_file(indexRelId, start_sid, end_sid, seg_index_type, &segment->index_ptr);
-        load_bitmap_file(indexRelId, start_sid, end_sid, &segment->bitmap_ptr);
-        load_mapping_file(indexRelId, start_sid, end_sid, &segment->map_ptr);
+        load_bitmap_file(indexRelId, start_sid, end_sid, &segment->bitmap_ptr, false);
+        load_mapping_file(indexRelId, start_sid, end_sid, &segment->map_ptr, false);
 
         segment->in_used = true;
         elog(DEBUG1, "[load_segment_from_disk] loaded segment %u-%u with %u vectors", start_sid, end_sid, valid_rows);

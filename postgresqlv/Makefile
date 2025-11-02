@@ -5,7 +5,7 @@ MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o \
-	   src/lsmindex.o src/lsm_segment.o src/lsmbackground.o src/lsmindex_io.o src/ringbuffer.o src/tasksend.o src/vector_index_worker.o src/vectorindeximpl.o src/utils.o
+	   src/lsmindex.o src/lsm_segment.o src/lsmbackground.o src/lsmindex_io.o src/ringbuffer.o src/tasksend.o src/vector_index_worker.o src/vectorindeximpl.o src/utils.o src/lsm_merge_worker.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard test/sql/*.sql)
