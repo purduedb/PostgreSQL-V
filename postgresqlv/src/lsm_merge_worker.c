@@ -71,6 +71,8 @@ initialize_merge_segment_array(SharedSegmentArray *seg_array)
         seg_array->segments[i].is_compacting = false;
         seg_array->segments[i].next_idx = -1;  // -1 indicates end of list
         seg_array->segments[i].prev_idx = -1;  
+        // Initialize the bitmap lock for this segment
+        LWLockInitialize(&seg_array->segments[i].bitmap_lock, LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE_ID);
     }
 }
 
@@ -291,17 +293,20 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     MergeSegmentInfo *segment = &seg_array->segments[task->segment_idx0];
     Oid index_relid = seg_array->current_index_relid;
     
+    // Find latest version once to avoid multiple directory scans
+    uint32_t version = find_latest_segment_version(index_relid, segment->start_sid, segment->end_sid);
+    
     // Load the existing index from disk
     void *old_index_ptr = NULL;
-    load_index_file(index_relid, segment->start_sid, segment->end_sid, segment->index_type, &old_index_ptr);
+    load_index_file(index_relid, segment->start_sid, segment->end_sid, version, segment->index_type, &old_index_ptr);
     Assert(old_index_ptr != NULL);
     // Load the bitmap from disk
     uint8_t *old_bitmap_ptr = NULL;
-    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, &old_bitmap_ptr, true);
+    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, version, &old_bitmap_ptr, true);
     Assert(old_bitmap_ptr != NULL);
     // Load the mapping from disk
     int64_t *old_mapping_ptr = NULL;
-    load_mapping_file(index_relid, segment->start_sid, segment->end_sid, &old_mapping_ptr, true);
+    load_mapping_file(index_relid, segment->start_sid, segment->end_sid, version, &old_mapping_ptr, true);
     Assert(old_mapping_ptr != NULL);
     
     // Create new index with filtered vectors
@@ -331,6 +336,21 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
                M, efConstruction, lists);
     Assert(new_index_ptr != NULL);
     
+    // Save original bitmap state for mapping generation (new index was built from this state)
+    Size original_bitmap_size = GET_BITMAP_SIZE(segment->vec_count);
+    uint8_t *original_bitmap_ptr = (uint8_t *) palloc(original_bitmap_size);
+    memcpy(original_bitmap_ptr, old_bitmap_ptr, original_bitmap_size);
+    
+    // Acquire exclusive bitmap lock before reloading bitmap
+    LWLockAcquire(&segment->bitmap_lock, LW_EXCLUSIVE);
+    
+    // Free old bitmap before reloading
+    pfree(old_bitmap_ptr);
+    
+    // Reload bitmap from disk after acquiring lock
+    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, version, &old_bitmap_ptr, true);
+    Assert(old_bitmap_ptr != NULL);
+    
     // Serialize the new index
     void *new_index_bin = NULL;
     IndexSerialize(new_index_ptr, &new_index_bin);
@@ -344,6 +364,7 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     memset(new_bitmap_ptr, 0x00, GET_BITMAP_SIZE(new_index_count));
 
     // Generate new mapping by filtering out deleted entries from the old mapping
+    // Use original_bitmap_ptr to match the state used when building the new index
     Size new_map_size = sizeof(int64_t) * (Size)new_index_count;
     int64_t *new_mapping_ptr = (int64_t *) palloc(new_map_size);
     Assert(new_mapping_ptr != NULL);
@@ -351,13 +372,16 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
         int write_idx = 0;
         for (int i = 0; i < (int)segment->vec_count; i++)
         {
-            if (!IS_SLOT_SET(old_bitmap_ptr, i))
+            if (!IS_SLOT_SET(original_bitmap_ptr, i))
             {
                 new_mapping_ptr[write_idx++] = old_mapping_ptr[i];
             }
         }
         Assert(write_idx == new_index_count);
     }
+    
+    // Free the saved original bitmap
+    pfree(original_bitmap_ptr);
 
     // Update the segment information in task
     task->merged_index_type = target_type;
@@ -408,51 +432,168 @@ merge_adjacent_segments(MergeTaskData *task)
     int64_t *mapping1_ptr = NULL;
     int64_t *merged_mapping_ptr = NULL;
     
+    // Find latest versions once to avoid multiple directory scans
+    uint32_t version0 = find_latest_segment_version(index_relid, segment0->start_sid, segment0->end_sid);
+    uint32_t version1 = find_latest_segment_version(index_relid, segment1->start_sid, segment1->end_sid);
+    
     // Load both indices from disk
     void *index0_ptr = NULL;
-    load_index_file(index_relid, segment0->start_sid, segment0->end_sid, segment0->index_type, &index0_ptr);
+    load_index_file(index_relid, segment0->start_sid, segment0->end_sid, version0, segment0->index_type, &index0_ptr);
     Assert(index0_ptr != NULL);
     
     void *index1_ptr = NULL;
-    load_index_file(index_relid, segment1->start_sid, segment1->end_sid, segment1->index_type, &index1_ptr);
+    load_index_file(index_relid, segment1->start_sid, segment1->end_sid, version1, segment1->index_type, &index1_ptr);
     Assert(index1_ptr != NULL);
     
     // Load both bitmaps from disk
     uint8_t *bitmap0_ptr = NULL;
-    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, &bitmap0_ptr, true);
+    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &bitmap0_ptr, true);
     Assert(bitmap0_ptr != NULL);
     
     uint8_t *bitmap1_ptr = NULL;
-    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, &bitmap1_ptr, true);
+    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &bitmap1_ptr, true);
     Assert(bitmap1_ptr != NULL);
     
-    // Merge the two indices
-    void *merged_index_ptr = NULL; // no neeed to free merged_index_ptr as it points to the larger index
-    uint8_t *merged_bitmap_ptr = NULL;
-    int merged_count = 0;
-    IndexType merged_index_type;
-    float merged_deletion_ratio;
-    
-    // TODO: make the parameters configurable
-    // Load mappings for both segments (used by MergeTwoIndices to build merged mapping)
-    load_mapping_file(index_relid, segment0->start_sid, segment0->end_sid, &mapping0_ptr, true);
+    // Load mappings for both segments (used to build merged mapping after merge)
+    load_mapping_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &mapping0_ptr, true);
     Assert(mapping0_ptr != NULL);
-    load_mapping_file(index_relid, segment1->start_sid, segment1->end_sid, &mapping1_ptr, true);
+    load_mapping_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &mapping1_ptr, true);
     Assert(mapping1_ptr != NULL);
 
-    merged_index_ptr = MergeTwoIndices(index0_ptr, bitmap0_ptr, mapping0_ptr, segment0->vec_count, segment0->index_type, segment0->deletion_ratio,
-                    index1_ptr, bitmap1_ptr, mapping1_ptr, segment1->vec_count, segment1->index_type, segment1->deletion_ratio,
-                    &merged_bitmap_ptr, &merged_mapping_ptr, &merged_count,
-                    &merged_index_type, &merged_deletion_ratio);
+    // Decide which index is larger outside of MergeTwoIndices
+    void *larger_index_ptr;
+    void *smaller_index_ptr;
+    uint8_t *larger_bitmap_ptr;
+    uint8_t *smaller_bitmap_ptr;
+    int64_t *larger_mapping_ptr;
+    int64_t *smaller_mapping_ptr;
+    int larger_count;
+    int smaller_count;
+    IndexType larger_index_type;
+    IndexType smaller_index_type;
+    float larger_deletion_ratio;
+    float smaller_deletion_ratio;
     
-    Assert(merged_index_ptr != NULL);
+    if (segment0->vec_count >= segment1->vec_count) {
+        larger_index_ptr = index0_ptr;
+        smaller_index_ptr = index1_ptr;
+        larger_bitmap_ptr = bitmap0_ptr;
+        smaller_bitmap_ptr = bitmap1_ptr;
+        larger_mapping_ptr = mapping0_ptr;
+        smaller_mapping_ptr = mapping1_ptr;
+        larger_count = segment0->vec_count;
+        smaller_count = segment1->vec_count;
+        larger_index_type = segment0->index_type;
+        smaller_index_type = segment1->index_type;
+        larger_deletion_ratio = segment0->deletion_ratio;
+        smaller_deletion_ratio = segment1->deletion_ratio;
+    } else {
+        larger_index_ptr = index1_ptr;
+        smaller_index_ptr = index0_ptr;
+        larger_bitmap_ptr = bitmap1_ptr;
+        smaller_bitmap_ptr = bitmap0_ptr;
+        larger_mapping_ptr = mapping1_ptr;
+        smaller_mapping_ptr = mapping0_ptr;
+        larger_count = segment1->vec_count;
+        smaller_count = segment0->vec_count;
+        larger_index_type = segment1->index_type;
+        smaller_index_type = segment0->index_type;
+        larger_deletion_ratio = segment1->deletion_ratio;
+        smaller_deletion_ratio = segment0->deletion_ratio;
+    }
+
+    // Merge the two indices (MergeTwoIndices verifies index size internally)
+    void *merged_index_ptr = NULL; // no need to free merged_index_ptr as it points to the larger index
+    int merged_count = 0;
+    
+    merged_index_ptr = MergeTwoIndices(larger_index_ptr, larger_count, larger_index_type,
+                                       smaller_index_ptr, smaller_count, smaller_index_type,
+                                       &merged_count);
+    
+    Assert(merged_index_ptr == larger_index_ptr);
+    
+    // Acquire exclusive bitmap locks for both segments before reloading bitmaps
+    // Acquire locks in consistent order (by segment index) to avoid deadlock
+    if (task->segment_idx0 < task->segment_idx1) {
+        LWLockAcquire(&segment0->bitmap_lock, LW_EXCLUSIVE);
+        LWLockAcquire(&segment1->bitmap_lock, LW_EXCLUSIVE);
+    } else {
+        LWLockAcquire(&segment1->bitmap_lock, LW_EXCLUSIVE);
+        LWLockAcquire(&segment0->bitmap_lock, LW_EXCLUSIVE);
+    }
+    
+    // Free old bitmaps before reloading
+    pfree(bitmap0_ptr);
+    pfree(bitmap1_ptr);
+    
+    // Reload both bitmaps from disk after acquiring locks
+    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &bitmap0_ptr, true);
+    Assert(bitmap0_ptr != NULL);
+    
+    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &bitmap1_ptr, true);
+    Assert(bitmap1_ptr != NULL);
+    
+    // Update pointers to point to the newly loaded bitmaps
+    if (segment0->vec_count >= segment1->vec_count) {
+        larger_bitmap_ptr = bitmap0_ptr;
+        smaller_bitmap_ptr = bitmap1_ptr;
+    } else {
+        larger_bitmap_ptr = bitmap1_ptr;
+        smaller_bitmap_ptr = bitmap0_ptr;
+    }
+    
+    // Generate new bitmap and mapping after returned from MergeTwoIndices
+    int total_count = larger_count + smaller_count;
+    Assert(merged_count == total_count);
+    
+    // Create merged bitmap by concatenating the two original bitmaps
+    Size merged_bitmap_size = GET_BITMAP_SIZE(total_count);
+    uint8_t *merged_bitmap_ptr = (uint8_t *) palloc0(merged_bitmap_size);
+    
+    // Copy bitmap from larger index bit by bit
+    for (int i = 0; i < larger_count; i++) {
+        if (IS_SLOT_SET(larger_bitmap_ptr, i)) {
+            SET_SLOT(merged_bitmap_ptr, i);
+        }
+    }
+
+    // Copy bitmap from smaller index bit by bit (starting after larger_count)
+    for (int i = 0; i < smaller_count; i++) {
+        int merged_bit_pos = larger_count + i;
+        if (IS_SLOT_SET(smaller_bitmap_ptr, i)) {
+            SET_SLOT(merged_bitmap_ptr, merged_bit_pos);
+        }
+    }
+    
+    // Clear any unused bits in the last byte if needed
+    int remaining_bits = total_count % 8;
+    if (remaining_bits != 0) {
+        uint8_t mask = (1 << remaining_bits) - 1;
+        merged_bitmap_ptr[merged_bitmap_size - 1] &= mask;
+    }
+
+    // Build merged mapping in the same order: larger first, then smaller
+    Size merged_map_size = sizeof(int64_t) * (Size)total_count;
+    merged_mapping_ptr = (int64_t *) palloc(merged_map_size);
+    for (int i = 0; i < larger_count; i++) {
+        merged_mapping_ptr[i] = larger_mapping_ptr[i];
+    }
+    for (int i = 0; i < smaller_count; i++) {
+        merged_mapping_ptr[larger_count + i] = smaller_mapping_ptr[i];
+    }
+
+    // Compute merged_index_type (use the index type of the larger segment)
+    IndexType merged_index_type = larger_index_type;
+    
+    // Compute merged_deletion_ratio as weighted average of the two segments
+    float merged_deletion_ratio = (larger_deletion_ratio * larger_count + smaller_deletion_ratio * smaller_count) / total_count;
     
     // Serialize the merged index
     void *merged_index_bin = NULL;
     IndexSerialize(merged_index_ptr, &merged_index_bin);
     Assert(merged_index_bin != NULL);
     
-    // Update the segment information in task using values computed by MergeTwoIndices
+    // Update the segment information in task
     task->merged_index_type = merged_index_type;
     task->merged_vec_count = merged_count;
     task->merged_deletion_ratio = merged_deletion_ratio;
@@ -665,6 +806,13 @@ finish_merge_task(int worker_id)
     }
     
     LWLockRelease(seg_array->lock);
+
+    // step 3: release the bitmap lock for the segment being rebuilt or merged
+    LWLockRelease(&seg_array->segments[task->segment_idx0].bitmap_lock);
+    if (task->segment_idx1 != -1)
+    {
+        LWLockRelease(&seg_array->segments[task->segment_idx1].bitmap_lock);
+    }
     
     // step 3: reset `is_compacting` flag for the segment being rebuilt or merged
     // (This is already done above in the switch statement)

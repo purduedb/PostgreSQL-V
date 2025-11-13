@@ -85,6 +85,16 @@ _PG_init(void)
 	// reserve LWLock tranche for merge worker manager (need multiple locks for segment arrays)
 	RequestNamedLWLockTranche("LSM Merge Worker", INDEX_BUF_SIZE + 1); // +1 for main manager lock
 	LWLockRegisterTranche(1003, "LSM Merge Worker");
+	
+	// reserve LWLock tranche for merge segment bitmap locks
+	// Need INDEX_BUF_SIZE * MAX_SEGMENTS_COUNT locks (one per segment per index buffer slot)
+	RequestNamedLWLockTranche(LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE, INDEX_BUF_SIZE * MAX_SEGMENTS_COUNT);
+	LWLockRegisterTranche(LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE_ID, LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE);
+	
+	// reserve LWLock tranche for memtable vacuum locks
+	// Need MEMTABLE_BUF_SIZE locks (one per memtable slot)
+	RequestNamedLWLockTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE, MEMTABLE_BUF_SIZE);
+	LWLockRegisterTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE_ID, LSM_MEMTABLE_VACUUM_LWTRANCHE);
 
 	// TODO: reserve shared memory for lsm index
 

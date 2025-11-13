@@ -1,4 +1,5 @@
 #include "lsmindex.h"
+#include "utils/elog.h"
 #include "vectorindeximpl.hpp"
 #include "utils.h"
 #include "lib/stringinfo.h"
@@ -107,6 +108,9 @@ lsm_index_buffer_shmem_initialize()
 
             /* Initialize header fields */
             memset(mt, 0, sizeof(*mt));
+            
+            /* Initialize the vacuum lock for this memtable */
+            LWLockInitialize(&mt->vacuum_lock, LSM_MEMTABLE_VACUUM_LWTRANCHE_ID);
         }
     }
 }
@@ -813,6 +817,7 @@ search_sealed_memtable(ConcurrentMemTable mt, const void *query_vector, int k, D
 {
     return search_memtable_common(mt, query_vector, k, top_k_pairs, /*check_ready=*/false);
 }
+
 // FIXME: how to decide the search parameters for each segment?
 // for now we just use the same parameters for all segments
 TopKTuples
@@ -896,6 +901,442 @@ search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs)
     // elog(DEBUG1, "[search_lsm_index] return %d", topk_result.num_results);
     return topk_result;
 }
+
+IndexBulkDeleteResult *
+bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state)
+{
+    elog(DEBUG1, "[bulk_delete_lsm_index] enter bulk_delete_lsm_index");
+    if (stats == NULL)
+    {
+        stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+    }
+    
+    int lsm_idx = get_lsm_index_idx(index->rd_id);
+    if (lsm_idx < 0)
+    {
+        return stats;
+    }
+    
+    LSMIndex lsm = &SharedLSMIndexBuffer->slots[lsm_idx].lsmIndex;
+    Oid indexRelId = index->rd_id;
+    
+    // Track memtable IDs that have been vacuumed to avoid duplicates
+    SegmentId vacuumed_memtable_ids[MEMTABLE_NUM + 1]; // +1 for growing memtable
+    uint32_t vacuumed_count = 0;
+    
+    // step 1. vacuum the growing memtable
+    /*
+    * 1. acquire the vacuum lock of the growing memtable
+    * 2. iterate over all ready slots in the growing memtable
+    * 3. for all ready slots in the growing memtable, use the callback function to check if the corresponding vector is deleted
+    * 4. if deleted, mark the slot as deleted in the bitmap
+    * 5. if not deleted, continue
+    * 6. check if the growing memtable is persistent on disk
+    * 7. if persistent, flush the growing memtable to disk
+    * 8. notify the index worker to update the bitmap (latest segment files)
+    * 9. release the vacuum lock of the growing memtable
+    */
+    // elog(DEBUG1, "[bulk_delete_lsm_index] step 1. vacuum the growing memtable");
+    SegmentId growing_memtable_id = 0;  // 0 indicates no growing memtable
+    {
+        int gidx = -1;
+        LWLockAcquire(lsm->mt_lock, LW_SHARED);
+        gidx = lsm->growing_memtable_idx;
+        
+        if (gidx >= 0 && gidx != MT_IDX_INVALID && gidx != MT_IDX_ROTATING)
+        {
+            // Increment reference count while holding mt_lock
+            pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[gidx].ref_count, 1);
+            growing_memtable_id = MT_FROM_SLOTIDX(gidx)->memtable_id;
+        }
+        LWLockRelease(lsm->mt_lock);
+        
+        if (gidx >= 0 && gidx != MT_IDX_INVALID && gidx != MT_IDX_ROTATING)
+        {
+            ConcurrentMemTable mt = MT_FROM_SLOTIDX(gidx);
+            
+            // Acquire vacuum lock
+            LWLockAcquire(&mt->vacuum_lock, LW_EXCLUSIVE);
+            
+            // Iterate over all ready slots
+            uint32_t current_size = pg_atomic_read_u32(&mt->current_size);
+            uint32_t valid_size = (current_size > mt->capacity) ? mt->capacity : current_size;
+            
+            bool bitmap_changed = false;
+            
+            // Iterate over ready slots (for growing memtable, we check ready flag)
+            for (uint32_t i = 0; i < valid_size; i++)
+            {
+                if (mt->ready[i] == 1)  // Slot is ready
+                {
+                    int64_t tid_int64 = mt->tids[i];
+                    ItemPointerData tid = Int64ToItemPointer(tid_int64);
+                    if (callback(&tid, callback_state))
+                    {
+                        // Vector is deleted, mark it in bitmap
+                        SET_SLOT(mt->bitmap, i);
+                        bitmap_changed = true;
+                        stats->tuples_removed++;
+                    }
+                    else {
+                        stats->num_index_tuples++;
+                    }
+                }
+            }
+            
+            // Check if memtable is persistent on disk (has been flushed)
+            // A memtable is persistent if there's a segment file for its memtable_id
+            SegmentId start_sid_disk, end_sid_disk;
+            uint32_t valid_rows;
+            IndexType seg_index_type;
+            bool is_persistent = read_lsm_segment_metadata(indexRelId, mt->memtable_id, mt->memtable_id, 
+                                                          UINT32_MAX, &start_sid_disk, &end_sid_disk, 
+                                                          &valid_rows, &seg_index_type);
+            
+            if (is_persistent && bitmap_changed)
+            {
+                // Find latest version and subversion
+                uint32_t version = find_latest_segment_version(indexRelId, mt->memtable_id, mt->memtable_id);
+                uint32_t latest_subversion = find_latest_bitmap_subversion(indexRelId, mt->memtable_id, mt->memtable_id, version);
+                uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
+                
+                // Write updated bitmap with subversion
+                write_bitmap_file_with_subversion(indexRelId, mt->memtable_id, mt->memtable_id, 
+                                                  version, next_subversion, mt->bitmap, 
+                                                  GET_BITMAP_SIZE(valid_size));
+                
+                // notify the index worker to update the bitmap
+                segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
+                elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for growing memtable %u", mt->memtable_id);
+            }
+            
+            // Release vacuum lock
+            LWLockRelease(&mt->vacuum_lock);
+            
+            // Decrement reference count (atomic operation, no lock needed)
+            pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[gidx].ref_count, -1);
+            
+            // Record this memtable as vacuumed
+            vacuumed_memtable_ids[vacuumed_count++] = growing_memtable_id;
+        }
+    }
+    
+    // step 2. vacuum the immutable memtables
+    /*
+    * 1. iterate over all immutable memtables
+    * 2. for each immutable memtable, acquire the vacuum lock
+    * 3. iterate over all slots in the immutable memtable
+    * 4. for each slot, use the callback function to check if the corresponding vector is deleted
+    * 5. if deleted, mark the slot as deleted in the bitmap
+    * 6. if not deleted, continue
+    * 7. check if the immutable memtable is persistent on disk
+    * 8. if persistent, flush the immutable memtable to disk, and notify the index worker to update the bitmap
+    * 9. release the vacuum lock of the immutable memtable
+    */
+    // elog(DEBUG1, "[bulk_delete_lsm_index] step 2. vacuum the immutable memtables");
+    {
+        // Process immutable memtables one by one, checking if they're still in the list
+        // to avoid processing memtables that were removed while we were working
+        for (;;)
+        {
+            SegmentId memtable_id_to_vacuum = 0;  // 0 indicates no memtable to vacuum
+            int mt_idx_to_vacuum = -1;
+            
+            // Get next immutable memtable to vacuum (if any)
+            LWLockAcquire(lsm->mt_lock, LW_SHARED);
+            
+            // Skip immutable memtables with sid >= growing_memtable_id recorded in step 1
+            // (already vacuumed in step 1 or newer than the one we vacuumed)
+            
+            // Find first immutable memtable that hasn't been vacuumed yet
+            // Iterate backwards to process more recent memtables first
+            uint32_t memtable_count = lsm->memtable_count;
+            for (int i = (int)memtable_count - 1; i >= 0; i--)
+            {
+                if (i >= (int)MEMTABLE_NUM)
+                    elog(ERROR, "[bulk_delete_lsm_index] memtable index out of range");
+                    
+                int mt_idx = lsm->memtable_idxs[i];
+                if (mt_idx < 0 || mt_idx >= MEMTABLE_BUF_SIZE)
+                    continue;
+                
+                ConcurrentMemTable mt = MT_FROM_SLOTIDX(mt_idx);
+                SegmentId mt_id = mt->memtable_id;
+                
+                // Skip if sid >= growing memtable sid (already vacuumed in step 1 or newer)
+                if (mt_id >= growing_memtable_id)
+                    continue;
+                
+                // Skip if already vacuumed
+                bool already_vacuumed = false;
+                for (uint32_t j = 0; j < vacuumed_count; j++)
+                {
+                    if (vacuumed_memtable_ids[j] == mt_id)
+                    {
+                        already_vacuumed = true;
+                        break;
+                    }
+                }
+                
+                if (!already_vacuumed)
+                {
+                    memtable_id_to_vacuum = mt_id;
+                    mt_idx_to_vacuum = mt_idx;
+                    // Increment reference count while holding mt_lock
+                    pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[mt_idx].ref_count, 1);
+                    break;
+                }
+            }
+            
+            LWLockRelease(lsm->mt_lock);
+            
+            // If no more memtables to vacuum, break
+            if (mt_idx_to_vacuum < 0)
+                break;
+            
+            // Verify memtable still exists and get it
+            ConcurrentMemTable mt = MT_FROM_SLOTIDX(mt_idx_to_vacuum);
+            if (mt->rel != indexRelId || mt->memtable_id != memtable_id_to_vacuum)
+            {
+                elog(ERROR, "[bulk_delete_lsm_index] memtable was removed or changed"); // this should not happen as we increment the reference count while holding the mt_lock
+                // Memtable was removed or changed, decrement ref count before skipping
+                pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[mt_idx_to_vacuum].ref_count, -1);
+                continue;
+            }
+            
+            // Acquire vacuum lock
+            LWLockAcquire(&mt->vacuum_lock, LW_EXCLUSIVE);
+            
+            // Iterate over all slots (immutable memtables are sealed, so all slots are valid)
+            uint32_t current_size = pg_atomic_read_u32(&mt->current_size);
+            uint32_t valid_size = (current_size > mt->capacity) ? mt->capacity : current_size;
+            
+            bool bitmap_changed = false;
+            
+            for (uint32_t j = 0; j < valid_size; j++)
+            {
+                int64_t tid_int64 = mt->tids[j];
+                ItemPointerData tid = Int64ToItemPointer(tid_int64);
+                if (callback(&tid, callback_state))
+                {
+                    // Vector is deleted, mark it in bitmap
+                    SET_SLOT(mt->bitmap, j);
+                    bitmap_changed = true;
+                    stats->tuples_removed++;
+                }
+                else {
+                    stats->num_index_tuples++;
+                }
+            }
+            
+            // Check if memtable is persistent on disk
+            SegmentId start_sid_disk, end_sid_disk;
+            uint32_t valid_rows;
+            IndexType seg_index_type;
+            bool is_persistent = read_lsm_segment_metadata(indexRelId, mt->memtable_id, mt->memtable_id, 
+                                                          UINT32_MAX, &start_sid_disk, &end_sid_disk, 
+                                                          &valid_rows, &seg_index_type);
+            
+            if (is_persistent && bitmap_changed)
+            {
+                // Find latest version and subversion
+                uint32_t version = find_latest_segment_version(indexRelId, mt->memtable_id, mt->memtable_id);
+                uint32_t latest_subversion = find_latest_bitmap_subversion(indexRelId, mt->memtable_id, mt->memtable_id, version);
+                uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
+                
+                // Write updated bitmap with subversion
+                write_bitmap_file_with_subversion(indexRelId, mt->memtable_id, mt->memtable_id, 
+                                                  version, next_subversion, mt->bitmap, 
+                                                  GET_BITMAP_SIZE(valid_size));
+
+                // notify the index worker to update the bitmap
+                segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
+                elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for immutable memtable %u", mt->memtable_id);
+            }
+            
+            // Release vacuum lock
+            LWLockRelease(&mt->vacuum_lock);
+            
+            // Decrement reference count (atomic operation, no lock needed)
+            pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[mt_idx_to_vacuum].ref_count, -1);
+
+            // Record this memtable as vacuumed
+            if (vacuumed_count < MEMTABLE_NUM + 1)
+            {
+                vacuumed_memtable_ids[vacuumed_count++] = mt->memtable_id;
+            }
+        }
+    }
+
+    // step 3. vacuum the merged segments
+    /*
+    * 1. iterate over all merged segments
+    * 2. for each merged segment, acquire the vacuum lock
+    * 3. load the bitmap and the mapping of the latest version of the merged segment
+    * 4. conduct vacuum on the merged segment to generate a new bitmap
+    * 5. flush the merged segment to disk
+    * 6. notify the index worker to update the bitmap
+    * 7. release the vacuum lock of the merged segment
+    */
+    // elog(DEBUG1, "[bulk_delete_lsm_index] step 3. vacuum the merged segments");
+    {
+        if (merge_worker_manager == NULL)
+        {
+            return stats;
+        }
+        
+        SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
+        
+        LWLockAcquire(seg_array->lock, LW_SHARED);
+        
+        // Maintain the largest segment ID that has been merged/vacuumed
+        // We guarantee to vacuum segments in ascending order
+        SegmentId max_vacuumed_segment_id = 0;
+        
+        // Iterate over all segments in the linked list
+        // Note that we must get the next idx in list before releasing the current segment's bitmap_lock
+        uint32_t cur_idx = 0;  // head_idx is always 0
+        while (cur_idx != (uint32_t)-1)
+        {
+            MergeSegmentInfo *segment = &seg_array->segments[cur_idx];
+
+            Assert(segment->in_used);
+            
+            // Check if this segment corresponds to a memtable we already vacuumed
+            // Memtables are stored as segments with start_sid == end_sid == memtable_id
+            bool already_vacuumed = false;
+            for (uint32_t i = 0; i < vacuumed_count; i++)
+            {
+                // Check if segment matches a vacuumed memtable
+                // For memtables: start_sid == end_sid == memtable_id
+                if (segment->start_sid == segment->end_sid && 
+                    segment->start_sid == vacuumed_memtable_ids[i])
+                {
+                    already_vacuumed = true;
+                    break;
+                }
+            }
+            
+            // Capture segment end_sid before releasing lock
+            SegmentId segment_end_sid = segment->end_sid;
+            
+            // Release shared lock before acquiring segment lock
+            LWLockRelease(seg_array->lock);
+            
+            // Acquire segment bitmap lock
+            LWLockAcquire(&segment->bitmap_lock, LW_EXCLUSIVE);
+
+            // Check if segment is still in use after acquiring bitmap lock
+            if (!segment->in_used)
+            {
+                // Release segment bitmap lock
+                LWLockRelease(&segment->bitmap_lock);
+                
+                // Re-acquire shared lock for next iteration
+                LWLockAcquire(seg_array->lock, LW_SHARED);
+                
+                // Iterate from head to locate the next segment to be vacuumed
+                // corresponding to the largest segment id we maintained
+                uint32_t next_idx = (uint32_t)-1;
+                
+                uint32_t search_idx = 0;  // Start from head
+                while (search_idx != (uint32_t)-1)
+                {
+                    MergeSegmentInfo *search_seg = &seg_array->segments[search_idx];
+                    Assert(search_seg->in_used);
+                    if (search_seg->start_sid >= max_vacuumed_segment_id)
+                    {
+                        next_idx = search_idx;
+                        break;
+                    }
+                    search_idx = search_seg->next_idx;
+                }
+                
+                cur_idx = next_idx;
+                continue;
+            }
+
+            if (!already_vacuumed)
+            {   
+                // Load bitmap and mapping of latest version
+                uint8_t *bitmap_ptr = NULL;
+                int64_t *mapping_ptr = NULL;
+                
+                uint32_t version = find_latest_segment_version(indexRelId, segment->start_sid, segment->end_sid);
+                load_bitmap_file(indexRelId, segment->start_sid, segment->end_sid, version, &bitmap_ptr, true);
+                load_mapping_file(indexRelId, segment->start_sid, segment->end_sid, version, &mapping_ptr, true);
+                
+                // Conduct vacuum: check each vector using callback
+                bool bitmap_changed = false;
+                uint32_t vec_count = segment->vec_count;
+                
+                for (uint32_t i = 0; i < vec_count; i++)
+                {
+                    if (!IS_SLOT_SET(bitmap_ptr, i))  // Only check non-deleted vectors
+                    {
+                        int64_t tid_int64 = mapping_ptr[i];
+                        ItemPointerData tid = Int64ToItemPointer(tid_int64);
+                        if (callback(&tid, callback_state))
+                        {
+                            // Vector is deleted, mark it in bitmap
+                            SET_SLOT(bitmap_ptr, i);
+                            bitmap_changed = true;
+                            stats->tuples_removed++;
+                        }
+                        else {
+                            stats->num_index_tuples++;
+                        }
+                    }
+                }
+                
+                if (bitmap_changed)
+                {
+                    // Find latest subversion and increment it
+                    uint32_t latest_subversion = find_latest_bitmap_subversion(indexRelId, segment->start_sid, segment->end_sid, version);
+                    uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
+                    
+                    // Write updated bitmap with subversion
+                    Size bitmap_size = GET_BITMAP_SIZE(vec_count);
+                    write_bitmap_file_with_subversion(indexRelId, segment->start_sid, segment->end_sid, 
+                                                      version, next_subversion, bitmap_ptr, bitmap_size);
+                    
+                    // notify the index worker to update the bitmap (use VACUUM operation type)
+                    segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, segment->start_sid, segment->end_sid);
+                    elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for merged segment %u", segment->start_sid);
+                }
+                
+                // Cleanup
+                pfree(bitmap_ptr);
+                pfree(mapping_ptr);
+            }
+            
+            // Update the largest segment ID that has been vacuumed
+            if (segment_end_sid > max_vacuumed_segment_id)
+            {
+                max_vacuumed_segment_id = segment_end_sid;
+            }
+
+            // Move to next segment
+            LWLockAcquire(seg_array->lock, LW_SHARED);
+            cur_idx = segment->next_idx;
+            LWLockRelease(seg_array->lock);
+
+            // Release segment bitmap lock
+            LWLockRelease(&segment->bitmap_lock);
+
+            // acquire the shared lock for the next iteration
+            LWLockAcquire(seg_array->lock, LW_SHARED);
+        }
+        
+        LWLockRelease(seg_array->lock);
+    }
+    
+    elog(DEBUG1, "[bulk_delete_lsm_index] completed bulk_delete_lsm_index for index %u: tuples_removed=%ld, num_index_tuples=%ld", 
+         indexRelId, stats->tuples_removed, stats->num_index_tuples);
+    
+    return stats;
+}
+
 
 // -------------------------------- for debugging ----------------------------------
 // static void*

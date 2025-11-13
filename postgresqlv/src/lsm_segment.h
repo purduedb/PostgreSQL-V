@@ -51,6 +51,6 @@ void find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start
 void replace_flushed_segment(FlushedSegmentPool *pool, uint32_t old_seg_idx_0, uint32_t old_seg_idx_1, uint32_t new_seg_idx);
 // IO
 void load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool);                     
-void load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid);
+void load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid, uint32_t version);
 
 #endif

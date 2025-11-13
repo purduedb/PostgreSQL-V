@@ -13,6 +13,10 @@
 #define MAX_SEGMENTS_SIZE 10000000            // The max number of vectors in a segment, the segment will not be merged if the number of vectors is larger than this value
 #define THRESHOLD_SMALL_SEGMENT_SIZE 1000000   // The min number of vectors in a segment, the segment will be merged if the number of vectors is smaller than this value
 
+// LWLock tranche for merge segment bitmap locks
+#define LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE "LSM Merge Segment Bitmap"
+#define LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE_ID 1004
+
 // Segment information structure for merge worker (scanned from disk)
 typedef struct {
     bool in_used;
@@ -28,6 +32,9 @@ typedef struct {
     // staticstics
     // TODO: we need to update the deletion ratio when we implemnting the deletion logic
     float deletion_ratio;
+    
+    // LWLock for bitmap concurrency control
+    LWLock bitmap_lock;
 } MergeSegmentInfo;
 
 typedef struct {
@@ -61,6 +68,7 @@ typedef struct {
     // segment information
     MergeSegmentInfo segments[MAX_SEGMENTS_COUNT];
     uint32_t segment_count;
+    // the head_idx is always 0
     uint32_t tail_idx;             // Index of the last segment in the linked list
     uint32_t insert_idx;           // Next available slot for insertion
     SegmentId max_end_segment_id;  // Current maximum end segment ID

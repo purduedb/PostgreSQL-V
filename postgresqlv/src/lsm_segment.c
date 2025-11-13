@@ -320,7 +320,8 @@ load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool)
         }
 
         FlushedSegment segment = &pool->flushed_segments[seg_idx];
-        load_and_set_segment(index_oid, seg_idx, segment, files[i].start_sid, files[i].end_sid);
+        // Use version from SegmentFileInfo to avoid recalculating it
+        load_and_set_segment(index_oid, seg_idx, segment, files[i].start_sid, files[i].end_sid, files[i].version);
         
         register_flushed_segment(pool, seg_idx);
     }
@@ -330,13 +331,19 @@ load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool)
 
 // handled by vector index worker (for index build)
 void 
-load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid)
+load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid, uint32_t version)
 {
     SegmentId start_sid_disk, end_sid_disk;
     uint32_t valid_rows;
     IndexType seg_index_type;
     
-    if (read_lsm_segment_metadata(indexRelId, start_sid, end_sid, 
+    // If version is UINT32_MAX, find latest version once to avoid multiple directory scans
+    if (version == UINT32_MAX)
+    {
+        version = find_latest_segment_version(indexRelId, start_sid, end_sid);
+    }
+    
+    if (read_lsm_segment_metadata(indexRelId, start_sid, end_sid, version,
                              &start_sid_disk, &end_sid_disk, &valid_rows, &seg_index_type))
     {
         segment->segment_id_start = start_sid_disk;
@@ -344,16 +351,16 @@ load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segmen
         segment->vec_count = valid_rows;
         segment->index_type = seg_index_type;
 
-        load_index_file(indexRelId, start_sid, end_sid, seg_index_type, &segment->index_ptr);
-        load_bitmap_file(indexRelId, start_sid, end_sid, &segment->bitmap_ptr, false);
-        load_mapping_file(indexRelId, start_sid, end_sid, &segment->map_ptr, false);
+        load_index_file(indexRelId, start_sid, end_sid, version, seg_index_type, &segment->index_ptr);
+        load_bitmap_file(indexRelId, start_sid, end_sid, version, &segment->bitmap_ptr, false);
+        load_mapping_file(indexRelId, start_sid, end_sid, version, &segment->map_ptr, false);
 
         segment->in_used = true;
-        elog(DEBUG1, "[load_segment_from_disk] loaded segment %u-%u with %u vectors", start_sid, end_sid, valid_rows);
+        elog(DEBUG1, "[load_segment_from_disk] loaded segment %u-%u v%u with %u vectors", start_sid, end_sid, version, valid_rows);
     }
     else 
     {
-        elog(ERROR, "[load_segment_from_disk] Failed to read segment metadata for segment %u-%u", start_sid, end_sid);
+        elog(ERROR, "[load_segment_from_disk] Failed to read segment metadata for segment %u-%u v%u", start_sid, end_sid, version);
     }
     pg_write_barrier();
 }

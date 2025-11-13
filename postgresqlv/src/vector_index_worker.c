@@ -166,7 +166,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
         {
             elog(ERROR, "[build_lsm_index] no free flushed segment slot");
         }
-        load_and_set_segment(index_relid, seg_idx, &pool->flushed_segments[seg_idx], START_SEGMENT_ID, START_SEGMENT_ID);
+        load_and_set_segment(index_relid, seg_idx, &pool->flushed_segments[seg_idx], START_SEGMENT_ID, START_SEGMENT_ID, LOAD_LATEST_VERSION);
         register_flushed_segment(pool, seg_idx);
 
         // notify the client
@@ -197,7 +197,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
                 uint32_t seg_idx = reserve_flushed_segment(pool);
                 pthread_rwlock_unlock(&pool->seg_lock);
 
-                load_and_set_segment(index_relid, seg_idx, &pool->flushed_segments[seg_idx], task->start_sid, task->end_sid);
+                load_and_set_segment(index_relid, seg_idx, &pool->flushed_segments[seg_idx], task->start_sid, task->end_sid, LOAD_LATEST_VERSION);
                 
                 pthread_rwlock_wrlock(&pool->seg_lock);
                 register_flushed_segment(pool, seg_idx);
@@ -231,7 +231,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
                 }
 
                 // Step 3: Load the rebuilt segment from disk
-                load_and_set_segment(index_relid, new_seg_idx, &pool->flushed_segments[new_seg_idx], task->start_sid, task->end_sid);
+                load_and_set_segment(index_relid, new_seg_idx, &pool->flushed_segments[new_seg_idx], task->start_sid, task->end_sid, LOAD_LATEST_VERSION);
                 
                 // Step 4: Replace old segment with new segment atomically
                 pthread_rwlock_wrlock(&pool->seg_lock);
@@ -274,7 +274,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
                 }
 
                 // Step 3: Load the merged segment from disk
-                load_and_set_segment(index_relid, new_seg_idx, &pool->flushed_segments[new_seg_idx], task->start_sid, task->end_sid);
+                load_and_set_segment(index_relid, new_seg_idx, &pool->flushed_segments[new_seg_idx], task->start_sid, task->end_sid, LOAD_LATEST_VERSION);
                 
                 // Step 4: Replace old segments with new segment atomically
                 pthread_rwlock_wrlock(&pool->seg_lock);
@@ -283,6 +283,57 @@ handle_task(TaskSlot *task_slot, int slot_idx)
 
                 elog(DEBUG1, "[handle_task] SegmentMerge completed, replaced segments %u and %u with segment %u", 
                      old_seg_idx_0, old_seg_idx_1, new_seg_idx);
+                break;
+            }
+            
+            case SEGMENT_UPDATE_VACUUM:
+            {
+                // Vacuum operation: reload only the latest version bitmap of the segment
+                elog(DEBUG1, "[handle_task] SegmentVacuum task received: reloading bitmap for segment %d-%d", 
+                     task->start_sid, task->end_sid);
+                
+                FlushedSegmentPool *pool = get_flushed_segment_pool(lsm_idx);
+                
+                // Step 1: Find the existing segment
+                pthread_rwlock_rdlock(&pool->seg_lock);
+                uint32_t seg_idx = find_segment_by_sids(pool, task->start_sid, task->end_sid);
+                pthread_rwlock_unlock(&pool->seg_lock);
+                
+                FlushedSegment segment = &pool->flushed_segments[seg_idx];
+                
+                if (segment->bitmap_ptr == NULL) {
+                    elog(ERROR, "[handle_task] Segment %d-%d has NULL bitmap pointer, cannot perform vacuum", 
+                         task->start_sid, task->end_sid);
+                    break;
+                }
+                
+                // Step 2: Load the new bitmap from disk
+                uint8_t *new_bitmap_ptr = NULL;
+                load_bitmap_file(index_relid, task->start_sid, task->end_sid, LOAD_LATEST_VERSION, &new_bitmap_ptr, false);
+                
+                if (new_bitmap_ptr == NULL) {
+                    elog(ERROR, "[handle_task] Failed to load new bitmap for segment %d-%d during vacuum", 
+                         task->start_sid, task->end_sid);
+                    break;
+                }
+                
+                // Step 3: Compare and merge: set all bits that are updated in the new bitmap
+                // This is safe for concurrent searches as we're only setting bits (OR operation)
+                // and not freeing the old bitmap
+                Size bitmap_size = GET_BITMAP_SIZE(segment->vec_count);
+                uint8_t *current_bitmap = segment->bitmap_ptr;
+                
+                // Perform bitwise OR: set all bits that are set in the new bitmap
+                // This updates the current bitmap in place without affecting concurrent readers
+                for (Size i = 0; i < bitmap_size; i++) {
+                    current_bitmap[i] |= new_bitmap_ptr[i];
+                }
+                
+                // Step 4: Free the new bitmap (we've merged its changes into the current one)
+                free(new_bitmap_ptr);
+                
+                elog(DEBUG1, "[handle_task] SegmentVacuum completed, merged new bitmap into segment %d-%d at slot %u", 
+                     task->start_sid, task->end_sid, seg_idx);
                 break;
             }
             
@@ -379,8 +430,7 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
         if (idx == tail_idx_snapshot) break;
         idx = pool->flushed_segments[idx].next_idx;
     } while (true);
-    // TODO: for debugging
-    elog(DEBUG1, "[vector_search] segment_count = %d", segment_count);
+    // elog(DEBUG1, "[vector_search] segment_count = %d", segment_count);
 
     // Release lock early to minimize contention
     pthread_rwlock_unlock(&pool->seg_lock);
@@ -389,8 +439,7 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
     for (uint32_t i = 0; i < segment_count; i++) {
         uint32_t idx = segment_indices[i];
         
-        // TODO: for debugging
-        elog(DEBUG1, "[vector_search] considering search on segment %u-%u, idx = %u", pool->flushed_segments[idx].segment_id_start, pool->flushed_segments[idx].segment_id_end, idx);
+        // elog(DEBUG1, "[vector_search] considering search on segment %u-%u, idx = %u", pool->flushed_segments[idx].segment_id_start, pool->flushed_segments[idx].segment_id_end, idx);
         // skip the flushed segment if its segment id is in the snapshot
         bool found = false;
         for (int j = 0; j < task->snapshot.scount; j++)
@@ -407,8 +456,7 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
                         task->snapshot.gmt_id >= pool->flushed_segments[idx].segment_id_start);
         if (!found)
         {   
-            // TODO: for debugging
-            elog(DEBUG1, "[vector_search] conducting search on segment %u-%u", pool->flushed_segments[idx].segment_id_start, pool->flushed_segments[idx].segment_id_end);
+            // elog(DEBUG1, "[vector_search] conducting search on segment %u-%u", pool->flushed_segments[idx].segment_id_start, pool->flushed_segments[idx].segment_id_end);
             // conduct search
             topKVector *segment_result;
             int64_t *mapping = pool->flushed_segments[idx].map_ptr;

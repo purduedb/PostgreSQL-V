@@ -5,6 +5,8 @@
 #include "ivfflat.h"
 #include "storage/bufmgr.h"
 
+#include "lsmindex.h"
+
 /*
  * Bulk delete tuples from the index
  */
@@ -12,6 +14,11 @@ IndexBulkDeleteResult *
 ivfflatbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				  IndexBulkDeleteCallback callback, void *callback_state)
 {
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	stats = bulk_delete_lsm_index(info->index, stats, callback, callback_state);
+
 	return stats;
 }
 

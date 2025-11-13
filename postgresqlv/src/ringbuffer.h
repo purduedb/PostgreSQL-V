@@ -86,7 +86,7 @@ typedef struct {
     Oid index_relid;
     int lsm_idx;
 
-    int operation_type;     // 0=regular update, 1=rebuild_flat, 2=rebuild_deletion, 3=merge
+    int operation_type;     // 0=regular update, 1=rebuild_flat, 2=rebuild_deletion, 3=merge, 4=vacuum
 
     // the merged segment information
     SegmentId start_sid;
@@ -99,6 +99,7 @@ typedef SegmentUpdateTaskData* SegmentUpdateTask;
 #define SEGMENT_UPDATE_REBUILD_FLAT 1
 #define SEGMENT_UPDATE_REBUILD_DELETION 2
 #define SEGMENT_UPDATE_MERGE 3
+#define SEGMENT_UPDATE_VACUUM 4
 
 // define the index load task structure
 typedef struct {

@@ -22,34 +22,51 @@ static void GetLsmDirPath(char *buf, size_t buflen, Oid indexRelId)
     snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/", indexRelId);
 }
 
-static void GetLsmFilePath(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, const char *type)
+static void GetLsmFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version, const char *type)
 {
-    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/%s_%u_%u", indexRelId, type, segmentIdStart, segmentIdEnd);
+    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/%s_%u_%u_v%u", indexRelId, type, segmentIdStart, segmentIdEnd, version);
 }
 
-static void GetLSMIndexFilePath(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd)
+static void GetLSMIndexFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
-    GetLsmFilePath(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, "index");
+    GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "index");
 }
 
-static void GetLSMBitmapFilePath(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd)
+static void GetLSMBitmapFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
-    GetLsmFilePath(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, "bitmap");
+    GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "bitmap");
 }
 
-static void GetLSMMappingFilePath(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd)
+// Get bitmap file path with version and optional subversion
+// If subversion is UINT32_MAX, no subversion suffix is added
+static void GetLSMBitmapFilePathWithSubversion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version, uint32_t subversion)
 {
-    GetLsmFilePath(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, "mapping");
+    if (subversion == UINT32_MAX)
+    {
+        // No subversion - use standard format
+        GetLSMBitmapFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version);
+    }
+    else
+    {
+        // Include subversion in filename: bitmap_<start>_<end>_v<version>_s<subversion>
+        snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/bitmap_%u_%u_v%u_s%u", 
+                 indexRelId, segmentIdStart, segmentIdEnd, version, subversion);
+    }
 }
 
-static void GetLSMSegmentMetadataPath(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd)
+static void GetLSMMappingFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
-    GetLsmFilePath(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, "metadata");
+    GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "mapping");
 }
 
-static void GetLSMSegmentMetadataTmpPath(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd)
+static void GetLSMSegmentMetadataPathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
-    GetLsmFilePath(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, "metadata.tmp");
+    GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "metadata");
+}
+
+static void GetLSMSegmentMetadataTmpPathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
+{
+    GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "metadata.tmp");
 }
 
 static void get_lsm_metadata_path(char *buf, size_t buflen, Oid indexRelId)
@@ -201,16 +218,93 @@ read_segment_file(const char *path, bool pg_alloc)
     return dest;
 }
 
+/* Find the latest version number for a segment by scanning directory */
+uint32_t
+find_latest_segment_version(Oid indexRelId, SegmentId start_sid, SegmentId end_sid)
+{
+    char dir_path[MAXPGPATH];
+    GetLsmDirPath(dir_path, sizeof(dir_path), indexRelId);
+    
+    DIR *dir = opendir(dir_path);
+    if (!dir)
+    {
+        // No directory or no existing files, start with version 0
+        return 0;
+    }
+    
+    uint32_t max_version = 0;
+    char pattern_prefix[256];
+    snprintf(pattern_prefix, sizeof(pattern_prefix), "metadata_%u_%u_v", start_sid, end_sid);
+    size_t prefix_len = strlen(pattern_prefix);
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        // Look for files matching pattern: metadata_<start_sid>_<end_sid>_v<version>
+        if (strncmp(entry->d_name, pattern_prefix, prefix_len) == 0)
+        {
+            char *version_str = entry->d_name + prefix_len;
+            uint32_t version = (uint32_t)atoi(version_str);
+            if (version > max_version)
+            {
+                max_version = version;
+            }
+        }
+    }
+    
+    closedir(dir);
+    return max_version;
+}
+
+/* Find the latest subversion for a bitmap file given a version */
+uint32_t
+find_latest_bitmap_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version)
+{
+    char dir_path[MAXPGPATH];
+    GetLsmDirPath(dir_path, sizeof(dir_path), indexRelId);
+    
+    DIR *dir = opendir(dir_path);
+    if (!dir)
+    {
+        // No directory - no subversion exists
+        return UINT32_MAX;
+    }
+    
+    // Pattern: bitmap_<start_sid>_<end_sid>_v<version>_s<subversion>
+    char pattern_prefix[256];
+    snprintf(pattern_prefix, sizeof(pattern_prefix), "bitmap_%u_%u_v%u_s", start_sid, end_sid, version);
+    size_t prefix_len = strlen(pattern_prefix);
+    
+    uint32_t max_subversion = UINT32_MAX;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        // Look for files matching pattern with subversion
+        if (strncmp(entry->d_name, pattern_prefix, prefix_len) == 0)
+        {
+            char *subversion_str = entry->d_name + prefix_len;
+            uint32_t subversion = (uint32_t)atoi(subversion_str);
+            if (max_subversion == UINT32_MAX || subversion > max_subversion)
+            {
+                max_subversion = subversion;
+            }
+        }
+    }
+    
+    closedir(dir);
+    return max_subversion;
+}
+
 static void 
-write_lsm_segment_metadata(Oid indexRelId, PrepareFlushMeta prep)
+write_lsm_segment_metadata(Oid indexRelId, PrepareFlushMeta prep, uint32_t version)
 {
     char tmp_path[MAXPGPATH];
     char final_path[MAXPGPATH];
     char dir_path[MAXPGPATH];
 
     GetLsmDirPath(dir_path, sizeof(dir_path), indexRelId);
-    GetLSMSegmentMetadataTmpPath(tmp_path, sizeof(tmp_path), indexRelId, prep->start_sid, prep->end_sid);
-    GetLSMSegmentMetadataPath(final_path, sizeof(final_path), indexRelId, prep->start_sid, prep->end_sid);
+    GetLSMSegmentMetadataTmpPathWithVersion(tmp_path, sizeof(tmp_path), indexRelId, prep->start_sid, prep->end_sid, version);
+    GetLSMSegmentMetadataPathWithVersion(final_path, sizeof(final_path), indexRelId, prep->start_sid, prep->end_sid, version);
 
     FILE *fp = fopen(tmp_path, "wb");
     if (!fp)
@@ -245,11 +339,18 @@ write_lsm_segment_metadata(Oid indexRelId, PrepareFlushMeta prep)
 }
 
 bool
-read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, 
+read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version,
 					  SegmentId *out_start_sid, SegmentId *out_end_sid, uint32_t *valid_rows, IndexType *index_type)
 {
 	char metadata_path[MAXPGPATH];
-	GetLSMSegmentMetadataPath(metadata_path, sizeof(metadata_path), indexRelId, start_sid, end_sid);
+	
+	// If version is UINT32_MAX, find latest version
+	if (version == UINT32_MAX)
+	{
+		version = find_latest_segment_version(indexRelId, start_sid, end_sid);
+	}
+
+	GetLSMSegmentMetadataPathWithVersion(metadata_path, sizeof(metadata_path), indexRelId, start_sid, end_sid, version);
 	
 	FILE *fp = fopen(metadata_path, "rb");
 	if (!fp)
@@ -312,32 +413,85 @@ scan_segment_metadata_files(Oid indexRelId, SegmentFileInfo *files, int max_file
         return 0;
     }
     
-    int file_count = 0;
+    // Temporary storage to track latest version for each segment
+    typedef struct {
+        SegmentId start_sid;
+        SegmentId end_sid;
+        uint32_t max_version;
+        bool found;
+    } SegmentVersion;
+    
+    SegmentVersion segments[MAX_SEGMENTS_COUNT];
+    int segment_count = 0;
     struct dirent *entry;
     
-    while ((entry = readdir(dir)) != NULL && file_count < max_files)
+    while ((entry = readdir(dir)) != NULL)
     {
-        // Look for files matching pattern: metadata_<start_sid>_<end_sid>
+        // Look for files matching pattern: metadata_<start_sid>_<end_sid>_v<version>
         if (strncmp(entry->d_name, "metadata_", 9) == 0)
         {
             char *filename = entry->d_name + 9; // Skip "metadata_"
-            char *underscore = strchr(filename, '_');
-            if (underscore)
+            char *underscore1 = strchr(filename, '_');
+            if (underscore1)
             {
-                *underscore = '\0';
+                *underscore1 = '\0';
                 SegmentId start_sid = (SegmentId)atoi(filename);
-                SegmentId end_sid = (SegmentId)atoi(underscore + 1);
                 
-                files[file_count].start_sid = start_sid;
-                files[file_count].end_sid = end_sid;
-                snprintf(files[file_count].filename, sizeof(files[file_count].filename), 
-                        "%s/%s", dir_path, entry->d_name);
-                file_count++;
+                char *rest = underscore1 + 1;
+                char *version_start = strstr(rest, "_v");
+                if (!version_start)
+                    continue; // Skip files without version number
+                
+                // Format: metadata_<start_sid>_<end_sid>_v<version>
+                *version_start = '\0';
+                SegmentId end_sid = (SegmentId)atoi(rest);
+                uint32_t version = (uint32_t)atoi(version_start + 2);
+                
+                // Find or create entry for this segment
+                int seg_idx = -1;
+                for (int i = 0; i < segment_count; i++)
+                {
+                    if (segments[i].start_sid == start_sid && segments[i].end_sid == end_sid)
+                    {
+                        seg_idx = i;
+                        break;
+                    }
+                }
+                
+                if (seg_idx == -1)
+                {
+                    // New segment
+                    if (segment_count >= MAX_SEGMENTS_COUNT)
+                        continue;
+                    seg_idx = segment_count++;
+                    segments[seg_idx].start_sid = start_sid;
+                    segments[seg_idx].end_sid = end_sid;
+                    segments[seg_idx].max_version = version;
+                    segments[seg_idx].found = true;
+                }
+                else
+                {
+                    // Update max version
+                    if (version > segments[seg_idx].max_version)
+                    {
+                        segments[seg_idx].max_version = version;
+                    }
+                }
             }
         }
     }
     
     closedir(dir);
+    
+    // Build the files array with latest versions
+    int file_count = 0;
+    for (int i = 0; i < segment_count && file_count < max_files; i++)
+    {
+        files[file_count].start_sid = segments[i].start_sid;
+        files[file_count].end_sid = segments[i].end_sid;
+        files[file_count].version = segments[i].max_version;
+        file_count++;
+    }
     
     // Sort files by start_sid
     qsort(files, file_count, sizeof(SegmentFileInfo), compare_segment_files);
@@ -436,42 +590,95 @@ flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
     GetLsmDirPath(file_path, MAXPGPATH, indexRelId);
     ensure_dir_exists(file_path);
 
-    // index file
-    GetLSMIndexFilePath(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid);
+    // Find latest version and increment it for atomic writing
+    uint32_t latest_version = find_latest_segment_version(indexRelId, prep->start_sid, prep->end_sid);
+    uint32_t new_version = latest_version + 1;
+    
+    elog(DEBUG1, "[flush_segment_to_disk] Writing segment with version %u (previous: %u)", new_version, latest_version);
+
+    // index file - write with new version
+    GetLSMIndexFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
     IndexBinarySetFlush(file_path, prep->index_bin);
 
-    // bitmap file
-    GetLSMBitmapFilePath(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid);
+    // bitmap file - write with new version
+    GetLSMBitmapFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
     write_segment_file(file_path, prep->bitmap_ptr, prep->bitmap_size);
 
-    // mapping file
-    GetLSMMappingFilePath(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid);
+    // mapping file - write with new version
+    GetLSMMappingFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
     write_segment_file(file_path, prep->map_ptr, prep->map_size);
 
-    // metadata file
-    write_lsm_segment_metadata(indexRelId, prep);
+    // metadata file - write with new version (this is the last step, making it atomic)
+    write_lsm_segment_metadata(indexRelId, prep, new_version);
+    
+    elog(DEBUG1, "[flush_segment_to_disk] Successfully wrote segment %u-%u with version %u", prep->start_sid, prep->end_sid, new_version);
 }
 
 void 
-load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint8_t **bitmap, bool pg_alloc)
+load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint8_t **bitmap, bool pg_alloc)
 {
+    // If version is UINT32_MAX, find latest version
+    if (version == UINT32_MAX)
+    {
+        version = find_latest_segment_version(indexRelId, start_sid, end_sid);
+    }
+    
+    // Find the latest subversion for this version (if any)
+    uint32_t subversion = find_latest_bitmap_subversion(indexRelId, start_sid, end_sid, version);
+    
     char path[MAXPGPATH];
-    GetLSMBitmapFilePath(path, sizeof(path), indexRelId, start_sid, end_sid);
+    GetLSMBitmapFilePathWithSubversion(path, sizeof(path), indexRelId, start_sid, end_sid, version, subversion);
     *bitmap = (uint8_t *) read_segment_file(path, pg_alloc);
 }
 
+// Write bitmap file with subversion (for vacuum operations)
+// If subversion is UINT32_MAX, writes without subversion suffix
 void 
-load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, int64_t **mapping, bool pg_alloc)
+write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size)
 {
+    char file_path[MAXPGPATH];
+    GetLsmDirPath(file_path, MAXPGPATH, indexRelId);
+    ensure_dir_exists(file_path);
+    
+    GetLSMBitmapFilePathWithSubversion(file_path, sizeof(file_path), indexRelId, start_sid, end_sid, version, subversion);
+    write_segment_file(file_path, bitmap, bitmap_size);
+    
+    if (subversion == UINT32_MAX)
+    {
+        elog(DEBUG1, "[write_bitmap_file_with_subversion] Successfully wrote bitmap file for segment %u-%u version %u", 
+             start_sid, end_sid, version);
+    }
+    else
+    {
+        elog(DEBUG1, "[write_bitmap_file_with_subversion] Successfully wrote bitmap file for segment %u-%u version %u subversion %u", 
+             start_sid, end_sid, version, subversion);
+    }
+}
+
+void 
+load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, int64_t **mapping, bool pg_alloc)
+{
+    // If version is UINT32_MAX, find latest version
+    if (version == UINT32_MAX)
+    {
+        version = find_latest_segment_version(indexRelId, start_sid, end_sid);
+    }
+    
     char path[MAXPGPATH];
-    GetLSMMappingFilePath(path, sizeof(path), indexRelId, start_sid, end_sid);
+    GetLSMMappingFilePathWithVersion(path, sizeof(path), indexRelId, start_sid, end_sid, version);
     *mapping = (int64_t *) read_segment_file(path, pg_alloc);
 }
 
 void 
-load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, IndexType index_type, void **index)
+load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, IndexType index_type, void **index)
 {
+    // If version is UINT32_MAX, find latest version
+    if (version == UINT32_MAX)
+    {
+        version = find_latest_segment_version(indexRelId, start_sid, end_sid);
+    }
+
     char path[MAXPGPATH];
-    GetLSMIndexFilePath(path, sizeof(path), indexRelId, start_sid, end_sid);
+    GetLSMIndexFilePathWithVersion(path, sizeof(path), indexRelId, start_sid, end_sid, version);
     IndexLoadAndSave(path, index_type, index);
 }

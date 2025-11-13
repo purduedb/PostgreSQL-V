@@ -177,6 +177,9 @@ lsm_flush_one_pending(LSMIndex lsm, int slot_idx, bool wait)
         elog(ERROR, "[lsm_flush_one_pending] claimed memtable not sealed");
     }
 
+    // acquire vacuum lock
+    LWLockAcquire(&mt->vacuum_lock, LW_SHARED);
+
     // step 2. prepare for flushing
     PrepareFlushMetaData prep;
     prepare_for_flushing(lsm, slot_idx, mt, &prep);
@@ -195,6 +198,9 @@ lsm_flush_one_pending(LSMIndex lsm, int slot_idx, bool wait)
 
     // step 7. update the segment array
     add_to_segment_array(slot_idx, lsm->indexRelId, prep.start_sid, prep.end_sid, prep.valid_rows, prep.index_type, 0.0f);
+    
+    // release vacuum lock
+    LWLockRelease(&mt->vacuum_lock);
     
     return true;
 }

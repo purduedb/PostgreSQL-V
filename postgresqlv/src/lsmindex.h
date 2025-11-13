@@ -7,6 +7,7 @@
 
 #include "utils.h"
 #include <sys/stat.h>
+#include <limits.h>
 
 typedef uint32_t SegmentId;
 typedef enum IndexType
@@ -40,6 +41,8 @@ typedef enum IndexType
 #define LSM_MEMTABLE_LWTRANCHE_ID 1001
 #define LSM_SEGMENT_LWTRANCHE "lsm_segment_rwlock"
 #define LSM_SEGMENT_LWTRANCHE_ID 1002
+#define LSM_MEMTABLE_VACUUM_LWTRANCHE "lsm_memtable_vacuum_lock"
+#define LSM_MEMTABLE_VACUUM_LWTRANCHE_ID 1005
 
 // Sentinel for rotation-in-progress
 #define MT_IDX_INVALID   (-1)
@@ -61,8 +64,11 @@ typedef struct ConcurrentMemTableData {
     uint32_t elem_size; // the size of each dimension
 
     int64_t tids[MEMTABLE_MAX_CAPACITY];
-    uint8_t bitmap[MEMTABLE_BITMAP_SIZE];   // 1 = “masked out / exclude this id”, and 0 = keep
+    uint8_t bitmap[MEMTABLE_BITMAP_SIZE];   // 1 = "masked out / exclude this id", and 0 = keep
     uint8_t ready[MEMTABLE_MAX_CAPACITY];   // 0 = not ready, 1 = ready
+    
+    // LWLock for vacuum operations - prevents flushing while vacuum is active
+    LWLock vacuum_lock;
 
     // followed by an in-memory array of vectors
 #if defined(pg_attribute_aligned)
@@ -148,6 +154,7 @@ void insert_lsm_index(Relation index, const void *vector, const int64_t tid);
 LSMIndex get_lsm_index(Oid index_relid);
 int get_lsm_index_idx(Oid index_relid);
 TopKTuples search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs);
+IndexBulkDeleteResult *bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
 
 // storage
 #define VECTOR_STORAGE_BASE_DIR "/ssd_root/liu4127/pg_vector_extension_indexes/"
@@ -174,17 +181,21 @@ typedef struct SegmentFileInfo
 {
     SegmentId start_sid;
     SegmentId end_sid;
-    char filename[MAXPGPATH];
+    uint32_t version;
 } SegmentFileInfo;
 int scan_segment_metadata_files(Oid indexRelId, SegmentFileInfo *files, int max_files);
 void flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep);
 void write_lsm_index_metadata(LSMIndex lsm);
 bool read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *dim, uint32_t *elem_size);
-bool read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, 
+bool read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version,
 					  SegmentId *out_start_sid, SegmentId *out_end_sid, uint32_t *valid_rows, IndexType *index_type);
-void load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, IndexType index_type, void **index);
-void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint8_t **bitmap, bool pg_alloc);
-void load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, int64_t **mapping, bool pg_alloc);
+uint32_t find_latest_segment_version(Oid indexRelId, SegmentId start_sid, SegmentId end_sid);
+uint32_t find_latest_bitmap_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version);
+void load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, IndexType index_type, void **index);
+void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint8_t **bitmap, bool pg_alloc);
+void write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size);
+void load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, int64_t **mapping, bool pg_alloc);
+#define LOAD_LATEST_VERSION UINT32_MAX
 
 // helper functions (memtable)
 ConcurrentMemTable MT_FROM_SLOTIDX(int slot_num);
