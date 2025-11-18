@@ -2,7 +2,10 @@
 #define LSM_SEGMENT_H
 
 #include "lsmindex.h"
+// atomic_int should be defined before including this header in C++ mode
+#ifndef __cplusplus
 #include <stdatomic.h>
+#endif
 #include <pthread.h>
 
 typedef struct FlushedSegmentData

@@ -282,7 +282,6 @@ build_lsm_index(IndexType type, Oid relId, void *vector_index, int64_t *tids, ui
     persist_index_segment(&slot->lsmIndex, START_SEGMENT_ID, START_SEGMENT_ID, count, tids, NULL, index_bin_set, type);
 
     index_build_blocking(relId, slot_num);
-
     // update segment array
     add_to_segment_array(slot_num, relId, START_SEGMENT_ID, START_SEGMENT_ID, count, type, 0.0f);
 
@@ -849,7 +848,8 @@ search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs)
 
     // step 2. issue a search task to the vector search process
     vector_search_send(index->rd_id, (float *)vector, lsm->dim, lsm->elem_size, k, nprobe_efs, lsm_snapshot);
-    
+    // elog(DEBUG1, "[search_lsm_index] Search task sent to vector search process");
+
     // step 3. search the growing memtables (update the reference count after search)
     DistancePair *final_pairs, *pair_1;
     int num_1;

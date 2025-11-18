@@ -1,13 +1,28 @@
 #ifndef VECTORINDEXIMPL_HPP
 #define VECTORINDEXIMPL_HPP
+
 #ifdef __cplusplus
+// C++-only stuff first (types, templates, etc.)
+#include <atomic>
+typedef std::atomic<int> atomic_int;
 extern "C" {
 #endif
 
 #include "postgres.h"
 #include "lsmindex.h"
+#include "lsm_segment.h"
+#include "ringbuffer.h"
 #include "utils.h"
 
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+// --- PG-facing C API, visible to both C and C++ ---
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // hnsw
 int HnswIndexInit(int dimension, int M, int efConstruction, void** hnswIndexPtr);
@@ -50,6 +65,30 @@ void* MergeTwoIndices(void *lindex_ptr, int lcount, IndexType lindex_type,
                      void *sindex_ptr, int scount, IndexType sindex_type,
                      int *merged_count);
 
+// concurrent vector search on multiple segments using knowhere thread pool
+// Structure for segment search information (must match C++ struct)
+typedef struct {
+    IndexType index_type;
+    void* index_ptr;
+    uint8_t* bitmap_ptr;
+    uint32_t vec_count;
+    int64_t* map_ptr;
+    uint32_t segment_idx;
+} SegmentSearchInfo;
+
+// Forward declarations
+struct PGPROC;
+
+// Concurrent search function
+void ConcurrentVectorSearchOnSegments(
+    SegmentSearchInfo* segments,
+    uint32_t segment_count,
+    const float* query_vector,
+    int topk,
+    int efs_nprobe,
+    VectorSearchResult result,
+    struct PGPROC* client_proc,
+    FlushedSegmentPool* pool);  // For decrementing reference counts
 
 #ifdef __cplusplus
 }

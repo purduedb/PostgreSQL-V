@@ -253,7 +253,7 @@ def main():
             print("Error: --file is required for --do-insert")
             sys.exit(1)
         print(f"Reading base vectors from: {args.file}")
-        base_vectors = read_bvecs(args.file, args.num)
+        base_vectors = read_fvecs(args.file, args.num)
         print(f"Loaded {len(base_vectors)} base vectors of dimension {base_vectors.shape[1]}")
         print("Creating table...")
         create_table(conn, base_vectors.shape[1], args.tablename)
@@ -277,12 +277,12 @@ def main():
             sys.exit(1)
         print(f"Reading ground truth from: {args.gnd}")
         
-        ground_truth = read_ivecs(args.gnd, 1000)
+        ground_truth = read_ivecs(args.gnd, 100)
         if not args.queries:
             print("Error: --queries is required for --do-query")
             sys.exit(1)
         print(f"Reading query vectors from: {args.queries}")
-        queries = read_bvecs(args.queries, args.nq)
+        queries = read_fvecs(args.queries, args.nq)
         print(f"Loaded {len(queries)} queries of dimension {queries.shape[1]}")
         
         print("Running similarity search (r1)...")

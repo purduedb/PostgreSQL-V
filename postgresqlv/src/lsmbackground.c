@@ -98,7 +98,7 @@ prepare_for_flushing(LSMIndex lsm, int slot_idx, ConcurrentMemTable mt, PrepareF
     prep->start_sid = mt->memtable_id;
     prep->end_sid = mt->memtable_id;
     prep->valid_rows = valid;
-    prep->index_type = FLAT;
+    prep->index_type = HNSW;
 
     // build hnsw type index on the segment
     // TODO: tune the parameters

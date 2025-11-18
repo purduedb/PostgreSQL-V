@@ -168,13 +168,13 @@ read_segment_file(const char *path, bool pg_alloc)
         if (fd < 0)
         {
             if (chunk_index == 0)
-                elog(ERROR, "Could not open FAISS segment file: %s", path);
+                fprintf(stderr, "[read_segment_file] ERROR: Could not open FAISS segment file: %s\n", path);
             break; // No more chunks to read
         }
 
         /* Stat file */
         if (fstat(fd, &st) < 0)
-            elog(ERROR, "Could not stat FAISS segment file: %s", chunk_path);
+            fprintf(stderr, "[read_segment_file] ERROR: Could not stat FAISS segment file: %s\n", chunk_path);
 
         size = st.st_size;
         total_size += size;
@@ -186,7 +186,7 @@ read_segment_file(const char *path, bool pg_alloc)
     /* Now, allocate a large memory block to hold all the chunks */
     void *dest = pg_alloc ? palloc(total_size) : malloc(total_size);
     if (!dest)
-        elog(ERROR, "Failed to allocate memory");
+        fprintf(stderr, "[read_segment_file] ERROR: Failed to allocate memory\n");
 
     int chunk_num = chunk_index;
     Size offset = 0;
@@ -198,17 +198,17 @@ read_segment_file(const char *path, bool pg_alloc)
         fd = OpenTransientFile(chunk_path, O_RDONLY | PG_BINARY);
         if (fd < 0)
         {
-            elog(ERROR, "Could not open FAISS segment file: %s", path);
+            fprintf(stderr, "[read_segment_file] ERROR: Could not open FAISS segment file: %s\n", path);
         }
 
         if (fstat(fd, &st) < 0)
-            elog(ERROR, "Could not stat FAISS segment file: %s", chunk_path);
+            fprintf(stderr, "[read_segment_file] ERROR: Could not stat FAISS segment file: %s\n", chunk_path);
 
         size = st.st_size;
 
         /* Read the chunk into the allocated memory at the appropriate offset */
         if (read(fd, (char *)dest + offset, size) != size)
-            elog(ERROR, "Failed to read complete segment file into memory: %s", chunk_path);
+            fprintf(stderr, "[read_segment_file] ERROR: Failed to read complete segment file into memory: %s\n", chunk_path);
 
         offset += size; // Update the offset for the next chunk
 
@@ -409,7 +409,7 @@ scan_segment_metadata_files(Oid indexRelId, SegmentFileInfo *files, int max_file
     DIR *dir = opendir(dir_path);
     if (!dir)
     {
-        elog(DEBUG1, "[scan_segment_metadata_files] Cannot open directory: %s", dir_path);
+        fprintf(stderr, "[scan_segment_metadata_files] Cannot open directory: %s\n", dir_path);
         return 0;
     }
     

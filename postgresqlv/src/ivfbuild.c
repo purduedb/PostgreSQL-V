@@ -441,7 +441,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	uint32_t dim = buildstate->dimensions;
 	uint32_t elem_size = buildstate->vectors->itemsize / buildstate->dimensions;
 
-	build_lsm_index(IVFFLAT, relId, buildstate->ivfflatIndex, (int64_t)tids, dim, elem_size, buildstate->num_tids);
+	build_lsm_index(IVFFLAT, relId, buildstate->ivfflatIndex, (int64_t *)tids, dim, elem_size, buildstate->num_tids);
 
 	// TODO: write visibility tuples
 

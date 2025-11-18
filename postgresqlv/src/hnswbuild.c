@@ -308,7 +308,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	void *tids = buildstate->tids;
 	uint32_t elem_size = buildstate->vectors->itemsize / buildstate->dimensions;
 	
-	build_lsm_index(HNSW, relId, buildstate->hnswIndex, (int64_t)tids, dim, elem_size, buildstate->num_tids);
+	build_lsm_index(HNSW, relId, buildstate->hnswIndex, (int64_t *)tids, dim, elem_size, buildstate->num_tids);
 	
 	// TODO: write the status pages
 

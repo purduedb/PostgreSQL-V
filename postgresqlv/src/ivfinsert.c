@@ -4,6 +4,7 @@
 
 #include "access/generic_xlog.h"
 #include "ivfflat.h"
+#include "lsmindex.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/memutils.h"

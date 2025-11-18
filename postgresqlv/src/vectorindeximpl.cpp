@@ -1,9 +1,49 @@
 #include "vectorindeximpl.hpp"
+#include <stdio.h>
+
+// --- Fix PostgreSQL atomic macro collisions with C++ standard library ---
+// These must be undefined before including any C++ headers that use <atomic>
+#ifdef atomic_is_lock_free
+#undef atomic_is_lock_free
+#endif
+#ifdef atomic_load_explicit
+#undef atomic_load_explicit
+#endif
+#ifdef atomic_load
+#undef atomic_load
+#endif
+#ifdef atomic_store_explicit
+#undef atomic_store_explicit
+#endif
+#ifdef atomic_store
+#undef atomic_store
+#endif
+#ifdef atomic_exchange_explicit
+#undef atomic_exchange_explicit
+#endif
+#ifdef atomic_exchange
+#undef atomic_exchange
+#endif
+#ifdef atomic_compare_exchange_strong_explicit
+#undef atomic_compare_exchange_strong_explicit
+#endif
+#ifdef atomic_compare_exchange_strong
+#undef atomic_compare_exchange_strong
+#endif
+#ifdef atomic_compare_exchange_weak_explicit
+#undef atomic_compare_exchange_weak_explicit
+#endif
+#ifdef atomic_compare_exchange_weak
+#undef atomic_compare_exchange_weak
+#endif
+
 #include "knowhere/comp/index_param.h"
 #include "lsmindex.h"
+#include "lsm_segment.h"
 #include "utils/elog.h"
 #include "vector.h"
-// #include "lsm_segment.h"
+#include "ringbuffer.h"
+#include "storage/proc.h"
 
 #include <cassert>
 #include <cstdio>
@@ -45,14 +85,48 @@
 // Keep glog's own severities usable without abbreviations conflict
 #define GLOG_NO_ABBREVIATED_SEVERITIES 1
 
-// knowhere
+// Include glog export header to define GLOG_EXPORT and GLOG_NO_EXPORT
+// This must be done before including knowhere headers that include glog
+#include "glog/export.h"
+
+// Workaround for glog argument limit - Folly uses COMPACT_GOOGLE_LOG_22 which doesn't exist
+// Define a fallback that uses COMPACT_GOOGLE_LOG_0 (the base macro)
+// This is a workaround for Folly's use of more arguments than glog supports
+// Note: This may cause some logging arguments to be ignored, but allows compilation to proceed
+#ifndef COMPACT_GOOGLE_LOG_22
+#define COMPACT_GOOGLE_LOG_22 COMPACT_GOOGLE_LOG_0
+#endif
+
+// Workaround for Folly macro conflicts with PostgreSQL
+// PostgreSQL's foreach macro uses ##__state which conflicts with Folly's token pasting
+// We need to undefine it before including knowhere/Folly headers
+#ifdef foreach
+#undef foreach
+#define PG_FOREACH_UNDEFINED
+#endif
+
+// knowhere (these headers pull in Folly)
 #include "knowhere/bitsetview.h"
 #include "knowhere/index/index.h"
 #include "knowhere/index/index_factory.h"
 #include "knowhere/binaryset.h"
 #include "simd/hook.h"
 #include "knowhere/comp/brute_force.h"
+#include "knowhere/comp/thread_pool.h"
+#include <atomic>
+#include <memory>
 
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+
+// Note: We don't restore the foreach macro here because:
+// 1. It's not used in this C++ file
+// 2. Restoring it would require including pg_list.h which causes conflicts with C++ headers
+// If foreach is needed elsewhere, it will be redefined when those headers are included
+#ifdef PG_FOREACH_UNDEFINED
+#undef PG_FOREACH_UNDEFINED
+#endif
 
 // Restore PG's macros so elog.h and friends keep working everywhere else.
 #if defined(__clang__) || defined(__GNUC__)
@@ -365,20 +439,23 @@ IndexFree(void* indexPtr)
 
 // FIXME: handle the situaltion when k > total vectors in the index
 static topKVector*
-VectorIndexSearchImpl(IndexType type, void* indexPtr, knowhere::BitsetView bitset_view, uint32_t count, const float* query_vector, int k, int efs_nprobe)
+VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView& bitset_view, uint32_t count, const float* query_vector, int k, int efs_nprobe)
 {
+    // TODO: for debugging
+    fprintf(stderr, "enter VectorIndexSearchImpl, type = %d, index_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, indexPtr, count, query_vector, k, efs_nprobe);
+
     // TODO: for evaluation
     // Timing instrumentation
     auto start_time = std::chrono::high_resolution_clock::now();
     
     // elog(DEBUG1, "enter VectorIndexSearch, type = %d, efs_nprobe = %d, k = %d, count = %d", type, efs_nprobe, k, count);
     knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(indexPtr);
+
     if (index->Count() <= 0)
     {
         elog(ERROR, "IvfflatIndexSearch: the index is empty");
         return nullptr;
     }
-    // elog(DEBUG1, "[VectorIndexSearchImpl] index->Count() = %d", index->Count());
 
     // configuration
     knowhere::Json conf;
@@ -406,10 +483,10 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, knowhere::BitsetView bitse
     auto res = index->Search(dataset, conf, bitset_view);
 
     // convert knowhere::Dataset to topKVector
-    topKVector* topk_result = (topKVector *) palloc(sizeof(topKVector));
+    topKVector* topk_result = (topKVector *) malloc(sizeof(topKVector));
     topk_result->num_results = k;
-    topk_result->distances = (float *) palloc(sizeof(float) * k);
-    topk_result->vids = (int64_t *) palloc(sizeof(int64_t) * k);
+    topk_result->distances = (float *) malloc(sizeof(float) * k);
+    topk_result->vids = (int64_t *) malloc(sizeof(int64_t) * k);
 
     const int64_t* ids = res.value()->GetIds();
     const float*   dis = res.value()->GetDistance();
@@ -458,7 +535,9 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, knowhere::BitsetView bitse
 extern "C" topKVector*
 VectorIndexSearch(IndexType type, void *index_ptr, uint8_t *bitmap_ptr, uint32_t count, const float* query_vector, int k, int efs_nprobe)
 {
-    // elog(DEBUG1, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
+    // TODO: for debugging
+    fprintf(stderr, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
+
     knowhere::BitsetView bitset_view(bitmap_ptr, count);
     return VectorIndexSearchImpl(type, index_ptr, bitset_view, count, query_vector, k, efs_nprobe);
 }
@@ -467,6 +546,20 @@ static void
 FreeBinarySet(void* bin)
 {
     delete static_cast<knowhere::BinarySet*>(bin);
+}
+
+// Helper function to free malloc-allocated topKVector (for thread-safe allocations)
+static void
+free_topk_vector_malloc(topKVector *tkv)
+{
+    if (tkv != nullptr)
+    {
+        if (tkv->distances != nullptr)
+            free(tkv->distances);
+        if (tkv->vids != nullptr)
+            free(tkv->vids);
+        free(tkv);
+    }
 }
 
 static inline Size
@@ -670,7 +763,7 @@ IndexBinarySetFlush(const char* filename, void *ret_bin_set)
 extern "C" void 
 IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
 {
-    elog(DEBUG1, "enter IndexLoadAndSave, index_type = %d", index_type);
+    fprintf(stderr, "[IndexLoadAndSave] enter IndexLoadAndSave, index_type = %d\n", index_type);
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
     
     knowhere::Json conf;
@@ -703,7 +796,7 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
         }
         default:
         {
-            elog(DEBUG1, "[IndexDeserializeAndSave] Unsupported index type");
+            fprintf(stderr, "[IndexLoadAndSave] Unsupported index type\n");
             break;
         }
     }
@@ -753,6 +846,7 @@ BruteForceSearch(const float* vectors, const float* query_vector, const uint8_t 
     auto res = knowhere::BruteForce::Search<knowhere::fp32>(base_dataset, query_dataset, conf, bitset_view);
     
     // Convert knowhere::Dataset to topKVector
+    // Note: This function is called from backend threads, so palloc is safe
     topKVector* topk_result = (topKVector *) palloc(sizeof(topKVector));
     
     if (res.has_value()) {
@@ -955,7 +1049,7 @@ MergeTwoIndices(void *lindex_ptr, int lcount, IndexType lindex_type,
 
     // Check dimension consistency
     if (lindex->Dim() != sindex->Dim()) {
-        elog(ERROR, "MergeTwoIndices: dimension mismatch - lindex: %d, sindex: %d", lindex->Dim(), sindex->Dim());
+        elog(ERROR, "MergeTwoIndices: dimension mismatch - lindex: %ld, sindex: %ld", (long)lindex->Dim(), (long)sindex->Dim());
         return NULL;
     }
     int dim = lindex->Dim();
@@ -1002,4 +1096,290 @@ MergeTwoIndices(void *lindex_ptr, int lcount, IndexType lindex_type,
     // Return the merged count
     *merged_count = merged_count_check;
     return lindex;
+}
+
+// Note: SegmentSearchInfo is defined in vectorindeximpl.hpp
+
+// C++ version of merge_top_k (same logic as the C version)
+static int
+merge_top_k_cpp(DistancePair *pairs_1, DistancePair *pairs_2, int num_1, int num_2, int top_k, DistancePair *merge_pair)
+{
+    int i = 0, j = 0, k = 0;
+
+    while (k < top_k && (i < num_1 || j < num_2)) {
+        if (i < num_1 && (j >= num_2 || pairs_1[i].distance <= pairs_2[j].distance)) {
+            merge_pair[k++] = pairs_1[i++];
+        } else if (j < num_2) {
+            merge_pair[k++] = pairs_2[j++];
+        }
+    }
+
+    return k;
+}
+
+struct SegmentResult {
+    topKVector* topk_vectors;
+    DistancePair* pairs;
+    int pair_count;
+    bool searched;  // true if this segment was searched (not skipped)
+};
+
+// Structure to hold search results from all segments
+struct ConcurrentSearchContext {
+    // Input parameters
+    const float* query_vector;
+    int topk;
+    int efs_nprobe;
+    uint32_t segment_count;
+    SegmentSearchInfo* segments;
+    
+    // Results storage (one per segment)
+    struct SegmentResult *segment_results;
+    
+    // Atomic countdown for last-finisher continuation
+    std::atomic<int> remaining_count;
+    
+    // Final merged result storage
+    DistancePair* final_pairs;
+    int final_count;
+    
+    // Result structure to write final results to
+    struct ResultInfo {
+        VectorSearchResult result;
+        PGPROC* client_proc;
+    } *result_info;
+    
+    // Pool pointer for decrementing reference counts
+    FlushedSegmentPool* pool_ptr;
+};
+
+// Helper function to merge all segment results
+static void
+merge_all_segment_results(ConcurrentSearchContext* ctx) {
+    // Find the first non-empty result
+    DistancePair* merged_pairs = nullptr;
+    int merged_count = 0;
+    bool first_result = true;
+    
+    for (uint32_t i = 0; i < ctx->segment_count; i++) {
+        if (!ctx->segment_results[i].searched || ctx->segment_results[i].pair_count == 0) {
+            continue;
+        }
+        
+        if (first_result) {
+            // First result - allocate new memory and copy (we'll free all segment results later)
+            merged_pairs = (DistancePair*) malloc(sizeof(DistancePair) * ctx->topk);
+            merged_count = ctx->segment_results[i].pair_count;
+            // Copy the first result
+            for (int j = 0; j < merged_count; j++) {
+                merged_pairs[j] = ctx->segment_results[i].pairs[j];
+            }
+            first_result = false;
+        } else {
+            // Merge with existing results
+            DistancePair* new_merged = (DistancePair*) malloc(sizeof(DistancePair) * ctx->topk);
+            merged_count = merge_top_k_cpp(merged_pairs, ctx->segment_results[i].pairs, 
+                                      merged_count, ctx->segment_results[i].pair_count, 
+                                      ctx->topk, new_merged);
+            
+            // Free old merged result
+            free(merged_pairs);
+            merged_pairs = new_merged;
+        }
+    }
+    
+    ctx->final_pairs = merged_pairs;
+    ctx->final_count = (merged_pairs != nullptr) ? merged_count : 0;
+    
+    // Free all segment result pairs (they've been merged into final_pairs)
+    for (uint32_t i = 0; i < ctx->segment_count; i++) {
+        if (ctx->segment_results[i].pairs != nullptr) {
+            free(ctx->segment_results[i].pairs);
+            ctx->segment_results[i].pairs = nullptr;
+        }
+    }
+}
+
+// Function called by each thread to search a segment
+static void
+search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
+    // TODO: for debugging
+    fprintf(stderr, "enter search_segment_task, seg_idx = %d\n", seg_idx);
+
+    SegmentSearchInfo* seg = &ctx->segments[seg_idx];
+    SegmentResult* result = &ctx->segment_results[seg_idx];
+    
+    // TODO: for debugging
+    fprintf(stderr, "search_segment_task: checkpoint 1, seg_idx = %d\n", seg_idx);
+
+    // Perform the search
+    result->topk_vectors = VectorIndexSearch(seg->index_type, seg->index_ptr, seg->bitmap_ptr,
+                                      seg->vec_count, ctx->query_vector, 
+                                      ctx->topk, ctx->efs_nprobe);
+
+    // TODO: for debugging
+    fprintf(stderr, "search_segment_task: finished searching the segment, seg_idx = %d\n", seg_idx);
+    fprintf(stderr, "search_segment_task: result->topk_vectors = %p, result->topk_vectors->num_results = %d, seg_idx = %d\n", result->topk_vectors, result->topk_vectors->num_results, seg_idx);
+    
+    if (result->topk_vectors != nullptr && result->topk_vectors->num_results > 0) {
+        result->searched = true;
+        result->pair_count = result->topk_vectors->num_results;
+        result->pairs = (DistancePair*) malloc(sizeof(DistancePair) * result->pair_count);
+        
+        // Convert result to DistancePair format
+        for (int k = 0; k < result->pair_count; k++) {
+            result->pairs[k].distance = result->topk_vectors->distances[k];
+            int pos = result->topk_vectors->vids[k];
+            result->pairs[k].id = seg->map_ptr[pos];
+        }
+        
+        // Free topk_vectors (always needed)
+        // Use malloc version since VectorIndexSearchImpl uses malloc for thread-safety
+        free_topk_vector_malloc(result->topk_vectors);
+        result->topk_vectors = nullptr;
+    } else {
+        result->searched = true;
+        result->pair_count = 0;
+        result->pairs = nullptr;
+        if (result->topk_vectors != nullptr) {
+            // Use malloc version since VectorIndexSearchImpl uses malloc for thread-safety
+            free_topk_vector_malloc(result->topk_vectors);
+            result->topk_vectors = nullptr;
+        }
+    }
+
+    // TODO: for debugging
+    fprintf(stderr, "search_segment_task: checkpoint 2, seg_idx = %d\n", seg_idx);
+
+    // Decrement reference count for this segment immediately after search completes
+    // This allows the segment to be freed/cleaned up earlier if needed
+    if (ctx->pool_ptr) {
+        decrement_flushed_segment_ref_count(ctx->pool_ptr, seg->segment_idx);
+    }
+    
+    // Atomic countdown: decrement and check if we're the last one
+    int remaining = ctx->remaining_count.fetch_sub(1) - 1;
+
+    // TODO: for debugging
+    fprintf(stderr, "search_segment_task: remaining = %d, seg_idx = %d\n", remaining, seg_idx);
+
+    if (remaining == 0) {
+        // TODO: for debugging
+        fprintf(stderr, "search_segment_task: we are the last thread to finish, seg_idx = %d\n", seg_idx);
+
+        // We are the last thread to finish - merge results, write to result structure, and set latch
+        merge_all_segment_results(ctx);
+        // Write results to the result structure
+        if (ctx->result_info && ctx->result_info->result) {
+            VectorSearchResult result = ctx->result_info->result;
+            result->result_count = ctx->final_count;
+            
+            float* res_dist = vs_search_result_dist_at(result);
+            int64_t* res_id = vs_search_result_id_at(result);
+
+
+            for (int i = 0; i < ctx->final_count; i++) {
+                res_dist[i] = ctx->final_pairs[i].distance;
+                res_id[i] = ctx->final_pairs[i].id;
+            }
+        }
+        
+        // Set latch to notify the client backend
+        if (ctx->result_info && ctx->result_info->client_proc) {
+            SetLatch(&ctx->result_info->client_proc->procLatch);
+        }
+        
+        // Free the context and all its sub-structures (allocated with malloc)
+        if (ctx->final_pairs) {
+            free(ctx->final_pairs);
+        }
+        if (ctx->segment_results) {
+            free(ctx->segment_results);
+        }
+        if (ctx->result_info) {
+            free(ctx->result_info);
+        }
+        if (ctx->segments) {
+            free(ctx->segments);
+        }
+        free(ctx);
+
+        // TODO: for debugging
+        fprintf(stderr, "search_segment_task: freed the context and all its sub-structures, seg_idx = %d\n", seg_idx);
+    }
+
+    // TODO: for debugging
+    fprintf(stderr, "search_segment_task: exit search_segment_task, seg_idx = %d\n", seg_idx);
+}
+
+// C wrapper function for concurrent vector search
+extern "C" void
+ConcurrentVectorSearchOnSegments(
+    SegmentSearchInfo* segments,
+    uint32_t segment_count,
+    const float* query_vector,
+    int topk,
+    int efs_nprobe,
+    VectorSearchResult result,
+    PGPROC* client_proc,
+    FlushedSegmentPool* pool) {
+
+    // TODO: for debugging
+    elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] enter ConcurrentVectorSearchOnSegments");
+    
+    // Get the global search thread pool
+    auto search_pool = knowhere::ThreadPool::GetGlobalSearchThreadPool();
+
+    // Allocate context structure using malloc (thread-safe allocation)
+    ConcurrentSearchContext* ctx = (ConcurrentSearchContext*) 
+        malloc(sizeof(ConcurrentSearchContext));
+    
+    ctx->query_vector = query_vector;
+    ctx->topk = topk;
+    ctx->efs_nprobe = efs_nprobe;
+    ctx->segment_count = segment_count;
+    ctx->segments = segments;
+    ctx->pool_ptr = pool;
+    ctx->final_pairs = nullptr;
+    ctx->final_count = 0;
+    
+    // Allocate result info structure
+    ctx->result_info = (ConcurrentSearchContext::ResultInfo*)
+        malloc(sizeof(ConcurrentSearchContext::ResultInfo));
+    ctx->result_info->result = result;
+    ctx->result_info->client_proc = client_proc;
+    
+    // Initialize atomic counter
+    ctx->remaining_count.store(segment_count);
+    
+    // Allocate result storage
+    ctx->segment_results = (SegmentResult*)
+        malloc(sizeof(SegmentResult) * segment_count);
+    
+    // Initialize results
+    for (uint32_t i = 0; i < segment_count; i++) {
+        ctx->segment_results[i].topk_vectors = nullptr;
+        ctx->segment_results[i].pairs = nullptr;
+        ctx->segment_results[i].pair_count = 0;
+        ctx->segment_results[i].searched = false;
+    }
+
+    // TODO: for debugging
+    elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] about to launch concurrent searches on all segments");
+    
+    // Launch concurrent searches on all segments using the thread pool
+    // Each task will run asynchronously in the thread pool
+    // The last-finisher thread will handle merging, writing results, and setting the latch
+    for (uint32_t i = 0; i < segment_count; i++) {
+        // TODO: for debugging
+        elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] launching search on segment %d", i);
+        search_pool->push([ctx, i]() {
+            knowhere::ThreadPool::ScopedSearchOmpSetter setter(1);  // Set OMP threads to 1 per task
+            search_segment_task(ctx, i);
+        });
+    }
+    
+    // Return immediately - all work (search, merge, notification) is handled asynchronously
+    // by threads in the thread pool. The context is allocated in memctx which persists
+    // until all tasks complete.
 }

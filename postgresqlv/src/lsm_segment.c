@@ -27,14 +27,14 @@ void initialize_segment_pool(FlushedSegmentPool *pool)
 uint32_t
 reserve_flushed_segment(FlushedSegmentPool *pool)
 {
-    elog(DEBUG1, "enter reserve_flushed_segment, insert_idx = %d", pool->insert_idx);
+    fprintf(stderr, "enter reserve_flushed_segment, insert_idx = %d\n", pool->insert_idx);
     for(int idx = pool->insert_idx; idx < MAX_SEGMENTS_COUNT; ++idx)
     {
         if(!pool->flushed_segments[idx].in_used)
         {
             pool->insert_idx = idx + 1;
             pool->flushed_segments[idx].in_used = true;
-            elog(DEBUG1, "reserve_flushed_segment successfully, idx = %d", idx);
+            fprintf(stderr, "reserve_flushed_segment successfully, idx = %d\n", idx);
             return idx;
         }
     }
@@ -44,7 +44,7 @@ reserve_flushed_segment(FlushedSegmentPool *pool)
 void
 register_flushed_segment(FlushedSegmentPool *pool, uint32_t idx)
 {
-    elog(DEBUG1, "enter register_flushed_segment for idx = %d", idx);
+    fprintf(stderr, "enter register_flushed_segment for idx = %d\n", idx);
     
     // Initialize reference count for the new segment
     atomic_store(&pool->flushed_segments[idx].ref_count, 1);
@@ -66,7 +66,7 @@ register_flushed_segment(FlushedSegmentPool *pool, uint32_t idx)
     }
     
     ++pool->flushed_segment_count;
-    elog(DEBUG1, "register_flushed_segment successfully added to list, idx = %d", idx);
+    fprintf(stderr, "register_flushed_segment successfully added to list, idx = %d\n", idx);
 }
 
 // Reference counting functions for flushed segments
@@ -89,7 +89,7 @@ cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
 {
     FlushedSegment segment = &pool->flushed_segments[segment_idx];
     
-    elog(DEBUG1, "[cleanup_flushed_segment] Cleaning up segment idx = %d", segment_idx);
+    fprintf(stderr, "[cleanup_flushed_segment] Cleaning up segment idx = %d\n", segment_idx);
     
     // Free the index, bitmap, and map
     if (segment->index_ptr != NULL)
@@ -119,7 +119,7 @@ cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
     
     atomic_store(&segment->ref_count, 0);
     
-    elog(DEBUG1, "[cleanup_flushed_segment] Segment idx = %d cleaned up and unlinked from list", segment_idx);
+    fprintf(stderr, "[cleanup_flushed_segment] Segment idx = %d cleaned up and unlinked from list\n", segment_idx);
 }
 
 // Find a segment by its segment IDs
@@ -136,12 +136,12 @@ find_segment_by_sids(FlushedSegmentPool *pool, SegmentId start_sid, SegmentId en
             seg->segment_id_start == start_sid && 
             seg->segment_id_end == end_sid)
         {
-            elog(DEBUG1, "[find_segment_by_ids] Found segment %u-%u at idx %u", start_sid, end_sid, idx);
+            fprintf(stderr, "[find_segment_by_ids] Found segment %u-%u at idx %u\n", start_sid, end_sid, idx);
             return idx;
         }
     }
     
-    elog(ERROR, "[find_segment_by_ids] Segment %u-%u not found", start_sid, end_sid);
+    fprintf(stderr, "[find_segment_by_ids] Segment %u-%u not found\n", start_sid, end_sid);
     return -1;
 }
 
@@ -152,7 +152,7 @@ void
 find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid, SegmentId target_end_sid,
                            uint32_t *seg_idx_0, uint32_t *seg_idx_1)
 {
-    elog(DEBUG1, "[find_two_adjacent_segments] Looking for segments covering range %u-%u", 
+    fprintf(stderr, "[find_two_adjacent_segments] Looking for segments covering range %u-%u\n", 
          target_start_sid, target_end_sid);
     
     // Iterate through the linked list to find the segments
@@ -171,7 +171,7 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
                 if (seg->segment_id_end >= target_end_sid)
                 {
                     // Single segment covers the entire range - error case
-                    elog(ERROR, "[find_two_adjacent_segments] Single segment %u-%u already covers range %u-%u, should use single segment replacement", 
+                    fprintf(stderr, "[find_two_adjacent_segments] Single segment %u-%u already covers range %u-%u, should use single segment replacement\n", 
                          seg->segment_id_start, seg->segment_id_end, target_start_sid, target_end_sid);
                     *seg_idx_0 = -1;
                     *seg_idx_1 = -1;
@@ -182,7 +182,7 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
                 uint32_t next_idx = seg->next_idx;
                 if (next_idx == -1)
                 {
-                    elog(ERROR, "[find_two_adjacent_segments] No adjacent segment found for range %u-%u", 
+                    fprintf(stderr, "[find_two_adjacent_segments] No adjacent segment found for range %u-%u\n", 
                          target_start_sid, target_end_sid);
                     *seg_idx_0 = -1;
                     *seg_idx_1 = -1;
@@ -195,7 +195,7 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
                     // Found the two segments
                     *seg_idx_0 = idx;
                     *seg_idx_1 = next_idx;
-                    elog(DEBUG1, "[find_two_adjacent_segments] Found segments: %u-%u and %u-%u covering range %u-%u",
+                    fprintf(stderr, "[find_two_adjacent_segments] Found segments: %u-%u and %u-%u covering range %u-%u\n",
                          seg->segment_id_start, seg->segment_id_end,
                          next_seg->segment_id_start, next_seg->segment_id_end,
                          target_start_sid, target_end_sid);
@@ -203,7 +203,7 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
                 }
                 else
                 {
-                    elog(ERROR, "[find_two_adjacent_segments] Adjacent segment %u-%u does not cover the range", 
+                    fprintf(stderr, "[find_two_adjacent_segments] Adjacent segment %u-%u does not cover the range\n", 
                          next_seg->segment_id_start, next_seg->segment_id_end);
                     *seg_idx_0 = -1;
                     *seg_idx_1 = -1;
@@ -212,7 +212,7 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
             }
         }
         else {
-            elog(ERROR, "[find_two_adjacent_segments] No adjacent segments found for range %u-%u", 
+            fprintf(stderr, "[find_two_adjacent_segments] No adjacent segments found for range %u-%u\n", 
                  target_start_sid, target_end_sid);
         }
         
@@ -224,7 +224,7 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
         idx = seg->next_idx;
     }
     
-    elog(ERROR, "[find_two_adjacent_segments] Could not find segments covering range %u-%u", 
+    fprintf(stderr, "[find_two_adjacent_segments] Could not find segments covering range %u-%u\n", 
          target_start_sid, target_end_sid);
     *seg_idx_0 = -1;
     *seg_idx_1 = -1;
@@ -237,7 +237,7 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
 void
 replace_flushed_segment(FlushedSegmentPool *pool, uint32_t old_seg_idx_0, uint32_t old_seg_idx_1, uint32_t new_seg_idx)
 {
-    elog(DEBUG1, "[replace_flushed_segment] Replacing old segment idx = %u with new segment idx = %u", 
+    fprintf(stderr, "[replace_flushed_segment] Replacing old segment idx = %u with new segment idx = %u\n", 
          old_seg_idx_0, new_seg_idx);
     
     // Get the old segment's position before unlinking
@@ -289,7 +289,7 @@ replace_flushed_segment(FlushedSegmentPool *pool, uint32_t old_seg_idx_0, uint32
         --pool->flushed_segment_count;
     }
     
-    elog(DEBUG1, "[replace_flushed_segment] Successfully replaced segment %u with segment %u", 
+    fprintf(stderr, "[replace_flushed_segment] Successfully replaced segment %u with segment %u\n", 
          old_seg_idx_0, new_seg_idx);
 }
 
@@ -304,11 +304,11 @@ load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool)
     
     if (file_count == 0)
     {
-        elog(DEBUG1, "[load_all_segments_from_disk] No segment metadata files found for index %u", index_oid);
+        fprintf(stderr, "[load_all_segments_from_disk] No segment metadata files found for index %u\n", index_oid);
         return;
     }
     
-    elog(DEBUG1, "[load_all_segments_from_disk] Found %d segment metadata files", file_count);
+    fprintf(stderr, "[load_all_segments_from_disk] Found %d segment metadata files\n", file_count);
     
     // Load segments in order
     for (int i = 0; i < file_count; i++)
@@ -316,7 +316,7 @@ load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool)
         uint32_t seg_idx = reserve_flushed_segment(pool);
         if (seg_idx == -1)
         {
-            elog(ERROR, "no free flushed segment slot");
+            fprintf(stderr, "no free flushed segment slot\n");
         }
 
         FlushedSegment segment = &pool->flushed_segments[seg_idx];
@@ -326,7 +326,7 @@ load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool)
         register_flushed_segment(pool, seg_idx);
     }
 
-    elog(DEBUG1, "[load_all_segments_from_disk] Loaded %d segments, tail_idx = %d", file_count, pool->tail_idx);
+    fprintf(stderr, "[load_all_segments_from_disk] Loaded %d segments, tail_idx = %d\n", file_count, pool->tail_idx);
 }
 
 // handled by vector index worker (for index build)
@@ -356,11 +356,11 @@ load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segmen
         load_mapping_file(indexRelId, start_sid, end_sid, version, &segment->map_ptr, false);
 
         segment->in_used = true;
-        elog(DEBUG1, "[load_segment_from_disk] loaded segment %u-%u v%u with %u vectors", start_sid, end_sid, version, valid_rows);
+        fprintf(stderr, "[load_segment_from_disk] loaded segment %u-%u v%u with %u vectors\n", start_sid, end_sid, version, valid_rows);
     }
     else 
     {
-        elog(ERROR, "[load_segment_from_disk] Failed to read segment metadata for segment %u-%u v%u", start_sid, end_sid, version);
+        fprintf(stderr, "[load_segment_from_disk] Failed to read segment metadata for segment %u-%u v%u\n", start_sid, end_sid, version);
     }
     pg_write_barrier();
 }

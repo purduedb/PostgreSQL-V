@@ -141,19 +141,19 @@ _PG_init(void)
 	elog(DEBUG1, "[_PG_init]register lsm index worker finished");
 
 	// initialize and register the lsm merge worker
-	elog(DEBUG1, "[_PG_init]register lsm merge worker");
-	BackgroundWorker lsm_merge_worker;
-	memset(&lsm_merge_worker, 0, sizeof(BackgroundWorker));
-	lsm_merge_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
-	lsm_merge_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	lsm_merge_worker.bgw_restart_time = 1;
-	snprintf(lsm_merge_worker.bgw_name, BGW_MAXLEN, "LSMMergeWorker"); // name
-	snprintf(lsm_merge_worker.bgw_library_name, BGW_MAXLEN, "vector.so"); // no .so
-	snprintf(lsm_merge_worker.bgw_function_name, BGW_MAXLEN, "lsm_merge_worker_main"); // entry function
-	lsm_merge_worker.bgw_main_arg = (Datum) 0; // Worker ID 0
-	lsm_merge_worker.bgw_notify_pid = 0;
-	RegisterBackgroundWorker(&lsm_merge_worker);
-	elog(DEBUG1, "[_PG_init]register lsm merge worker finished");
+	// elog(DEBUG1, "[_PG_init]register lsm merge worker");
+	// BackgroundWorker lsm_merge_worker;
+	// memset(&lsm_merge_worker, 0, sizeof(BackgroundWorker));
+	// lsm_merge_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	// lsm_merge_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	// lsm_merge_worker.bgw_restart_time = 1;
+	// snprintf(lsm_merge_worker.bgw_name, BGW_MAXLEN, "LSMMergeWorker"); // name
+	// snprintf(lsm_merge_worker.bgw_library_name, BGW_MAXLEN, "vector.so"); // no .so
+	// snprintf(lsm_merge_worker.bgw_function_name, BGW_MAXLEN, "lsm_merge_worker_main"); // entry function
+	// lsm_merge_worker.bgw_main_arg = (Datum) 0; // Worker ID 0
+	// lsm_merge_worker.bgw_notify_pid = 0;
+	// RegisterBackgroundWorker(&lsm_merge_worker);
+	// elog(DEBUG1, "[_PG_init]register lsm merge worker finished");
 }
 
 /*
