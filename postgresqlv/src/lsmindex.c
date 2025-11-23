@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <time.h>
 #include "lsm_merge_worker.h"
+#include "statuspage.h"
 
 LSMIndexBuffer *SharedLSMIndexBuffer = NULL;
 MemtableBuffer *SharedMemtableBuffer = NULL;
@@ -75,6 +76,7 @@ lsm_index_buffer_shmem_initialize()
                         MAXALIGN(sizeof(LSMIndexBuffer)),
                         &found);
     LWLockPadded *mt_tranche = GetNamedLWLockTranche(LSM_MEMTABLE_LWTRANCHE);
+    LWLockPadded *flushed_release_tranche = GetNamedLWLockTranche(LSM_FLUSHED_RELEASE_LWTRANCHE);
     // LWLockPadded *seg_tranche = GetNamedLWLockTranche(LSM_SEGMENT_LWTRANCHE);
     if (!found)
     {
@@ -83,9 +85,13 @@ lsm_index_buffer_shmem_initialize()
             pg_atomic_write_u32(&SharedLSMIndexBuffer->slots[i].valid, 0);
             LWLockInitialize(&SharedLSMIndexBuffer->slots[i].lsmIndex.mt_lock, LSM_MEMTABLE_LWTRANCHE_ID);
             SharedLSMIndexBuffer->slots[i].lsmIndex.mt_lock = &mt_tranche[i].lock;
+            LWLockInitialize(&flushed_release_tranche[i].lock, LSM_FLUSHED_RELEASE_LWTRANCHE_ID);
+            SharedLSMIndexBuffer->slots[i].lsmIndex.flushed_release_lock = &flushed_release_tranche[i].lock;
             // SharedLSMIndexBuffer->slots[i].lsmIndex.seg_lock = &seg_tranche[i].lock;
             SharedLSMIndexBuffer->slots[i].lsmIndex.growing_memtable_idx = MT_IDX_INVALID;
             SharedLSMIndexBuffer->slots[i].lsmIndex.growing_memtable_id  = 0;
+            pg_atomic_init_u32(&SharedLSMIndexBuffer->slots[i].lsmIndex.flushed_not_released_count, 0);
+            pg_atomic_init_u32(&SharedLSMIndexBuffer->slots[i].lsmIndex.releasing_in_progress, 0);
         }
     }
     // initialize SharedMemtableBuffer
@@ -185,6 +191,10 @@ register_and_set_memtable(LSMIndex lsm)
     MemSet(mt->bitmap, 0, sizeof(uint8_t) * MEMTABLE_BITMAP_SIZE);
 
     pg_write_barrier();
+
+    // update the status page
+    RegisterStatusMemtable(lsm->indexRelId, mt->memtable_id);
+
     elog(DEBUG1, "[register_and_set_memtable]  mt->memtable_id = %d, slot_num = %d",  mt->memtable_id, slot_num);
     return slot_num;
 }
@@ -234,6 +244,7 @@ persist_index_segment(LSMIndex lsm, SegmentId id_start, SegmentId id_end, uint64
         memcpy(bitmap_ptr, bitmap, prep.bitmap_size);
     }
     prep.bitmap_ptr = bitmap_ptr;
+    prep.delete_count = 0;
 
     // set the index binary
     prep.index_bin = index_bin;
@@ -283,7 +294,7 @@ build_lsm_index(IndexType type, Oid relId, void *vector_index, int64_t *tids, ui
 
     index_build_blocking(relId, slot_num);
     // update segment array
-    add_to_segment_array(slot_num, relId, START_SEGMENT_ID, START_SEGMENT_ID, count, type, 0.0f);
+    add_to_segment_array(slot_num, relId, START_SEGMENT_ID, START_SEGMENT_ID, count, type, 0);
 
     // initialize the memtable
     for (int i = 0; i < MEMTABLE_NUM; i++)
@@ -291,6 +302,8 @@ build_lsm_index(IndexType type, Oid relId, void *vector_index, int64_t *tids, ui
         slot->lsmIndex.memtable_idxs[i] = -1;
     }
     slot->lsmIndex.memtable_count = 0;
+    pg_atomic_init_u32(&slot->lsmIndex.flushed_not_released_count, 0);
+    pg_atomic_init_u32(&slot->lsmIndex.releasing_in_progress, 0);
     int mt_idx = allocate_new_growing_memtable(&slot->lsmIndex);
     slot->lsmIndex.growing_memtable_idx = mt_idx;
     slot->lsmIndex.growing_memtable_id = MT_FROM_SLOTIDX(mt_idx)->memtable_id;
@@ -305,6 +318,9 @@ load_lsm_index(Oid index_relid, uint32_t slot_idx)
 {
     elog(DEBUG1, "[load_lsm_index] loading index: relId = %u to slot %u", index_relid, slot_idx);
     
+    // Load all flushed segments from disk via vector index worker
+    index_load_blocking(index_relid, slot_idx);
+
     LSMIndex lsm = &SharedLSMIndexBuffer->slots[slot_idx].lsmIndex;
     
     // Read LSM index metadata from disk
@@ -314,17 +330,66 @@ load_lsm_index(Oid index_relid, uint32_t slot_idx)
     {
         elog(ERROR, "[load_lsm_index] Failed to read LSM index metadata for index %u", index_relid);
     }
-    
+
     // Initialize LSM index structure
     lsm->indexRelId = index_relid;
     lsm->index_type = index_type;
     lsm->dim = dim;
     lsm->elem_size = elem_size;
-    // FIXME: check this
-    pg_atomic_write_u32(&lsm->next_segment_id, START_SEGMENT_ID + 1);
     
-    // Load all flushed segments from disk via vector index worker
-    index_load_blocking(index_relid, slot_idx);
+    // Scan segment metadata files to get all segments
+    SegmentFileInfo files[MAX_SEGMENTS_COUNT];
+    int file_count = scan_segment_metadata_files(index_relid, files, MAX_SEGMENTS_COUNT);
+    
+    // Find the maximum end_sid from scanned segments
+    SegmentId max_end_sid = START_SEGMENT_ID;
+    for (int i = 0; i < file_count; i++)
+    {
+        if (files[i].end_sid > max_end_sid)
+        {
+            max_end_sid = files[i].end_sid;
+        }
+    }
+    
+    // Set next_segment_id to max_end_sid + 1
+    pg_atomic_write_u32(&lsm->next_segment_id, max_end_sid + 1);
+    
+    // Update SharedSegmentArray with segments from disk
+    if (merge_worker_manager != NULL)
+    {
+        SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[slot_idx];
+        
+        // Initialize the segment array for this index
+        LWLockAcquire(seg_array->lock, LW_EXCLUSIVE);
+        seg_array->current_index_relid = index_relid;
+        seg_array->max_end_segment_id = max_end_sid;
+        LWLockRelease(seg_array->lock);
+        
+        // Add each segment to the array
+        for (int i = 0; i < file_count; i++)
+        {
+            SegmentId start_sid_disk, end_sid_disk;
+            uint32_t valid_rows;
+            IndexType seg_index_type;
+            
+            // Read segment metadata to get vec_count and index_type
+            if (read_lsm_segment_metadata(index_relid, files[i].start_sid, files[i].end_sid, files[i].version,
+                                         &start_sid_disk, &end_sid_disk, &valid_rows, &seg_index_type))
+            {
+                // Read delete_count from bitmap file
+                uint32_t delete_count = 0;
+                if (!read_bitmap_delete_count(index_relid, start_sid_disk, end_sid_disk, files[i].version, &delete_count))
+                {
+                    elog(ERROR, "[load_lsm_index] Failed to read delete_count from bitmap file for segment %u-%u v%u", start_sid_disk, end_sid_disk, files[i].version);
+                    Assert(0);
+                }
+                
+                // Add segment to the merge worker's segment array
+                add_to_segment_array(slot_idx, index_relid, start_sid_disk, end_sid_disk, 
+                                    valid_rows, seg_index_type, delete_count);
+            }
+        }
+    }
 
     // Initialize memtables
     for (int i = 0; i < MEMTABLE_NUM; i++)
@@ -332,6 +397,8 @@ load_lsm_index(Oid index_relid, uint32_t slot_idx)
         lsm->memtable_idxs[i] = -1;
     }
     lsm->memtable_count = 0;
+    pg_atomic_init_u32(&lsm->flushed_not_released_count, 0);
+    pg_atomic_init_u32(&lsm->releasing_in_progress, 0);
     
     // Allocate a new growing memtable
     int mt_idx = allocate_new_growing_memtable(lsm);
@@ -597,6 +664,43 @@ insert_lsm_index(Relation index, const void *vector, const int64_t tid)
 {
     LSMIndex lsm_index = get_lsm_index(index->rd_id);
 
+    // Check for flushed but not released memtables and release them
+    // Only one backend should release at a time to avoid duplicate work
+    uint32_t count = pg_atomic_read_u32(&lsm_index->flushed_not_released_count);
+    if (count > 0)
+    {
+        // Check if another backend is already releasing
+        uint32_t expected = 0;
+        if (pg_atomic_compare_exchange_u32(&lsm_index->releasing_in_progress, &expected, 1))
+        {
+            // We successfully claimed the releasing task
+            // Now acquire the lock before releasing
+            LWLockAcquire(lsm_index->flushed_release_lock, LW_EXCLUSIVE);
+            
+            // Re-read count while holding lock (it might have changed)
+            count = pg_atomic_read_u32(&lsm_index->flushed_not_released_count);
+            if (count > 0)
+            {
+                // Read barrier to ensure we see the array writes made before count was incremented
+                pg_read_barrier();
+                
+                // Atomically clear the count and get the items to release
+                uint32_t items_to_release = pg_atomic_exchange_u32(&lsm_index->flushed_not_released_count, 0);
+                
+                // Release all flushed memtables from status pages
+                for (uint32_t i = 0; i < items_to_release && i < MEMTABLE_NUM; i++)
+                {
+                    ReleaseStatusMemtable(index, lsm_index->flushed_not_released[i]);
+                }
+            }
+            
+            // Release lock and clear the flag
+            LWLockRelease(lsm_index->flushed_release_lock);
+            pg_atomic_write_u32(&lsm_index->releasing_in_progress, 0);
+        }
+        // If another backend is already releasing, skip (they'll handle it)
+    }
+
     for (;;)
     {
         LWLockAcquire(lsm_index->mt_lock, LW_SHARED);
@@ -623,6 +727,10 @@ insert_lsm_index(Relation index, const void *vector, const int64_t tid)
         {
             mt->tids[i] = tid;
             memcpy(VEC_PTR_AT(mt, i), vector, VEC_BYTES_PER_ROW(mt));
+            
+            // update the status page
+            AddToStatusMemtable(index, MAIN_FORKNUM, mt->memtable_id, Int64ToItemPointer(tid));
+
             publish_slot_release(mt, i);
             return;
         }
@@ -993,21 +1101,37 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                                                           UINT32_MAX, &start_sid_disk, &end_sid_disk, 
                                                           &valid_rows, &seg_index_type);
             
-            if (is_persistent && bitmap_changed)
+            if (bitmap_changed)
             {
-                // Find latest version and subversion
-                uint32_t version = find_latest_segment_version(indexRelId, mt->memtable_id, mt->memtable_id);
-                uint32_t latest_subversion = find_latest_bitmap_subversion(indexRelId, mt->memtable_id, mt->memtable_id, version);
-                uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
-                
-                // Write updated bitmap with subversion
-                write_bitmap_file_with_subversion(indexRelId, mt->memtable_id, mt->memtable_id, 
-                                                  version, next_subversion, mt->bitmap, 
-                                                  GET_BITMAP_SIZE(valid_size));
-                
-                // notify the index worker to update the bitmap
-                segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
-                elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for growing memtable %u", mt->memtable_id);
+                // Calculate delete_count from bitmap
+                uint32_t delete_count = 0;
+                for (uint32_t i = 0; i < valid_size; i++)
+                {
+                    if (IS_SLOT_SET(mt->bitmap, i))
+                    {
+                        delete_count++;
+                    }
+                }
+                if (is_persistent)
+                {
+                    // Find latest version and subversion
+                    uint32_t version = find_latest_segment_version(indexRelId, mt->memtable_id, mt->memtable_id);
+                    uint32_t latest_subversion = find_latest_bitmap_subversion(indexRelId, mt->memtable_id, mt->memtable_id, version);
+                    uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
+                    
+                    // Write updated bitmap with subversion
+                    write_bitmap_file_with_subversion(indexRelId, mt->memtable_id, mt->memtable_id, 
+                                                    version, next_subversion, mt->bitmap, 
+                                                    GET_BITMAP_SIZE(valid_size), delete_count);
+                    
+                    // notify the index worker to update the bitmap
+                    segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
+                    elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for growing memtable %u", mt->memtable_id);
+                }
+                else {
+                    write_bitmap_for_memtable(indexRelId, mt->memtable_id, mt->bitmap, GET_BITMAP_SIZE(valid_size), delete_count);
+                    elog(DEBUG1, "[bulk_delete_lsm_index] wrote the bitmap for growing memtable %u to disk", mt->memtable_id);
+                }
             }
             
             // Release vacuum lock
@@ -1137,21 +1261,40 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                                                           UINT32_MAX, &start_sid_disk, &end_sid_disk, 
                                                           &valid_rows, &seg_index_type);
             
-            if (is_persistent && bitmap_changed)
+            if (bitmap_changed)
             {
-                // Find latest version and subversion
-                uint32_t version = find_latest_segment_version(indexRelId, mt->memtable_id, mt->memtable_id);
-                uint32_t latest_subversion = find_latest_bitmap_subversion(indexRelId, mt->memtable_id, mt->memtable_id, version);
-                uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
-                
-                // Write updated bitmap with subversion
-                write_bitmap_file_with_subversion(indexRelId, mt->memtable_id, mt->memtable_id, 
-                                                  version, next_subversion, mt->bitmap, 
-                                                  GET_BITMAP_SIZE(valid_size));
+                // Calculate delete_count from bitmap
+                uint32_t delete_count = 0;
+                for (uint32_t i = 0; i < valid_size; i++)
+                {
+                    if (IS_SLOT_SET(mt->bitmap, i))
+                    {
+                        delete_count++;
+                    }
+                }
+                if (is_persistent)
+                {
+                    // Find latest version and subversion
+                    uint32_t version = find_latest_segment_version(indexRelId, mt->memtable_id, mt->memtable_id);
+                    uint32_t latest_subversion = find_latest_bitmap_subversion(indexRelId, mt->memtable_id, mt->memtable_id, version);
+                    uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
+                    
+                    
+                    
+                    // Write updated bitmap with subversion
+                    write_bitmap_file_with_subversion(indexRelId, mt->memtable_id, mt->memtable_id, 
+                                                    version, next_subversion, mt->bitmap, 
+                                                    GET_BITMAP_SIZE(valid_size), delete_count);
 
-                // notify the index worker to update the bitmap
-                segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
-                elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for immutable memtable %u", mt->memtable_id);
+                    // notify the index worker to update the bitmap
+                    segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
+                    elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for immutable memtable %u", mt->memtable_id);
+                }
+                else
+                {
+                    write_bitmap_for_memtable(indexRelId, mt->memtable_id, mt->bitmap, GET_BITMAP_SIZE(valid_size), delete_count);
+                    elog(DEBUG1, "[bulk_delete_lsm_index] wrote the bitmap for immutable memtable %u to disk", mt->memtable_id);
+                }
             }
             
             // Release vacuum lock
@@ -1263,7 +1406,8 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                 int64_t *mapping_ptr = NULL;
                 
                 uint32_t version = find_latest_segment_version(indexRelId, segment->start_sid, segment->end_sid);
-                load_bitmap_file(indexRelId, segment->start_sid, segment->end_sid, version, &bitmap_ptr, true);
+                uint32_t delete_count;
+                load_bitmap_file(indexRelId, segment->start_sid, segment->end_sid, version, &bitmap_ptr, true, &delete_count);
                 load_mapping_file(indexRelId, segment->start_sid, segment->end_sid, version, &mapping_ptr, true);
                 
                 // Conduct vacuum: check each vector using callback
@@ -1282,6 +1426,7 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                             SET_SLOT(bitmap_ptr, i);
                             bitmap_changed = true;
                             stats->tuples_removed++;
+                            delete_count++;
                         }
                         else {
                             stats->num_index_tuples++;
@@ -1298,7 +1443,7 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                     // Write updated bitmap with subversion
                     Size bitmap_size = GET_BITMAP_SIZE(vec_count);
                     write_bitmap_file_with_subversion(indexRelId, segment->start_sid, segment->end_sid, 
-                                                      version, next_subversion, bitmap_ptr, bitmap_size);
+                                                      version, next_subversion, bitmap_ptr, bitmap_size, delete_count);
                     
                     // notify the index worker to update the bitmap (use VACUUM operation type)
                     segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, segment->start_sid, segment->end_sid);

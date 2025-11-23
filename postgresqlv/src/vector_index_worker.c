@@ -246,7 +246,8 @@ maintenance_worker_thread(void *arg)
                         }
                         
                         uint8_t *new_bitmap_ptr = NULL;
-                        load_bitmap_file(index_relid, task->start_sid, task->end_sid, LOAD_LATEST_VERSION, &new_bitmap_ptr, false);
+                        uint32_t delete_count;
+                        load_bitmap_file(index_relid, task->start_sid, task->end_sid, LOAD_LATEST_VERSION, &new_bitmap_ptr, false, &delete_count);
                         
                         if (new_bitmap_ptr == NULL) {
                             fprintf(stderr, "[maintenance_worker] ERROR: Failed to load new bitmap for segment %d-%d during vacuum\n", 

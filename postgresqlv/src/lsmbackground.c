@@ -116,6 +116,20 @@ prepare_for_flushing(LSMIndex lsm, int slot_idx, ConcurrentMemTable mt, PrepareF
     // build DSM bitmap (all ones; trim tail)
     prep->bitmap_size = GET_BITMAP_SIZE(valid);
     prep->bitmap_ptr = mt->bitmap;
+    
+    // count deleted vectors from bitmap
+    prep->delete_count = 0;
+    if (prep->bitmap_ptr != NULL && prep->valid_rows > 0)
+    {
+        uint8_t *bitmap = (uint8_t *)prep->bitmap_ptr;
+        for (uint32_t i = 0; i < prep->valid_rows; i++)
+        {
+            if (IS_SLOT_SET(bitmap, i))
+            {
+                prep->delete_count++;
+            }
+        }
+    }
 }
 
 // atomically publish segment and remove memtable from queue
@@ -190,14 +204,31 @@ lsm_flush_one_pending(LSMIndex lsm, int slot_idx, bool wait)
     // step 4. notify the vector index worker to load the segment from disk
     segment_update_blocking(slot_idx, lsm->indexRelId, SEGMENT_UPDATE_REGULAR, prep.start_sid, prep.end_sid);
 
+    // step 4.5. track flushed but not released memtable
+    // Use lock in flush path (less frequent), but write count atomically for lock-free reads
+    SegmentId flushed_sid = prep.start_sid; // memtable_id
+    LWLockAcquire(lsm->flushed_release_lock, LW_EXCLUSIVE);
+    uint32_t count = pg_atomic_read_u32(&lsm->flushed_not_released_count);
+    if (count < MEMTABLE_NUM)
+    {
+        lsm->flushed_not_released[count] = flushed_sid;
+        pg_write_barrier(); // Ensure array write is visible before count increment
+        pg_atomic_write_u32(&lsm->flushed_not_released_count, count + 1);
+    }
+    else
+    {
+        elog(WARNING, "[lsm_flush_one_pending] flushed_not_released array is full, cannot track memtable %u", flushed_sid);
+    }
+    LWLockRelease(lsm->flushed_release_lock);
+
     // step 5. atomic handoff
     handoff_unlink(lsm, mt_idx, &prep);
 
     // step 6. free the memtable slot
     release_memtable_slot(mt_idx);
-
+    
     // step 7. update the segment array
-    add_to_segment_array(slot_idx, lsm->indexRelId, prep.start_sid, prep.end_sid, prep.valid_rows, prep.index_type, 0.0f);
+    add_to_segment_array(slot_idx, lsm->indexRelId, prep.start_sid, prep.end_sid, prep.valid_rows, prep.index_type, prep.delete_count);
     
     // release vacuum lock
     LWLockRelease(&mt->vacuum_lock);

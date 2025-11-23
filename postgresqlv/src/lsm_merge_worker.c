@@ -250,7 +250,7 @@ remove_from_segment_array(SharedSegmentArray *seg_array, uint32_t idx)
 
 // Add a segment to the linked list (need to hold the lock)
 void
-add_to_segment_array(uint32_t lsm_idx, Oid index_relid, SegmentId start_sid, SegmentId end_sid, uint32_t vec_count, IndexType index_type, float deletion_ratio)
+add_to_segment_array(uint32_t lsm_idx, Oid index_relid, SegmentId start_sid, SegmentId end_sid, uint32_t vec_count, IndexType index_type, uint32_t delete_count)
 {
     SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
     LWLockAcquire(seg_array->lock, LW_EXCLUSIVE);
@@ -261,7 +261,7 @@ add_to_segment_array(uint32_t lsm_idx, Oid index_relid, SegmentId start_sid, Seg
     seg_array->segments[segment_idx].end_sid = end_sid;
     seg_array->segments[segment_idx].vec_count = vec_count;
     seg_array->segments[segment_idx].index_type = index_type;
-    seg_array->segments[segment_idx].deletion_ratio = deletion_ratio;
+    seg_array->segments[segment_idx].delete_count = delete_count;
 
     LWLockAcquire(seg_array->lock, LW_EXCLUSIVE);
     // Set the index relid for this segment array if not already set
@@ -285,9 +285,9 @@ add_to_segment_array(uint32_t lsm_idx, Oid index_relid, SegmentId start_sid, Seg
 static void 
 rebuild_index(MergeTaskData *task, IndexType target_type)
 {
-    elog(DEBUG1, "enter rebuild_index for slot %u, segment %u, index_type = %d, delete_ratio = %f, target_type = %d", 
+    elog(DEBUG1, "enter rebuild_index for slot %u, segment %u, index_type = %d, delete_count = %u, target_type = %d", 
         task->lsm_idx, task->segment_idx0, merge_worker_manager->segment_arrays[task->lsm_idx].segments[task->segment_idx0].index_type, 
-        merge_worker_manager->segment_arrays[task->lsm_idx].segments[task->segment_idx0].deletion_ratio, target_type);
+        merge_worker_manager->segment_arrays[task->lsm_idx].segments[task->segment_idx0].delete_count, target_type);
     
     SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[task->lsm_idx];
     MergeSegmentInfo *segment = &seg_array->segments[task->segment_idx0];
@@ -302,7 +302,8 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     Assert(old_index_ptr != NULL);
     // Load the bitmap from disk
     uint8_t *old_bitmap_ptr = NULL;
-    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, version, &old_bitmap_ptr, true);
+    uint32_t delete_count;
+    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, version, &old_bitmap_ptr, true, &delete_count);
     Assert(old_bitmap_ptr != NULL);
     // Load the mapping from disk
     int64_t *old_mapping_ptr = NULL;
@@ -348,7 +349,7 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     pfree(old_bitmap_ptr);
     
     // Reload bitmap from disk after acquiring lock
-    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, version, &old_bitmap_ptr, true);
+    load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, version, &old_bitmap_ptr, true, &delete_count);
     Assert(old_bitmap_ptr != NULL);
     
     // Serialize the new index
@@ -356,25 +357,36 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     IndexSerialize(new_index_ptr, &new_index_bin);
     Assert(new_index_bin != NULL);
     
-    // Generate new bitmap since all vectors in rebuilt index are valid (deleted ones filtered out)
-    uint8_t *new_bitmap_ptr = (uint8_t *) palloc0(GET_BITMAP_SIZE(new_index_count));
-    Assert(new_bitmap_ptr != NULL);
-
-    // Set all bits to 0 since all vectors in the rebuilt index are valid
-    memset(new_bitmap_ptr, 0x00, GET_BITMAP_SIZE(new_index_count));
-
-    // Generate new mapping by filtering out deleted entries from the old mapping
+    // Generate new mapping and bitmap by filtering out deleted entries from the old mapping
     // Use original_bitmap_ptr to match the state used when building the new index
+    // But check the reloaded old_bitmap_ptr to preserve any new deletions
     Size new_map_size = sizeof(int64_t) * (Size)new_index_count;
     int64_t *new_mapping_ptr = (int64_t *) palloc(new_map_size);
     Assert(new_mapping_ptr != NULL);
+    
+    // Generate new bitmap - preserve deletion state from reloaded bitmap
+    uint8_t *new_bitmap_ptr = (uint8_t *) palloc0(GET_BITMAP_SIZE(new_index_count));
+    Assert(new_bitmap_ptr != NULL);
+    uint32_t new_delete_count = 0;
+    
     {
         int write_idx = 0;
         for (int i = 0; i < (int)segment->vec_count; i++)
         {
+            // Only include vectors that were not deleted in the original bitmap (used for index building)
             if (!IS_SLOT_SET(original_bitmap_ptr, i))
             {
-                new_mapping_ptr[write_idx++] = old_mapping_ptr[i];
+                new_mapping_ptr[write_idx] = old_mapping_ptr[i];
+                
+                // Check if this vector is deleted in the reloaded bitmap
+                // If it was deleted after we built the index, mark it in the new bitmap
+                if (IS_SLOT_SET(old_bitmap_ptr, i))
+                {
+                    SET_SLOT(new_bitmap_ptr, write_idx);
+                    new_delete_count++;
+                }
+                
+                write_idx++;
             }
         }
         Assert(write_idx == new_index_count);
@@ -386,7 +398,7 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     // Update the segment information in task
     task->merged_index_type = target_type;
     task->merged_vec_count = new_index_count;
-    task->merged_deletion_ratio = 0.0f; // Reset deletion ratio after rebuild
+    task->merged_delete_count = new_delete_count;
     
     // Prepare flush metadata
     PrepareFlushMetaData prep;
@@ -397,6 +409,7 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     prep.index_bin = new_index_bin;
     prep.bitmap_ptr = new_bitmap_ptr;
     prep.bitmap_size = GET_BITMAP_SIZE(new_index_count); // Use new count for bitmap size
+    prep.delete_count = new_delete_count;
     prep.map_ptr = new_mapping_ptr;
     prep.map_size = new_map_size;
     
@@ -447,11 +460,13 @@ merge_adjacent_segments(MergeTaskData *task)
     
     // Load both bitmaps from disk
     uint8_t *bitmap0_ptr = NULL;
-    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &bitmap0_ptr, true);
+    uint32_t delete_count0;
+    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &bitmap0_ptr, true, &delete_count0);
     Assert(bitmap0_ptr != NULL);
     
     uint8_t *bitmap1_ptr = NULL;
-    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &bitmap1_ptr, true);
+    uint32_t delete_count1;
+    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &bitmap1_ptr, true, &delete_count1);
     Assert(bitmap1_ptr != NULL);
     
     // Load mappings for both segments (used to build merged mapping after merge)
@@ -471,8 +486,6 @@ merge_adjacent_segments(MergeTaskData *task)
     int smaller_count;
     IndexType larger_index_type;
     IndexType smaller_index_type;
-    float larger_deletion_ratio;
-    float smaller_deletion_ratio;
     
     if (segment0->vec_count >= segment1->vec_count) {
         larger_index_ptr = index0_ptr;
@@ -485,8 +498,6 @@ merge_adjacent_segments(MergeTaskData *task)
         smaller_count = segment1->vec_count;
         larger_index_type = segment0->index_type;
         smaller_index_type = segment1->index_type;
-        larger_deletion_ratio = segment0->deletion_ratio;
-        smaller_deletion_ratio = segment1->deletion_ratio;
     } else {
         larger_index_ptr = index1_ptr;
         smaller_index_ptr = index0_ptr;
@@ -498,8 +509,6 @@ merge_adjacent_segments(MergeTaskData *task)
         smaller_count = segment0->vec_count;
         larger_index_type = segment1->index_type;
         smaller_index_type = segment0->index_type;
-        larger_deletion_ratio = segment1->deletion_ratio;
-        smaller_deletion_ratio = segment0->deletion_ratio;
     }
 
     // Merge the two indices (MergeTwoIndices verifies index size internally)
@@ -527,10 +536,10 @@ merge_adjacent_segments(MergeTaskData *task)
     pfree(bitmap1_ptr);
     
     // Reload both bitmaps from disk after acquiring locks
-    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &bitmap0_ptr, true);
+    load_bitmap_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &bitmap0_ptr, true, &delete_count0);
     Assert(bitmap0_ptr != NULL);
     
-    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &bitmap1_ptr, true);
+    load_bitmap_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &bitmap1_ptr, true, &delete_count1);
     Assert(bitmap1_ptr != NULL);
     
     // Update pointers to point to the newly loaded bitmaps
@@ -585,8 +594,8 @@ merge_adjacent_segments(MergeTaskData *task)
     // Compute merged_index_type (use the index type of the larger segment)
     IndexType merged_index_type = larger_index_type;
     
-    // Compute merged_deletion_ratio as weighted average of the two segments
-    float merged_deletion_ratio = (larger_deletion_ratio * larger_count + smaller_deletion_ratio * smaller_count) / total_count;
+    // Compute merged_delete_count as sum of the two segments' delete counts
+    uint32_t merged_delete_count = delete_count0 + delete_count1;
     
     // Serialize the merged index
     void *merged_index_bin = NULL;
@@ -596,7 +605,7 @@ merge_adjacent_segments(MergeTaskData *task)
     // Update the segment information in task
     task->merged_index_type = merged_index_type;
     task->merged_vec_count = merged_count;
-    task->merged_deletion_ratio = merged_deletion_ratio;
+    task->merged_delete_count = merged_delete_count;
     
     // Prepare flush metadata for the merged segment
     PrepareFlushMetaData prep;
@@ -610,6 +619,7 @@ merge_adjacent_segments(MergeTaskData *task)
     // Provide the merged mapping aligned with merged index order
     prep.map_ptr = merged_mapping_ptr;
     prep.map_size = sizeof(int64_t) * (Size)merged_count;
+    prep.delete_count = merged_delete_count;
     
     // Write the merged segment to disk
     flush_segment_to_disk(index_relid, &prep);
@@ -748,7 +758,7 @@ finish_merge_task(int worker_id)
                 // Update segment metadata with merged information
                 segment->index_type = task->merged_index_type;
                 segment->vec_count = task->merged_vec_count;
-                segment->deletion_ratio = task->merged_deletion_ratio;
+                segment->delete_count = task->merged_delete_count;
                 segment->is_compacting = false;
                 
                 // Update statistics: add new values after updating segment
@@ -782,7 +792,7 @@ finish_merge_task(int worker_id)
                 segment0->end_sid = task->merged_end_sid;
                 segment0->vec_count = task->merged_vec_count;
                 segment0->index_type = task->merged_index_type;
-                segment0->deletion_ratio = task->merged_deletion_ratio;
+                segment0->delete_count = task->merged_delete_count;
                 segment0->is_compacting = false;
                 
                 // Update statistics: add new values for segment0 after updating
@@ -827,7 +837,7 @@ finish_merge_task(int worker_id)
     worker->current_task.merged_end_sid = -1;
     worker->current_task.merged_vec_count = 0;
     worker->current_task.merged_index_type = -1;
-    worker->current_task.merged_deletion_ratio = 0.0f;
+    worker->current_task.merged_delete_count = 0;
     
     elog(DEBUG1, "[finish_merge_task] Task finished for worker %d", worker_id);
 }
@@ -921,7 +931,8 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
                 break;
                 
             case 3: // deletion_ratio > MERGE_DELETION_RATIO_THRESHOLD
-                if (seg_array->segments[cur].deletion_ratio > MERGE_DELETION_RATIO_THRESHOLD)
+                if (seg_array->segments[cur].vec_count > 0 && 
+                    (float)seg_array->segments[cur].delete_count / seg_array->segments[cur].vec_count > MERGE_DELETION_RATIO_THRESHOLD)
                 {
                     should_claim = true;
                 }

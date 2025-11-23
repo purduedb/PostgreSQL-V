@@ -54,6 +54,11 @@ static void GetLSMBitmapFilePathWithSubversion(char *buf, size_t buflen, Oid ind
     }
 }
 
+static void GetLSMBitmapFilePathForMemtable(char *buf, size_t buflen, Oid indexRelId, SegmentId memtable_id)
+{
+    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/bitmap_memtable_%u", indexRelId, memtable_id);
+}
+
 static void GetLSMMappingFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "mapping");
@@ -96,12 +101,15 @@ static void ensure_dir_exists(const char *path)
 }
 
 // write to disk
+// If delete_count is not NULL, it will be written first (4 bytes) before the data
 static void 
-write_segment_file(const char *path, const void *data, Size size)
+write_segment_file(const char *path, const void *data, Size size, const uint32_t *delete_count)
 {
     Size written_size = 0;
     int chunk_index = 0;
-    while (written_size < size) {
+    bool delete_count_written = false;
+    
+    while (written_size < size || (delete_count != NULL && !delete_count_written)) {
         char tmp_path[MAXPGPATH];
         snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", path, chunk_index);
 
@@ -109,17 +117,35 @@ write_segment_file(const char *path, const void *data, Size size)
         if (fd < 0)
             elog(ERROR, "Failed to create temporary file: %s", tmp_path);
 
-        Size chunk_size = (size - written_size > MAX_FILE_SIZE) ? MAX_FILE_SIZE : size - written_size;
+        Size total_to_write = 0;
+        
+        // Write delete_count first if this is the first chunk and delete_count is provided
+        if (delete_count != NULL && !delete_count_written && chunk_index == 0)
+        {
+            Size write_size;
+            if ((write_size = write(fd, delete_count, sizeof(uint32_t))) != sizeof(uint32_t))
+                elog(ERROR, "Failed to write delete_count to temporary file: %s", tmp_path);
+            total_to_write += sizeof(uint32_t);
+            delete_count_written = true;
+        }
+        
+        // Write data chunk
+        if (written_size < size)
+        {
+            Size chunk_size = (size - written_size > MAX_FILE_SIZE - total_to_write) ? 
+                              (MAX_FILE_SIZE - total_to_write) : size - written_size;
 
-        Size write_size;
-        if ((write_size = write(fd, (char *)data + written_size, chunk_size)) != chunk_size)
-            elog(ERROR, "Failed to write full content to temporary file: %s, should write %ld but wrote %ld instead", tmp_path, chunk_size, write_size);
+            Size write_size;
+            if ((write_size = write(fd, (char *)data + written_size, chunk_size)) != chunk_size)
+                elog(ERROR, "Failed to write full content to temporary file: %s, should write %ld but wrote %ld instead", tmp_path, chunk_size, write_size);
+
+            written_size += chunk_size;
+        }
 
         if (fsync(fd) != 0)
             elog(ERROR, "fsync failed on temporary file: %s", tmp_path);
 
         CloseTransientFile(fd);
-        written_size += chunk_size;
         chunk_index++;
     }
 
@@ -149,8 +175,9 @@ write_segment_file(const char *path, const void *data, Size size)
 // We use alloc instead of palloc here to avoid autovacuum in Postgres (local memory)
 // This function can only be called by the vector index worker
 // note that we use malloc instead of palloc here as this function will be called by the vector index worker
+// If delete_count_out is not NULL, it will read delete_count first (4 bytes) from the file
 static void *
-read_segment_file(const char *path, bool pg_alloc)
+read_segment_file(const char *path, bool pg_alloc, uint32_t *delete_count_out)
 {
     int fd;
     struct stat st;
@@ -183,13 +210,22 @@ read_segment_file(const char *path, bool pg_alloc)
         chunk_index++;
     }
 
+    /* Adjust total_size if delete_count is present */
+    Size data_size = total_size;
+    if (delete_count_out != NULL && total_size >= sizeof(uint32_t))
+    {
+        data_size = total_size - sizeof(uint32_t);
+    }
+
     /* Now, allocate a large memory block to hold all the chunks */
-    void *dest = pg_alloc ? palloc(total_size) : malloc(total_size);
+    void *dest = pg_alloc ? palloc(data_size) : malloc(data_size);
     if (!dest)
         fprintf(stderr, "[read_segment_file] ERROR: Failed to allocate memory\n");
 
     int chunk_num = chunk_index;
     Size offset = 0;
+    bool delete_count_read = false;
+    
     for (int chunk_index = 0; chunk_index < chunk_num; chunk_index++)
     {
         char chunk_path[MAXPGPATH];
@@ -198,19 +234,45 @@ read_segment_file(const char *path, bool pg_alloc)
         fd = OpenTransientFile(chunk_path, O_RDONLY | PG_BINARY);
         if (fd < 0)
         {
-            fprintf(stderr, "[read_segment_file] ERROR: Could not open FAISS segment file: %s\n", path);
+            fprintf(stderr, "[read_segment_file] ERROR: Could not open FAISS segment file: %s\n", chunk_path);
+            Assert(0);
         }
 
+        /* Stat file */
         if (fstat(fd, &st) < 0)
+        {
             fprintf(stderr, "[read_segment_file] ERROR: Could not stat FAISS segment file: %s\n", chunk_path);
+            CloseTransientFile(fd);
+            Assert(0);
+        }
 
         size = st.st_size;
-
-        /* Read the chunk into the allocated memory at the appropriate offset */
-        if (read(fd, (char *)dest + offset, size) != size)
-            fprintf(stderr, "[read_segment_file] ERROR: Failed to read complete segment file into memory: %s\n", chunk_path);
-
-        offset += size; // Update the offset for the next chunk
+        
+        // Read delete_count from first chunk if needed
+        if (delete_count_out != NULL && !delete_count_read && chunk_index == 0 && size >= sizeof(uint32_t))
+        {
+            if (read(fd, delete_count_out, sizeof(uint32_t)) != sizeof(uint32_t))
+            {
+                fprintf(stderr, "[read_segment_file] ERROR: Failed to read delete_count from file: %s\n", chunk_path);
+                CloseTransientFile(fd);
+                continue;
+            }
+            size -= sizeof(uint32_t);  // Adjust size to skip delete_count
+            delete_count_read = true;
+        }
+        
+        // Read data chunk
+        if (size > 0 && offset < data_size)
+        {
+            Size read_size = (offset + size > data_size) ? (data_size - offset) : size;
+            if (read(fd, (char *)dest + offset, read_size) != read_size)
+            {
+                fprintf(stderr, "[read_segment_file] ERROR: Failed to read complete segment file into memory: %s\n", chunk_path);
+                CloseTransientFile(fd);
+                continue;
+            }
+            offset += read_size;
+        }
 
         CloseTransientFile(fd);
     }
@@ -400,6 +462,37 @@ compare_segment_files(const void *a, const void *b)
         return 0;
 }
 
+static int
+compare_segment_versions(const void *a, const void *b)
+{
+    typedef struct {
+        SegmentId start_sid;
+        SegmentId end_sid;
+        uint32_t max_version;
+        bool found;
+    } SegmentVersion;
+    
+    const SegmentVersion *seg_a = (const SegmentVersion *)a;
+    const SegmentVersion *seg_b = (const SegmentVersion *)b;
+    
+    // First sort by start_sid
+    if (seg_a->start_sid < seg_b->start_sid)
+        return -1;
+    else if (seg_a->start_sid > seg_b->start_sid)
+        return 1;
+    else
+    {
+        // For same start_sid, prefer larger scope (end_sid - start_sid)
+        // This ensures merged segments (larger scope) are processed first
+        if (seg_a->end_sid > seg_b->end_sid)
+            return -1;
+        else if (seg_a->end_sid < seg_b->end_sid)
+            return 1;
+        else
+            return 0;
+    }
+}
+
 int
 scan_segment_metadata_files(Oid indexRelId, SegmentFileInfo *files, int max_files)
 {
@@ -483,18 +576,53 @@ scan_segment_metadata_files(Oid indexRelId, SegmentFileInfo *files, int max_file
     
     closedir(dir);
     
-    // Build the files array with latest versions
+    // Sort segments by start_sid, and for same start_sid, prefer larger scope
+    qsort(segments, segment_count, sizeof(SegmentVersion), compare_segment_versions);
+    
+    // Sequentially scan segments, ensuring no gaps or overlaps
+    // Track the current largest end_sid and only accept contiguous segments
+    SegmentId largest_end_sid = (SegmentId)-1; // Initialize to -1 (no segments processed yet)
     int file_count = 0;
+    
     for (int i = 0; i < segment_count && file_count < max_files; i++)
     {
-        files[file_count].start_sid = segments[i].start_sid;
-        files[file_count].end_sid = segments[i].end_sid;
-        files[file_count].version = segments[i].max_version;
-        file_count++;
+        SegmentId start_sid = segments[i].start_sid;
+        SegmentId end_sid = segments[i].end_sid;
+        
+        if (largest_end_sid == (SegmentId)-1)
+        {
+            // First segment - accept it and initialize largest_end_sid
+            files[file_count].start_sid = start_sid;
+            files[file_count].end_sid = end_sid;
+            files[file_count].version = segments[i].max_version;
+            largest_end_sid = end_sid;
+            file_count++;
+            // elog(DEBUG1, "[scan_segment_metadata_files] accepted first segment: %u-%u", start_sid, end_sid);
+        }
+        else if (start_sid <= largest_end_sid)
+        {
+            // Overlap detected - skip this segment
+            // (we prefer the segment with larger scope, which should have been processed first after sorting)
+            // elog(DEBUG1, "[scan_segment_metadata_files] skipped overlapping segment: %u-%u", start_sid, end_sid);
+            continue;
+        }
+        else if (start_sid == largest_end_sid + 1)
+        {
+            // Contiguous segment - accept it
+            files[file_count].start_sid = start_sid;
+            files[file_count].end_sid = end_sid;
+            files[file_count].version = segments[i].max_version;
+            largest_end_sid = end_sid;
+            file_count++;
+            // elog(DEBUG1, "[scan_segment_metadata_files] accepted contiguous segment: %u-%u", start_sid, end_sid);
+        }
+        else // start_sid > largest_end_sid + 1
+        {
+            // Gap detected - trigger error
+            elog(ERROR, "Gap detected in segment files: expected start_sid %u but found %u (largest_end_sid: %u)",
+                 (unsigned int)(largest_end_sid + 1), (unsigned int)start_sid, (unsigned int)largest_end_sid);
+        }
     }
-    
-    // Sort files by start_sid
-    qsort(files, file_count, sizeof(SegmentFileInfo), compare_segment_files);
     
     return file_count;
 }
@@ -600,13 +728,16 @@ flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
     GetLSMIndexFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
     IndexBinarySetFlush(file_path, prep->index_bin);
 
-    // bitmap file - write with new version
+    // bitmap file - write with new version (include delete_count)
     GetLSMBitmapFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
-    write_segment_file(file_path, prep->bitmap_ptr, prep->bitmap_size);
+    // TODO: for debugging
+    elog(DEBUG1, "[flush_segment_to_disk] Writing bitmap file for segment %u-%u version %u, delete_count %u", 
+         prep->start_sid, prep->end_sid, new_version, prep->delete_count);
+    write_segment_file(file_path, prep->bitmap_ptr, prep->bitmap_size, &prep->delete_count);
 
-    // mapping file - write with new version
+    // mapping file - write with new version (no delete_count)
     GetLSMMappingFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
-    write_segment_file(file_path, prep->map_ptr, prep->map_size);
+    write_segment_file(file_path, prep->map_ptr, prep->map_size, NULL);
 
     // metadata file - write with new version (this is the last step, making it atomic)
     write_lsm_segment_metadata(indexRelId, prep, new_version);
@@ -614,8 +745,9 @@ flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
     elog(DEBUG1, "[flush_segment_to_disk] Successfully wrote segment %u-%u with version %u", prep->start_sid, prep->end_sid, new_version);
 }
 
-void 
-load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint8_t **bitmap, bool pg_alloc)
+// Read only the delete_count from bitmap file (more efficient than loading entire bitmap)
+bool
+read_bitmap_delete_count(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t *delete_count_out)
 {
     // If version is UINT32_MAX, find latest version
     if (version == UINT32_MAX)
@@ -628,20 +760,66 @@ load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_
     
     char path[MAXPGPATH];
     GetLSMBitmapFilePathWithSubversion(path, sizeof(path), indexRelId, start_sid, end_sid, version, subversion);
-    *bitmap = (uint8_t *) read_segment_file(path, pg_alloc);
+    
+    // Open the first chunk file (delete_count is always in the first chunk)
+    char chunk_path[MAXPGPATH];
+    snprintf(chunk_path, sizeof(chunk_path), "%s.0", path);
+    
+    int fd = OpenTransientFile(chunk_path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+    {
+        return false;
+    }
+    
+    // Read only the delete_count (first 4 bytes)
+    uint32_t delete_count;
+    if (read(fd, &delete_count, sizeof(uint32_t)) != sizeof(uint32_t))
+    {
+        CloseTransientFile(fd);
+        return false;
+    }
+    
+    CloseTransientFile(fd);
+    *delete_count_out = delete_count;
+    return true;
+}
+
+void 
+load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint8_t **bitmap, bool pg_alloc, uint32_t *delete_count_out)
+{
+    // If version is UINT32_MAX, find latest version
+    if (version == UINT32_MAX)
+    {
+        version = find_latest_segment_version(indexRelId, start_sid, end_sid);
+    }
+    
+    // Find the latest subversion for this version (if any)
+    uint32_t subversion = find_latest_bitmap_subversion(indexRelId, start_sid, end_sid, version);
+    
+    char path[MAXPGPATH];
+    GetLSMBitmapFilePathWithSubversion(path, sizeof(path), indexRelId, start_sid, end_sid, version, subversion);
+    *bitmap = (uint8_t *) read_segment_file(path, pg_alloc, delete_count_out);
+
+    // TODO: for debugging
+    elog(DEBUG1, "[load_bitmap_file] Loaded bitmap file for segment %u-%u version %u subversion %u, delete_count %u", 
+         start_sid, end_sid, version, subversion, *delete_count_out);
 }
 
 // Write bitmap file with subversion (for vacuum operations)
 // If subversion is UINT32_MAX, writes without subversion suffix
+// delete_count will be written to the file
 void 
-write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size)
+write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size, uint32_t delete_count)
 {
+    // elog(DEBUG1, "[write_bitmap_file_with_subversion] Writing bitmap file for segment %u-%u version %u subversion %u, delete_count %u", 
+    //      start_sid, end_sid, version, subversion, delete_count);
+
     char file_path[MAXPGPATH];
     GetLsmDirPath(file_path, MAXPGPATH, indexRelId);
     ensure_dir_exists(file_path);
     
     GetLSMBitmapFilePathWithSubversion(file_path, sizeof(file_path), indexRelId, start_sid, end_sid, version, subversion);
-    write_segment_file(file_path, bitmap, bitmap_size);
+    write_segment_file(file_path, bitmap, bitmap_size, &delete_count);
     
     if (subversion == UINT32_MAX)
     {
@@ -655,6 +833,19 @@ write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId
     }
 }
 
+void
+write_bitmap_for_memtable(Oid indexRelId, SegmentId memtable_id, uint8_t *bitmap, Size bitmap_size, uint32_t delete_count)
+{
+    char file_path[MAXPGPATH];
+    GetLsmDirPath(file_path, MAXPGPATH, indexRelId);
+    ensure_dir_exists(file_path);
+
+    GetLSMBitmapFilePathForMemtable(file_path, sizeof(file_path), indexRelId, memtable_id);
+    write_segment_file(file_path, bitmap, bitmap_size, &delete_count);
+    
+    elog(DEBUG1, "[write_bitmap_for_memtable] Successfully wrote bitmap file for memtable %u", memtable_id);
+}
+
 void 
 load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, int64_t **mapping, bool pg_alloc)
 {
@@ -666,7 +857,7 @@ load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32
     
     char path[MAXPGPATH];
     GetLSMMappingFilePathWithVersion(path, sizeof(path), indexRelId, start_sid, end_sid, version);
-    *mapping = (int64_t *) read_segment_file(path, pg_alloc);
+    *mapping = (int64_t *) read_segment_file(path, pg_alloc, NULL);
 }
 
 void 

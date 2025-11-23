@@ -30,8 +30,7 @@ typedef struct {
     IndexType index_type;
 
     // staticstics
-    // TODO: we need to update the deletion ratio when we implemnting the deletion logic
-    float deletion_ratio;
+    uint32_t delete_count;  // Number of deleted vectors in this segment
     
     // LWLock for bitmap concurrency control
     LWLock bitmap_lock;
@@ -50,7 +49,7 @@ typedef struct {
     SegmentId merged_end_sid;
     uint32_t merged_vec_count;
     IndexType merged_index_type;
-    float merged_deletion_ratio;
+    uint32_t merged_delete_count;
 } MergeTaskData;
 
 // Merge worker state
@@ -94,7 +93,7 @@ extern MergeWorkerManager *merge_worker_manager;
 void initialize_merge_worker_manager(void);
 
 // Linked list management functions (similar to FlushedSegmentPool)
-void add_to_segment_array(uint32_t lsm_idx, Oid index_relid, SegmentId start_sid, SegmentId end_sid, uint32_t vec_count, IndexType index_type, float deletion_ratio);
+void add_to_segment_array(uint32_t lsm_idx, Oid index_relid, SegmentId start_sid, SegmentId end_sid, uint32_t vec_count, IndexType index_type, uint32_t delete_count);
 
 // Background worker main function
 void lsm_merge_worker_main(Datum main_arg);

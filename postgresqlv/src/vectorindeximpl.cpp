@@ -441,8 +441,7 @@ IndexFree(void* indexPtr)
 static topKVector*
 VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView& bitset_view, uint32_t count, const float* query_vector, int k, int efs_nprobe)
 {
-    // TODO: for debugging
-    fprintf(stderr, "enter VectorIndexSearchImpl, type = %d, index_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, indexPtr, count, query_vector, k, efs_nprobe);
+    // fprintf(stderr, "enter VectorIndexSearchImpl, type = %d, index_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, indexPtr, count, query_vector, k, efs_nprobe);
 
     // TODO: for evaluation
     // Timing instrumentation
@@ -535,8 +534,7 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
 extern "C" topKVector*
 VectorIndexSearch(IndexType type, void *index_ptr, uint8_t *bitmap_ptr, uint32_t count, const float* query_vector, int k, int efs_nprobe)
 {
-    // TODO: for debugging
-    fprintf(stderr, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
+    // fprintf(stderr, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
 
     knowhere::BitsetView bitset_view(bitmap_ptr, count);
     return VectorIndexSearchImpl(type, index_ptr, bitset_view, count, query_vector, k, efs_nprobe);
@@ -932,7 +930,16 @@ MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_index_
     
     // Generate a bitmap view from the bitmap pointer
     knowhere::BitsetView bitset_view(bitmap_ptr, count);
-    int selected_count = count - bitset_view.count();
+    // TODO: for debugging
+    // int selected_count = count - bitset_view.count();
+    // count the number of bits in the bitmap (use bitmap_ptr)
+    int deleted_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (IS_SLOT_SET(bitmap_ptr, i)) {
+            deleted_count++;
+        }
+    }
+    int selected_count = count - deleted_count;
     if (selected_count <= 0) {
         // TODO: handle this case
         elog(ERROR, "MergeIndex: no vectors are selected");
@@ -1203,24 +1210,16 @@ merge_all_segment_results(ConcurrentSearchContext* ctx) {
 // Function called by each thread to search a segment
 static void
 search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
-    // TODO: for debugging
-    fprintf(stderr, "enter search_segment_task, seg_idx = %d\n", seg_idx);
+    // fprintf(stderr, "enter search_segment_task, seg_idx = %d\n", seg_idx);
 
     SegmentSearchInfo* seg = &ctx->segments[seg_idx];
     SegmentResult* result = &ctx->segment_results[seg_idx];
     
-    // TODO: for debugging
-    fprintf(stderr, "search_segment_task: checkpoint 1, seg_idx = %d\n", seg_idx);
-
     // Perform the search
     result->topk_vectors = VectorIndexSearch(seg->index_type, seg->index_ptr, seg->bitmap_ptr,
                                       seg->vec_count, ctx->query_vector, 
                                       ctx->topk, ctx->efs_nprobe);
 
-    // TODO: for debugging
-    fprintf(stderr, "search_segment_task: finished searching the segment, seg_idx = %d\n", seg_idx);
-    fprintf(stderr, "search_segment_task: result->topk_vectors = %p, result->topk_vectors->num_results = %d, seg_idx = %d\n", result->topk_vectors, result->topk_vectors->num_results, seg_idx);
-    
     if (result->topk_vectors != nullptr && result->topk_vectors->num_results > 0) {
         result->searched = true;
         result->pair_count = result->topk_vectors->num_results;
@@ -1248,9 +1247,6 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
         }
     }
 
-    // TODO: for debugging
-    fprintf(stderr, "search_segment_task: checkpoint 2, seg_idx = %d\n", seg_idx);
-
     // Decrement reference count for this segment immediately after search completes
     // This allows the segment to be freed/cleaned up earlier if needed
     if (ctx->pool_ptr) {
@@ -1260,12 +1256,8 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
     // Atomic countdown: decrement and check if we're the last one
     int remaining = ctx->remaining_count.fetch_sub(1) - 1;
 
-    // TODO: for debugging
-    fprintf(stderr, "search_segment_task: remaining = %d, seg_idx = %d\n", remaining, seg_idx);
-
     if (remaining == 0) {
-        // TODO: for debugging
-        fprintf(stderr, "search_segment_task: we are the last thread to finish, seg_idx = %d\n", seg_idx);
+        // fprintf(stderr, "search_segment_task: we are the last thread to finish, seg_idx = %d\n", seg_idx);
 
         // We are the last thread to finish - merge results, write to result structure, and set latch
         merge_all_segment_results(ctx);
@@ -1303,13 +1295,7 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
             free(ctx->segments);
         }
         free(ctx);
-
-        // TODO: for debugging
-        fprintf(stderr, "search_segment_task: freed the context and all its sub-structures, seg_idx = %d\n", seg_idx);
     }
-
-    // TODO: for debugging
-    fprintf(stderr, "search_segment_task: exit search_segment_task, seg_idx = %d\n", seg_idx);
 }
 
 // C wrapper function for concurrent vector search
@@ -1323,9 +1309,6 @@ ConcurrentVectorSearchOnSegments(
     VectorSearchResult result,
     PGPROC* client_proc,
     FlushedSegmentPool* pool) {
-
-    // TODO: for debugging
-    elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] enter ConcurrentVectorSearchOnSegments");
     
     // Get the global search thread pool
     auto search_pool = knowhere::ThreadPool::GetGlobalSearchThreadPool();
@@ -1364,15 +1347,11 @@ ConcurrentVectorSearchOnSegments(
         ctx->segment_results[i].searched = false;
     }
 
-    // TODO: for debugging
-    elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] about to launch concurrent searches on all segments");
-    
     // Launch concurrent searches on all segments using the thread pool
     // Each task will run asynchronously in the thread pool
     // The last-finisher thread will handle merging, writing results, and setting the latch
     for (uint32_t i = 0; i < segment_count; i++) {
-        // TODO: for debugging
-        elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] launching search on segment %d", i);
+        // elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] launching search on segment %d", i);
         search_pool->push([ctx, i]() {
             knowhere::ThreadPool::ScopedSearchOmpSetter setter(1);  // Set OMP threads to 1 per task
             search_segment_task(ctx, i);

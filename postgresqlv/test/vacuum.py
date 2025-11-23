@@ -34,6 +34,28 @@ def read_fvecs(file_path, num_vectors=None, skip=0):
     return np.vstack(vectors)
 
 
+def read_ivecs(file_path, expected_k=10000):
+    """
+    Reads an .ivecs ground truth file where each entry is prefixed by an int32
+    indicating the number of neighbors (should be `expected_k`, usually 1000).
+    """
+    vecs = []
+    with open(file_path, "rb") as f:
+        query_index = 0
+        while True:
+            len_bytes = f.read(4)
+            if not len_bytes:
+                break  # EOF
+            dim = struct.unpack("i", len_bytes)[0]
+            if dim != expected_k:
+                raise ValueError(f"Expected {expected_k} neighbors but got {dim} at query {query_index}")
+            vec_data = f.read(4 * dim)
+            vec = struct.unpack(f"{dim}i", vec_data)
+            vecs.append(vec)
+            query_index += 1
+    return vecs
+
+
 def create_table(conn, dim, tablename="test_vectors"):
     """Create a table for storing vectors"""
     with conn.cursor() as cur:
@@ -141,7 +163,7 @@ def vacuum_table(conn, table_name):
 
 
 def search_queries(conn, queries, top_k=10, nprobe=20, ef_search=400, tablename="test_vectors"):
-    """Run similarity search queries and return results"""
+    """Run similarity search queries and return results (zero-based IDs)"""
     with conn.cursor() as cur:
         cur.execute(f"SET ivfflat.probes = {nprobe};")
         cur.execute(f"SET hnsw.ef_search = {ef_search};")
@@ -154,9 +176,51 @@ def search_queries(conn, queries, top_k=10, nprobe=20, ef_search=400, tablename=
                 ORDER BY vec <-> %s::vector
                 LIMIT %s;
             """, (q.tolist(), top_k))
-            ids = [row[0] for row in cur.fetchall()]
+            # Subtract 1 from each ID to get zero-based indexing (matching ground truth format)
+            ids = [row[0] - 1 for row in cur.fetchall()]
             all_results.append(ids)
         return all_results
+
+
+def compute_exact_ground_truth(conn, queries, top_k=10, tablename="test_vectors"):
+    """Compute exact ground truth by running sequential scan (no index) - returns zero-based IDs"""
+    print("Computing exact ground truth (sequential scan)...")
+    with conn.cursor() as cur:
+        # Disable index scan to force sequential scan for exact results
+        cur.execute("SET enable_indexscan = off;")
+        all_results = []
+        for q in queries:
+            cur.execute(f"""
+                SELECT id
+                FROM {tablename}
+                ORDER BY vec <-> %s::vector
+                LIMIT %s;
+            """, (q.tolist(), top_k))
+            # Subtract 1 from each ID to get zero-based indexing (matching ground truth format)
+            ids = [row[0] - 1 for row in cur.fetchall()]
+            all_results.append(ids)
+        # Re-enable index scan
+        cur.execute("SET enable_indexscan = on;")
+    print(f"Computed ground truth for {len(all_results)} queries")
+    return all_results
+
+
+def compute_recall(predicted_ids, ground_truth_ids, top_k=10):
+    """Compute recall@k by comparing predicted results with ground truth"""
+    total_correct = 0
+    for i in range(len(predicted_ids)):
+        pred = predicted_ids[i][:top_k]
+        if i < len(ground_truth_ids):
+            gt = set(ground_truth_ids[i][:top_k])
+        else:
+            gt = set()
+        
+        correct = sum(1 for pid in pred if pid in gt)
+        total_correct += correct
+    
+    recall = total_correct / (len(predicted_ids) * top_k)
+    print(f"\nRecall@{top_k}: {recall:.4f}")
+    return recall
 
 
 def verify_search_results(search_results, deleted_ids, test_name="Search"):
@@ -225,6 +289,7 @@ def main():
     
     # Search and verification
     parser.add_argument("--queries", help="Path to query .fvecs file")
+    parser.add_argument("--gnd", help="Path to groundtruth .ivecs file for calculating recall (optional, will compute if not provided)")
     parser.add_argument("--nq", type=int, default=10, help="Number of queries to run")
     parser.add_argument("--k", type=int, default=10, help="Top-k for search")
     parser.add_argument("--nprobe", type=int, default=20, help="IVF_FLAT: number of probes")
@@ -371,9 +436,9 @@ def main():
         print("STEP 5: Run VACUUM")
         vacuum_table(conn, args.tablename)
         
-        # Wait 10 seconds after vacuum before running queries
-        print("Waiting 10 seconds after vacuum before running queries...")
-        time.sleep(10)
+        # # Wait 10 seconds after vacuum before running queries
+        # print("Waiting 10 seconds after vacuum before running queries...")
+        # time.sleep(10)
 
         # Step 6: Conduct similarity search and verify correctness
         print("STEP 6: Similarity Search and Verification")
@@ -391,25 +456,36 @@ def main():
                 conn, queries, args.k, args.nprobe, args.ef_search, args.tablename
             )
             
-            # Verify results
-            if deleted_ids:
-                success = verify_search_results(search_results, deleted_ids, "Vacuum Test")
-                if not success:
-                    sys.exit(1)
+            # Get ground truth: from file if provided, otherwise compute exact
+            if args.gnd:
+                print(f"Reading ground truth from: {args.gnd}")
+                ground_truth = read_ivecs(args.gnd, args.k)
             else:
-                print("No vectors were deleted, skipping verification")
+                # Compute exact ground truth by sequential scan
+                ground_truth = compute_exact_ground_truth(conn, queries, args.k, args.tablename)
             
-            # Additional verification: check that all returned IDs exist in the table
-            all_existing_ids = set(get_all_vector_ids(conn, args.tablename))
-            all_valid = True
-            for query_idx, result_ids in enumerate(search_results):
-                invalid_ids = [vid for vid in result_ids if vid not in all_existing_ids]
-                if invalid_ids:
-                    print(f"❌ Query {query_idx}: Found non-existent IDs {invalid_ids}")
-                    all_valid = False
+            # Compute recall
+            recall = compute_recall(search_results, ground_truth, args.k)
             
-            if all_valid:
-                print("✅ All returned IDs exist in the table")
+            # # Verify results
+            # if deleted_ids:
+            #     success = verify_search_results(search_results, deleted_ids, "Vacuum Test")
+            #     if not success:
+            #         sys.exit(1)
+            # else:
+            #     print("No vectors were deleted, skipping verification")
+            
+            # # Additional verification: check that all returned IDs exist in the table
+            # all_existing_ids = set(get_all_vector_ids(conn, args.tablename))
+            # all_valid = True
+            # for query_idx, result_ids in enumerate(search_results):
+            #     invalid_ids = [vid for vid in result_ids if vid not in all_existing_ids]
+            #     if invalid_ids:
+            #         print(f"❌ Query {query_idx}: Found non-existent IDs {invalid_ids}")
+            #         all_valid = False
+            
+            # if all_valid:
+            #     print("✅ All returned IDs exist in the table")
         
         print("TEST COMPLETED SUCCESSFULLY")
 

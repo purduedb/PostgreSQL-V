@@ -55,6 +55,7 @@
 #include "utils/memutils.h"
 #include "vectorindeximpl.hpp"
 #include "lsmindex.h"
+#include "statuspage.h"
 
 #if PG_VERSION_NUM >= 140000
 #include "utils/backend_progress.h"
@@ -309,8 +310,10 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	uint32_t elem_size = buildstate->vectors->itemsize / buildstate->dimensions;
 	
 	build_lsm_index(HNSW, relId, buildstate->hnswIndex, (int64_t *)tids, dim, elem_size, buildstate->num_tids);
-	
-	// TODO: write the status pages
+		
+	// create the status pages
+	CreateStatusMetaPage(index, MAIN_FORKNUM);
+	InitializeStatusMemtableArray(index, MAIN_FORKNUM);
 
 	MemoryContextSwitchTo(oldCtx);
     MemoryContextDelete(hnswBuildCtx);

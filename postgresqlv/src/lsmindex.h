@@ -43,6 +43,8 @@ typedef enum IndexType
 #define LSM_SEGMENT_LWTRANCHE_ID 1002
 #define LSM_MEMTABLE_VACUUM_LWTRANCHE "lsm_memtable_vacuum_lock"
 #define LSM_MEMTABLE_VACUUM_LWTRANCHE_ID 1005
+#define LSM_FLUSHED_RELEASE_LWTRANCHE "lsm_flushed_release_lock"
+#define LSM_FLUSHED_RELEASE_LWTRANCHE_ID 1006
 
 // Sentinel for rotation-in-progress
 #define MT_IDX_INVALID   (-1)
@@ -132,6 +134,13 @@ typedef struct LSMIndexData
     SegmentId growing_memtable_id;
     int32_t memtable_idxs[MEMTABLE_NUM]; // the idx of the memtable in the global memtable array
     uint32_t memtable_count; // number of immutable memtables for this index
+    
+    // Track memtables that have been flushed but not yet released in status pages
+    // Use atomic operations for lock-free reads in insert path
+    LWLock *flushed_release_lock; // lock for flushed_not_released tracking (used in both flush and release paths)
+    SegmentId flushed_not_released[MEMTABLE_NUM]; // SegmentIds of flushed but not released memtables
+    pg_atomic_uint32 flushed_not_released_count; // number of flushed but not released memtables (atomic for lock-free reads)
+    pg_atomic_uint32 releasing_in_progress; // 1 if a backend is currently releasing memtables, 0 otherwise
 } LSMIndexData;
 typedef LSMIndexData * LSMIndex;
 
@@ -171,6 +180,7 @@ typedef struct PrepareFlushMetaData
     // dsm_handle bitmap_hdl;
     void *bitmap_ptr;
     Size bitmap_size;
+    uint32_t delete_count;  // Number of deleted vectors in this segment
     void *index_bin;
     IndexType index_type;
 } PrepareFlushMetaData;
@@ -192,8 +202,10 @@ bool read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId en
 uint32_t find_latest_segment_version(Oid indexRelId, SegmentId start_sid, SegmentId end_sid);
 uint32_t find_latest_bitmap_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version);
 void load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, IndexType index_type, void **index);
-void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint8_t **bitmap, bool pg_alloc);
-void write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size);
+bool read_bitmap_delete_count(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t *delete_count_out);
+void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint8_t **bitmap, bool pg_alloc, uint32_t *delete_count_out);
+void write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size, uint32_t delete_count);
+void write_bitmap_for_memtable(Oid indexRelId, SegmentId memtable_id, uint8_t *bitmap, Size bitmap_size, uint32_t delete_count);
 void load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, int64_t **mapping, bool pg_alloc);
 #define LOAD_LATEST_VERSION UINT32_MAX
 

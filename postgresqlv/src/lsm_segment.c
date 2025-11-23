@@ -43,9 +43,7 @@ reserve_flushed_segment(FlushedSegmentPool *pool)
 
 void
 register_flushed_segment(FlushedSegmentPool *pool, uint32_t idx)
-{
-    fprintf(stderr, "enter register_flushed_segment for idx = %d\n", idx);
-    
+{    
     // Initialize reference count for the new segment
     atomic_store(&pool->flushed_segments[idx].ref_count, 1);
     
@@ -66,6 +64,7 @@ register_flushed_segment(FlushedSegmentPool *pool, uint32_t idx)
     }
     
     ++pool->flushed_segment_count;
+
     fprintf(stderr, "register_flushed_segment successfully added to list, idx = %d\n", idx);
 }
 
@@ -88,9 +87,7 @@ void
 cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
 {
     FlushedSegment segment = &pool->flushed_segments[segment_idx];
-    
-    fprintf(stderr, "[cleanup_flushed_segment] Cleaning up segment idx = %d\n", segment_idx);
-    
+        
     // Free the index, bitmap, and map
     if (segment->index_ptr != NULL)
     {
@@ -352,7 +349,8 @@ load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segmen
         segment->index_type = seg_index_type;
 
         load_index_file(indexRelId, start_sid, end_sid, version, seg_index_type, &segment->index_ptr);
-        load_bitmap_file(indexRelId, start_sid, end_sid, version, &segment->bitmap_ptr, false);
+        uint32_t delete_count;
+        load_bitmap_file(indexRelId, start_sid, end_sid, version, &segment->bitmap_ptr, false, &delete_count);
         load_mapping_file(indexRelId, start_sid, end_sid, version, &segment->map_ptr, false);
 
         segment->in_used = true;

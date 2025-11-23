@@ -38,6 +38,7 @@
 
 #include "vectorindeximpl.hpp"
 #include "lsmindex.h"
+#include "statuspage.h"
 
 /*
  * Add sample
@@ -471,6 +472,10 @@ ivfflatbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 #endif
 
 	BuildIndex(heap, index, indexInfo, &buildstate, MAIN_FORKNUM);
+
+	// create the status pages
+	CreateStatusMetaPage(index, MAIN_FORKNUM);
+	InitializeStatusMemtableArray(index, MAIN_FORKNUM);
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
 	// TODO: set `buildstate.reltuples` and `buildstate.indtuples`
