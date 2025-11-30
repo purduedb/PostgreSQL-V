@@ -57,7 +57,7 @@ If you find our system useful for your research, please cite the following paper
 ```
 @inproceedings{PostgreSQLV-CIDR26,
   title={Fast Vector Search in PostgreSQL: A Decoupled Approach},
-  author={Jiayi Liu and Yunan Zhang and Chenzhe Jin and Aditya Gupta and Shige Liu and and Jianguo Wang},
+  author={Jiayi Liu and Yunan Zhang and Chenzhe Jin and Aditya Gupta and Shige Liu and Jianguo Wang},
   booktitle={Conference on Innovative Data Systems Research (CIDR)},
   year={2026}
 }
