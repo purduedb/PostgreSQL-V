@@ -1210,8 +1210,6 @@ merge_all_segment_results(ConcurrentSearchContext* ctx) {
 // Function called by each thread to search a segment
 static void
 search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
-    // fprintf(stderr, "enter search_segment_task, seg_idx = %d\n", seg_idx);
-
     SegmentSearchInfo* seg = &ctx->segments[seg_idx];
     SegmentResult* result = &ctx->segment_results[seg_idx];
     
@@ -1309,7 +1307,6 @@ ConcurrentVectorSearchOnSegments(
     VectorSearchResult result,
     PGPROC* client_proc,
     FlushedSegmentPool* pool) {
-    
     // Get the global search thread pool
     auto search_pool = knowhere::ThreadPool::GetGlobalSearchThreadPool();
 
@@ -1338,7 +1335,7 @@ ConcurrentVectorSearchOnSegments(
     // Allocate result storage
     ctx->segment_results = (SegmentResult*)
         malloc(sizeof(SegmentResult) * segment_count);
-    
+
     // Initialize results
     for (uint32_t i = 0; i < segment_count; i++) {
         ctx->segment_results[i].topk_vectors = nullptr;

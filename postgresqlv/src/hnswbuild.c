@@ -303,17 +303,18 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 
 	HnswIndexInit(dim, buildstate->m, buildstate->efConstruction, &(buildstate->hnswIndex));
 	CreateMetaPage(buildstate);
+	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
+		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
 	ScanAllRows(buildstate);
 
-	Oid relId = RelationGetRelid(buildstate->index);
 	void *tids = buildstate->tids;
 	uint32_t elem_size = buildstate->vectors->itemsize / buildstate->dimensions;
 	
-	build_lsm_index(HNSW, relId, buildstate->hnswIndex, (int64_t *)tids, dim, elem_size, buildstate->num_tids);
-		
 	// create the status pages
 	CreateStatusMetaPage(index, MAIN_FORKNUM);
 	InitializeStatusMemtableArray(index, MAIN_FORKNUM);
+	
+	build_lsm_index(HNSW, buildstate->index, buildstate->hnswIndex, (int64_t *)tids, dim, elem_size, buildstate->num_tids);
 
 	MemoryContextSwitchTo(oldCtx);
     MemoryContextDelete(hnswBuildCtx);

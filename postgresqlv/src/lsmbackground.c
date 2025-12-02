@@ -130,6 +130,13 @@ prepare_for_flushing(LSMIndex lsm, int slot_idx, ConcurrentMemTable mt, PrepareF
             }
         }
     }
+
+    // set the offsets
+    SegmentOffsetRange *offsets = palloc(sizeof(SegmentOffsetRange) * 1);
+    offsets[0].sid = prep->start_sid;
+    offsets[0].start_offset = 0;
+    offsets[0].end_offset = prep->valid_rows;
+    prep->offsets = offsets;
 }
 
 // atomically publish segment and remove memtable from queue

@@ -70,7 +70,7 @@ typedef struct {
     // the head_idx is always 0
     uint32_t tail_idx;             // Index of the last segment in the linked list
     uint32_t insert_idx;           // Next available slot for insertion
-    SegmentId max_end_segment_id;  // Current maximum end segment ID
+    // SegmentId max_end_segment_id;  // Current maximum end segment ID
     
     // staticstics
     pg_atomic_uint32 flat_count; // number of flat segments

@@ -1,4 +1,7 @@
 #include "lsmindex.h"
+#include "storage/block.h"
+#include "storage/bufmgr.h"
+#include "storage/itemid.h"
 #include "utils/elog.h"
 #include "vectorindeximpl.hpp"
 #include "utils.h"
@@ -7,10 +10,16 @@
 #include "storage/shmem.h"
 #include "storage/dsm.h"
 #include "tasksend.h"
+#include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
 #include "lsm_merge_worker.h"
 #include "statuspage.h"
+#include "catalog/index.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "vector.h"
+#include "access/heapam.h"
 
 LSMIndexBuffer *SharedLSMIndexBuffer = NULL;
 MemtableBuffer *SharedMemtableBuffer = NULL;
@@ -77,9 +86,14 @@ lsm_index_buffer_shmem_initialize()
                         &found);
     LWLockPadded *mt_tranche = GetNamedLWLockTranche(LSM_MEMTABLE_LWTRANCHE);
     LWLockPadded *flushed_release_tranche = GetNamedLWLockTranche(LSM_FLUSHED_RELEASE_LWTRANCHE);
+    LWLockPadded *index_buffer_tranche = GetNamedLWLockTranche(LSM_INDEX_BUFFER_LWTRANCHE);
     // LWLockPadded *seg_tranche = GetNamedLWLockTranche(LSM_SEGMENT_LWTRANCHE);
     if (!found)
     {
+        // Initialize the buffer-level lock
+        LWLockInitialize(&index_buffer_tranche[0].lock, LSM_INDEX_BUFFER_LWTRANCHE_ID);
+        SharedLSMIndexBuffer->lock = &index_buffer_tranche[0].lock;
+        
         for (int i = 0; i < INDEX_BUF_SIZE; i++)
         {
             pg_atomic_write_u32(&SharedLSMIndexBuffer->slots[i].valid, 0);
@@ -129,14 +143,62 @@ alloc_segment_id(LSMIndex lsm)
 }
 
 static int
-register_lsm_index()
+register_lsm_index(Oid index_relid)
 {
+    // Acquire exclusive lock to prevent concurrent registration
+    LWLockAcquire(SharedLSMIndexBuffer->lock, LW_EXCLUSIVE);
+    
+    // Double-check: another backend might have registered this index while we were waiting
+    for (int i = 0; i < INDEX_BUF_SIZE; i++)
+    {
+        uint32 valid = pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[i].valid);
+        if (valid > 0 && 
+            SharedLSMIndexBuffer->slots[i].lsmIndex.indexRelId == index_relid)
+        {
+            // Index already registered, check status
+            LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[i];
+            
+            if (valid == 1)
+            {
+                // Index is fully loaded, release lock and return the slot
+                LWLockRelease(SharedLSMIndexBuffer->lock);
+                return i;
+            }
+            else if (valid == 2)
+            {
+                // Index is being loaded by another backend, wait for it to complete
+                LWLockRelease(SharedLSMIndexBuffer->lock);
+                elog(DEBUG1, "[register_lsm_index] waiting for index %u to finish loading in slot %u", index_relid, i);
+                
+                // Wait for loading to complete (poll until valid becomes 1)
+                while (pg_atomic_read_u32(&slot->valid) == 2)
+                {
+                    pg_usleep(1000);  // Sleep 1ms
+                }
+                
+                // Verify it's now loaded
+                if (pg_atomic_read_u32(&slot->valid) == 1 && 
+                    slot->lsmIndex.indexRelId == index_relid &&
+                    slot->lsmIndex.dim > 0)
+                {
+                    elog(DEBUG1, "[register_lsm_index] index %u loaded by another backend", index_relid);
+                    return i;
+                }
+                else
+                {
+                    elog(ERROR, "[register_lsm_index] index %u loading failed or slot state invalid", index_relid);
+                }
+            }
+        }
+    }
+    
     // find an empty slot
     int slot_num = -1;
     for (int i = 0; i < INDEX_BUF_SIZE; i++)
     {
         uint32 expected = 0;
-        if (pg_atomic_compare_exchange_u32(&SharedLSMIndexBuffer->slots[i].valid, &expected, 1))
+        // Mark as loading (2) when registering, not loaded (1)
+        if (pg_atomic_compare_exchange_u32(&SharedLSMIndexBuffer->slots[i].valid, &expected, 2))
         {
             slot_num = i;
             break;
@@ -145,13 +207,20 @@ register_lsm_index()
     if (slot_num == -1)
     {
         // no free slot - randomly evict one
+        LWLockRelease(SharedLSMIndexBuffer->lock);
         elog(ERROR, "[register_lsm_index] no free slot");
     }
+    
+    // Write the Oid when registering the index
+    SharedLSMIndexBuffer->slots[slot_num].lsmIndex.indexRelId = index_relid;
+    
+    // Release lock before returning
+    LWLockRelease(SharedLSMIndexBuffer->lock);
     return slot_num;
 }
 
 static int
-register_and_set_memtable(LSMIndex lsm)
+register_and_set_memtable(LSMIndex lsm, Relation index, bool is_recovery, SegmentId assigned_sid)
 {
     // find an empty slot
     int slot_num = -1;
@@ -172,7 +241,14 @@ register_and_set_memtable(LSMIndex lsm)
 
     ConcurrentMemTable mt = MT_FROM_SLOTIDX(slot_num);  
     mt->rel = lsm->indexRelId;
-    mt->memtable_id = alloc_segment_id(lsm);
+    if (is_recovery)
+    {
+        mt->memtable_id = assigned_sid;
+    }
+    else
+    {
+        mt->memtable_id = alloc_segment_id(lsm);
+    }
     // elog(DEBUG1, "[register_and_set_memtable] mt->memtable_id = %d", mt->memtable_id);
     mt->dim = lsm->dim;
     mt->elem_size = lsm->elem_size;
@@ -193,7 +269,10 @@ register_and_set_memtable(LSMIndex lsm)
     pg_write_barrier();
 
     // update the status page
-    RegisterStatusMemtable(lsm->indexRelId, mt->memtable_id);
+    if (!is_recovery)
+    {
+        RegisterStatusMemtable(index, mt->memtable_id);
+    }
 
     elog(DEBUG1, "[register_and_set_memtable]  mt->memtable_id = %d, slot_num = %d",  mt->memtable_id, slot_num);
     return slot_num;
@@ -202,11 +281,11 @@ register_and_set_memtable(LSMIndex lsm)
 // require an exclusive lock
 // try to allocate a new memtable slot from the global buffer, waiting if none
 static int
-allocate_new_growing_memtable(LSMIndex lsm)
+allocate_new_growing_memtable(LSMIndex lsm, Relation index, bool is_recovery, SegmentId assigned_sid)
 {
     for (;;)
     {
-        int mt_idx = register_and_set_memtable(lsm);
+        int mt_idx = register_and_set_memtable(lsm, index, is_recovery, assigned_sid);
         elog(DEBUG1, "[allocate_new_growing_memtable] mt_idx = %d", mt_idx);
         if (mt_idx >= 0)
         {
@@ -249,6 +328,13 @@ persist_index_segment(LSMIndex lsm, SegmentId id_start, SegmentId id_end, uint64
     // set the index binary
     prep.index_bin = index_bin;
 
+    // set the offsets
+    SegmentOffsetRange *offsets = palloc(sizeof(SegmentOffsetRange) * 1);
+    offsets[0].sid = prep.start_sid;
+    offsets[0].start_offset = 0;
+    offsets[0].end_offset = count;
+    prep.offsets = offsets;
+
     flush_segment_to_disk(lsm->indexRelId, &prep);
     /* Persist overall LSM index metadata (index_type, dim, elem_size) */
     write_lsm_index_metadata(lsm);
@@ -268,10 +354,11 @@ try_dsm_attach(dsm_handle hdl)
 
 // no locks are needed when building
 void
-build_lsm_index(IndexType type, Oid relId, void *vector_index, int64_t *tids, uint32_t dim, uint32_t elem_size, uint64_t count)
+build_lsm_index(IndexType type, Relation index, void *vector_index, int64_t *tids, uint32_t dim, uint32_t elem_size, uint64_t count)
 {
     elog(DEBUG1, "enter build_lsm_index");
-    int slot_num = register_lsm_index();
+    Oid relId = RelationGetRelid(index);
+    int slot_num = register_lsm_index(relId);
     if (slot_num == -1)
     {
         elog(ERROR, "[build_lsm_index] no free slot to register a new lsm index");
@@ -304,33 +391,82 @@ build_lsm_index(IndexType type, Oid relId, void *vector_index, int64_t *tids, ui
     slot->lsmIndex.memtable_count = 0;
     pg_atomic_init_u32(&slot->lsmIndex.flushed_not_released_count, 0);
     pg_atomic_init_u32(&slot->lsmIndex.releasing_in_progress, 0);
-    int mt_idx = allocate_new_growing_memtable(&slot->lsmIndex);
+    int mt_idx = allocate_new_growing_memtable(&slot->lsmIndex, index, false, NULL);
     slot->lsmIndex.growing_memtable_idx = mt_idx;
     slot->lsmIndex.growing_memtable_id = MT_FROM_SLOTIDX(mt_idx)->memtable_id;
+    pg_atomic_write_u32(&slot->valid, 1);
     // elog(DEBUG1, "[build_lsm_index] initialized the memtable, growing_memtable_idx = %d, growing_memtable_id = %d", 
     //         slot->lsmIndex.growing_memtable_idx, slot->lsmIndex.growing_memtable_id);
 
     // vector_index will be freed outside this function
 }
 
-static void
-load_lsm_index(Oid index_relid, uint32_t slot_idx)
+// Comparison function for descending sort of SegmentId array
+static int
+compare_sids_desc(const void *a, const void *b)
 {
+    SegmentId sid_a = *(const SegmentId *)a;
+    SegmentId sid_b = *(const SegmentId *)b;
+    if (sid_a > sid_b)
+        return -1;
+    if (sid_a < sid_b)
+        return 1;
+    return 0;
+}
+
+// Comparison function for ascending sort of int64_t array (for binary search)
+static int
+compare_int64(const void *a, const void *b)
+{
+    int64_t val_a = *(const int64_t *)a;
+    int64_t val_b = *(const int64_t *)b;
+    if (val_a < val_b)
+        return -1;
+    if (val_a > val_b)
+        return 1;
+    return 0;
+}
+
+static inline void publish_slot_release(ConcurrentMemTable t, uint32 i);
+static bool test_consistency(Relation heap_rel, LSMIndex lsm_index, int lsm_slot_idx);
+
+static void
+load_lsm_index(Relation index, uint32_t slot_idx)
+{
+    Oid index_relid = RelationGetRelid(index);
     elog(DEBUG1, "[load_lsm_index] loading index: relId = %u to slot %u", index_relid, slot_idx);
     
+    // Note: Concurrency and status checks are already handled in register_lsm_index()
+    // and get_lsm_index_idx()/get_lsm_index() before calling this function.
+    // By the time we reach here, the slot should be registered (valid == 2) with the correct Oid.
+    
+    LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[slot_idx];
+
+    // read the max memtable sid from the status page
+    SegmentId status_growing_sid = GetStatusGrowingSid(index, MAIN_FORKNUM);
+    int num_sids;
+    SegmentId *sids = GetStatusMemtableSids(index, MAIN_FORKNUM, &num_sids);
+    // sort the sids descendingly
+    if (sids != NULL && num_sids > 0)
+    {
+        qsort(sids, num_sids, sizeof(SegmentId), compare_sids_desc);
+    }
+    Assert(sids[0] <= max_memtable_sid);
+    SegmentId max_memtable_sid = sids[0] == status_growing_sid ? status_growing_sid : status_growing_sid - 1;
+
     // Load all flushed segments from disk via vector index worker
     index_load_blocking(index_relid, slot_idx);
 
     LSMIndex lsm = &SharedLSMIndexBuffer->slots[slot_idx].lsmIndex;
-    
+
     // Read LSM index metadata from disk
     IndexType index_type;
     uint32_t dim, elem_size;
     if (!read_lsm_index_metadata(index_relid, &index_type, &dim, &elem_size))
     {
         elog(ERROR, "[load_lsm_index] Failed to read LSM index metadata for index %u", index_relid);
+        Assert(false);
     }
-
     // Initialize LSM index structure
     lsm->indexRelId = index_relid;
     lsm->index_type = index_type;
@@ -340,19 +476,243 @@ load_lsm_index(Oid index_relid, uint32_t slot_idx)
     // Scan segment metadata files to get all segments
     SegmentFileInfo files[MAX_SEGMENTS_COUNT];
     int file_count = scan_segment_metadata_files(index_relid, files, MAX_SEGMENTS_COUNT);
-    
-    // Find the maximum end_sid from scanned segments
-    SegmentId max_end_sid = START_SEGMENT_ID;
-    for (int i = 0; i < file_count; i++)
+
+    // Recovery
+    // For segments that include sids > max_memtable_sid, mark those vectors as deleted
+    for (int i = file_count - 1; i >= 0; i--)
     {
-        if (files[i].end_sid > max_end_sid)
+        // Check if this segment includes any sids greater than max_memtable_sid
+        if (files[i].end_sid > max_memtable_sid)
         {
-            max_end_sid = files[i].end_sid;
+            SegmentId start_sid_disk, end_sid_disk;
+            uint32_t valid_rows;
+            IndexType seg_index_type;
+            
+            // Read segment metadata to get actual sid range and valid_rows
+            if (read_lsm_segment_metadata(index_relid, files[i].start_sid, files[i].end_sid, files[i].version,
+                                         &start_sid_disk, &end_sid_disk, &valid_rows, &seg_index_type))
+            {
+                // Only process if the segment actually has sids > max_memtable_sid
+                if (end_sid_disk > max_memtable_sid)
+                {
+                    // Load bitmap file (use latest version)
+                    uint8_t *bitmap = NULL;
+                    uint32_t delete_count;
+                    load_bitmap_file(index_relid, start_sid_disk, end_sid_disk, LOAD_LATEST_VERSION, &bitmap, true, &delete_count);
+                    Assert(bitmap != NULL); 
+                    
+                    // Load offset file to map sids to vector indices (use latest version)
+                    SegmentOffsetRange *offsets = NULL;
+                    load_offset_file(index_relid, start_sid_disk, end_sid_disk, LOAD_LATEST_VERSION, &offsets, true);
+                    Assert(offsets != NULL);
+                    
+                    // Iterate through all offset ranges and mark vectors with sid > max_memtable_sid
+                    uint32_t segment_count = end_sid_disk - start_sid_disk + 1;
+                    for (uint32_t sid_idx = 0; sid_idx < segment_count; sid_idx++)
+                    {
+                        SegmentOffsetRange *offset_range = &offsets[sid_idx];
+                        
+                        // Only process entries where sid > max_memtable_sid
+                        if (offset_range->sid <= max_memtable_sid)
+                            continue;
+                        
+                        // Skip empty ranges (no vectors for this sid)
+                        if (offset_range->start_offset == offset_range->end_offset)
+                            continue;
+                        
+                        // Set all bits in the range [start_offset, end_offset) to 1
+                        for (Size vec_idx = offset_range->start_offset; vec_idx < offset_range->end_offset; vec_idx++)
+                        {
+                            if (vec_idx < valid_rows && !IS_SLOT_SET(bitmap, vec_idx))
+                            {
+                                SET_SLOT(bitmap, vec_idx);
+                                delete_count++;
+                            }
+                        }
+                    }
+                    
+                    // Find latest version and subversion for writing new bitmap
+                    uint32_t version = find_latest_segment_version(index_relid, start_sid_disk, end_sid_disk);
+                    uint32_t latest_subversion = find_latest_bitmap_subversion(index_relid, start_sid_disk, end_sid_disk, version);
+                    uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
+                    
+                    // Write updated bitmap with new subversion
+                    Size bitmap_size = GET_BITMAP_SIZE(valid_rows);
+                    write_bitmap_file_with_subversion(index_relid, start_sid_disk, end_sid_disk, 
+                                                      version, next_subversion, bitmap, bitmap_size, delete_count);
+                    
+                    // FIXME: can be done in parallel
+                    // Notify index worker to update with SEGMENT_UPDATE_VACUUM
+                    segment_update_blocking(slot_idx, index_relid, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
+                    
+                    elog(DEBUG1, "[load_lsm_index] Vacuumed segment %u-%u v%u: marked all sids > %u as deleted, new delete_count=%u", 
+                         start_sid_disk, end_sid_disk, version, max_memtable_sid, delete_count);
+                    
+                    // Clean up
+                    pfree(bitmap);
+                    pfree(offsets);
+                }
+            }
+        }
+        else {
+            break;
         }
     }
-    
-    // Set next_segment_id to max_end_sid + 1
-    pg_atomic_write_u32(&lsm->next_segment_id, max_end_sid + 1);
+
+    // Recovery step 2: For segments that include sid in sids array, mark vectors as deleted if the corresponding tids are not in the status page
+    if (sids != NULL && num_sids > 0 && file_count > 0 && files[file_count - 1].end_sid >= sids[num_sids - 1])
+    {
+        int f_idx = file_count - 1;
+        int s_idx = 0;
+        
+        while (f_idx >= 0 && s_idx < num_sids)
+        {
+            // skip the sid if it is greater than the end_sid of the largest segment
+            if (sids[s_idx] > files[f_idx].end_sid)
+            {
+                s_idx++;
+                continue;
+            }
+            // check whether the segment contains any sid in sids array
+            if (files[f_idx].start_sid <= sids[s_idx] && files[f_idx].end_sid >= sids[s_idx])
+            {
+                SegmentId start_sid_disk, end_sid_disk;
+                uint32_t valid_rows;
+                IndexType seg_index_type;
+                
+                // Read segment metadata to get actual sid range and valid_rows
+                if (read_lsm_segment_metadata(index_relid, files[f_idx].start_sid, files[f_idx].end_sid, files[f_idx].version,
+                                             &start_sid_disk, &end_sid_disk, &valid_rows, &seg_index_type))
+                {
+                    // load the mapping file, bitmap file and offset file
+                    int64_t *mapping = NULL;
+                    load_mapping_file(index_relid, start_sid_disk, end_sid_disk, LOAD_LATEST_VERSION, &mapping, true);
+                    Assert(mapping != NULL);
+                    
+                    uint8_t *bitmap = NULL;
+                    uint32_t delete_count;
+                    load_bitmap_file(index_relid, start_sid_disk, end_sid_disk, LOAD_LATEST_VERSION, &bitmap, true, &delete_count);
+                    Assert(bitmap != NULL);
+                    
+                    SegmentOffsetRange *offsets = NULL;
+                    load_offset_file(index_relid, start_sid_disk, end_sid_disk, LOAD_LATEST_VERSION, &offsets, true);
+                    Assert(offsets != NULL);
+                    
+                    bool bitmap_changed = false;
+                    uint32_t segment_count = end_sid_disk - start_sid_disk + 1;
+                    
+                    // find all sids that are in sids array
+                    for (uint32_t sid_idx = 0; sid_idx < segment_count; sid_idx++)
+                    {
+                        SegmentOffsetRange *offset_range = &offsets[sid_idx];
+                        SegmentId current_sid = offset_range->sid;
+                        
+                        // Check if this sid is in the sids array
+                        bool sid_in_array = false;
+                        for (int check_s_idx = s_idx; check_s_idx < num_sids; check_s_idx++)
+                        {
+                            if (sids[check_s_idx] == current_sid)
+                            {
+                                sid_in_array = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!sid_in_array)
+                            continue;
+                        
+                        // Skip empty ranges (no vectors for this sid)
+                        if (offset_range->start_offset == offset_range->end_offset)
+                            continue;
+                        
+                        // For each sid, Call GetStatusMemtableTids to get the tids in the status page
+                        int num_status_tids = 0;
+                        ItemPointerData *status_tids = GetStatusMemtableTids(index, MAIN_FORKNUM, current_sid, &num_status_tids);
+                        Assert(status_tids != NULL && num_status_tids > 0);
+
+                        // FIXME: this part can be optimized
+                        // Convert status tids to int64 and sort for efficient lookup
+                        int64_t *status_tids_int64 = (int64_t *) palloc(sizeof(int64_t) * num_status_tids);
+                        for (int t_idx = 0; t_idx < num_status_tids; t_idx++)
+                        {
+                            status_tids_int64[t_idx] = ItemPointerToInt64(&status_tids[t_idx]);
+                        }
+                        
+                        // Sort for binary search (tids are approximately in order, but sorting ensures correctness)
+                        qsort(status_tids_int64, num_status_tids, sizeof(int64_t), compare_int64);
+                        
+                        // Generate new bitmap for this sid's range
+                        Size range_start = offset_range->start_offset;
+                        Size range_end = offset_range->end_offset;
+                        
+                        if (range_start < range_end)
+                        {
+                            // Generate bitmap: set bit to 1 if tid is NOT in status_tids
+                            // Use binary search for efficient lookup (O(log n) per lookup)
+                            // Since tids are approximately in order, binary search is efficient
+                            uint32_t additional_deleted = 0;
+                            
+                            for (Size vec_idx = range_start; vec_idx < range_end; vec_idx++)
+                            {
+                                int64_t vec_tid = mapping[vec_idx];
+                                
+                                // Binary search to check if tid is in status_tids
+                                int64_t *found = (int64_t *) bsearch(&vec_tid, status_tids_int64, num_status_tids, 
+                                                                        sizeof(int64_t), compare_int64);
+                                
+                                // If tid not found in status page, mark as deleted
+                                if (found == NULL)
+                                {
+                                    // Check if bit was already set (preserve existing deletions)
+                                    if (!IS_SLOT_SET(bitmap, vec_idx))
+                                    {
+                                        SET_SLOT(bitmap, vec_idx);
+                                        additional_deleted++;
+                                    }
+                                }
+                            }
+                            
+                            delete_count += additional_deleted;
+                            if (additional_deleted > 0)
+                                bitmap_changed = true;
+                        }
+                        
+                        pfree(status_tids_int64);
+                        
+                        if (status_tids != NULL)
+                        {
+                            pfree(status_tids);
+                        }
+                    }
+                    
+                    // Flush the modified bitmap to disk
+                    if (bitmap_changed)
+                    {
+                        uint32_t version = find_latest_segment_version(index_relid, start_sid_disk, end_sid_disk);
+                        uint32_t latest_subversion = find_latest_bitmap_subversion(index_relid, start_sid_disk, end_sid_disk, version);
+                        uint32_t next_subversion = (latest_subversion == UINT32_MAX) ? 0 : latest_subversion + 1;
+                        
+                        Size bitmap_size = GET_BITMAP_SIZE(valid_rows);
+                        write_bitmap_file_with_subversion(index_relid, start_sid_disk, end_sid_disk, 
+                                                          version, next_subversion, bitmap, bitmap_size, delete_count);
+                        
+                        // Notify index worker to update the segment with SEGMENT_UPDATE_VACUUM
+                        segment_update_blocking(slot_idx, index_relid, SEGMENT_UPDATE_VACUUM, start_sid_disk, end_sid_disk);
+                        
+                        elog(DEBUG1, "[load_lsm_index] Vacuumed segment %u-%u v%u: marked vectors with missing tids as deleted, new delete_count=%u", 
+                             start_sid_disk, end_sid_disk, version, delete_count);
+                    }
+                    
+                    // Clean up
+                    pfree(mapping);
+                    pfree(bitmap);
+                    pfree(offsets);
+                }
+            }
+
+            f_idx--;
+        }
+    }
     
     // Update SharedSegmentArray with segments from disk
     if (merge_worker_manager != NULL)
@@ -362,7 +722,7 @@ load_lsm_index(Oid index_relid, uint32_t slot_idx)
         // Initialize the segment array for this index
         LWLockAcquire(seg_array->lock, LW_EXCLUSIVE);
         seg_array->current_index_relid = index_relid;
-        seg_array->max_end_segment_id = max_end_sid;
+        // seg_array->max_end_segment_id = max_end_sid;
         LWLockRelease(seg_array->lock);
         
         // Add each segment to the array
@@ -391,68 +751,269 @@ load_lsm_index(Oid index_relid, uint32_t slot_idx)
         }
     }
 
-    // Initialize memtables
+    // Initialize sealed memtable array
     for (int i = 0; i < MEMTABLE_NUM; i++)
     {
         lsm->memtable_idxs[i] = -1;
     }
     lsm->memtable_count = 0;
+    // Initialize and update the flushed_not_released array
     pg_atomic_init_u32(&lsm->flushed_not_released_count, 0);
     pg_atomic_init_u32(&lsm->releasing_in_progress, 0);
+    for (int sid_idx = num_sids - 1; sid_idx >= 0; sid_idx--)
+    {
+        if (sids[sid_idx] <= files[file_count - 1].end_sid)
+        {
+            uint32_t count = pg_atomic_read_u32(&lsm->flushed_not_released_count);
+            lsm->flushed_not_released[count] = sids[sid_idx];
+            pg_atomic_write_u32(&lsm->flushed_not_released_count, count + 1);
+        }        
+        else {
+            break;
+        }
+    }
+
+    // prepare the heap relation
+    Oid heap_relid = index->rd_index->indrelid;
+    AttrNumber attnum = index->rd_index->indkey.values[0];
+    Relation heap_rel = table_open(heap_relid, AccessShareLock);
+    TupleTableSlot *heap_slot = table_slot_create(heap_rel, NULL);
+
+    bool growing_memtable_allocated = false;
+    // Recovery step 3: construct the memtables
+    for (int i = num_sids - 1; i >= 0; i--)
+    {
+        // those sids are already flushed to disk as segments
+        if (sids[i] <= files[file_count - 1].end_sid)
+        {
+            continue;
+        }
+
+        // read status pages to get the tids
+        int num_status_tids = 0;
+        ItemPointerData *status_tids = GetStatusMemtableTids(index, MAIN_FORKNUM, sids[i], &num_status_tids);
+
+        ConcurrentMemTable current_mt;
+        int mt_idx;
+        // allocate a new growing memtable
+        mt_idx = allocate_new_growing_memtable(lsm, index, true, sids[i]);
+        current_mt = MT_FROM_SLOTIDX(mt_idx);
+
+        // iterate the tids to construct the memtable
+        for (int t_idx = 0; t_idx < num_status_tids; t_idx++)
+        {            
+            if (table_tuple_fetch_row_version(heap_rel, &status_tids[t_idx], SnapshotAny, heap_slot)) {
+                
+                uint32_t i = pg_atomic_fetch_add_u32(&current_mt->current_size, 1);
+                current_mt->tids[i] = ItemPointerToInt64(&status_tids[t_idx]);
+
+                // extract the vector attribute
+                bool isnull;
+                Datum vector_datum = slot_getattr(heap_slot, attnum, &isnull);
+                if (isnull)
+                    elog(ERROR, "failed to fetch the vector data in the LSM index recovery phase");
+
+                Vector *vec = (Vector *) PG_DETOAST_DATUM_COPY(vector_datum);
+                
+                memcpy(VEC_PTR_AT(current_mt, i), vec->x, VEC_BYTES_PER_ROW(current_mt));
+
+                pfree(vec);
+
+                publish_slot_release(current_mt, i);
+            }
+            else {
+                elog(DEBUG1, "[load_lsm_index] failed to fetch the vector data in the LSM index recovery phase, potential table pruning detected");
+            }
+        }
+
+        if (sids[i] == status_growing_sid) { // the current sid is the growing memtable
+            lsm->growing_memtable_idx = mt_idx;
+            lsm->growing_memtable_id = MT_FROM_SLOTIDX(mt_idx)->memtable_id;
+            // update the next_segment_id
+            pg_atomic_write_u32(&lsm->next_segment_id, lsm->growing_memtable_id + 1);
+            growing_memtable_allocated = true;
+        }
+        else {
+            // seal the memtable
+            pg_atomic_write_u32(&current_mt->sealed, 1);
+            // enqueue the sealed memtable
+            if (lsm->memtable_count < MEMTABLE_NUM)
+            {
+                lsm->memtable_idxs[lsm->memtable_count++] = mt_idx;
+            }
+            else {
+                elog(ERROR, "[load_lsm_index] no free slot to register a new memtable");
+            }
+        }
+    }
+
+    if (!growing_memtable_allocated) {
+        // update the next_segment_id
+        pg_atomic_write_u32(&lsm->next_segment_id, sids[0] + 1);
+        // we should not allocate a new growing memtable here, it will be allocated in the insert path (within a transaction)
+    }
     
-    // Allocate a new growing memtable
-    int mt_idx = allocate_new_growing_memtable(lsm);
-    lsm->growing_memtable_idx = mt_idx;
-    lsm->growing_memtable_id = MT_FROM_SLOTIDX(mt_idx)->memtable_id;
+    pg_write_barrier();
+
+    // test the consistency of the LSM index
+    bool consistency_ok = test_consistency(heap_rel, lsm, slot_idx);
+    if (!consistency_ok) {
+        elog(ERROR, "[load_lsm_index] consistency check failed for LSM index %u", index_relid);
+        Assert(false);
+    }
+
+    table_close(heap_rel, AccessShareLock);
+    // Mark as fully loaded (valid = 1) - use write barrier to ensure all writes are visible
+    pg_atomic_write_u32(&slot->valid, 1);
     
     elog(DEBUG1, "[load_lsm_index] successfully loaded LSM index %u", index_relid);
 }
 
+// This is called by the index worker to get the index slot number
 int
-get_lsm_index_idx(Oid index_relid)
-{    
-    // check if it's already in the buffer
-    for (int i = 0; i < INDEX_BUF_SIZE; i++)
-    {
-        if (pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[i].valid) && SharedLSMIndexBuffer->slots[i].lsmIndex.indexRelId == index_relid)
-        {
-            return i;
-        }
-    }
-    
-    elog(DEBUG1, "[get_lsm_index_idx] the requested lsm_index is not in the buffer");
-    // find an empty slot
-    int slot_num = register_lsm_index();
-    if (slot_num == -1)
-    {
-        elog(ERROR, "[get_lsm_index_idx] no free slot to register a new lsm index");
-        return NULL;
-    }
-    load_lsm_index(index_relid, slot_num);
-    return slot_num;
-}
-
-LSMIndex
-get_lsm_index(Oid index_relid)
+get_lsm_index_idx_no_loading(Oid index_relid)
 {
     // check if it's already in the buffer
     for (int i = 0; i < INDEX_BUF_SIZE; i++)
     {
-        if (pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[i].valid) && SharedLSMIndexBuffer->slots[i].lsmIndex.indexRelId == index_relid)
+        uint32 valid = pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[i].valid);
+        if (valid > 0 && SharedLSMIndexBuffer->slots[i].lsmIndex.indexRelId == index_relid)
         {
-            return &SharedLSMIndexBuffer->slots[i].lsmIndex;
+            // If loading (valid == 2), wait for it to complete
+            if (valid == 2)
+            {
+                LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[i];
+                while (pg_atomic_read_u32(&slot->valid) == 2)
+                {
+                    pg_usleep(1000);  // Sleep 1ms
+                }
+                // Verify it's now loaded
+                if (pg_atomic_read_u32(&slot->valid) == 1 && 
+                    slot->lsmIndex.indexRelId == index_relid)
+                {
+                    return i;
+                }
+            }
+            else if (valid == 1)
+            {
+                return i;
+            }
+        }
+    }
+    
+    elog(DEBUG1, "[get_lsm_index_idx] the requested lsm_index is not in the buffer");
+    return -1;
+}
+
+// This is called by the index worker to get the index slot number
+int
+get_lsm_index_idx(Relation index)
+{
+    // check if it's already in the buffer
+    for (int i = 0; i < INDEX_BUF_SIZE; i++)
+    {
+        uint32 valid = pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[i].valid);
+        if (valid > 0 && SharedLSMIndexBuffer->slots[i].lsmIndex.indexRelId == index->rd_id)
+        {
+            // If loading (valid == 2), wait for it to complete
+            if (valid == 2)
+            {
+                LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[i];
+                while (pg_atomic_read_u32(&slot->valid) == 2)
+                {
+                    pg_usleep(1000);  // Sleep 1ms
+                }
+                // Verify it's now loaded
+                if (pg_atomic_read_u32(&slot->valid) == 1 && 
+                    slot->lsmIndex.indexRelId == index->rd_id)
+                {
+                    return i;
+                }
+            }
+            else if (valid == 1)
+            {
+                return i;
+            }
+        }
+    }
+    
+    elog(DEBUG1, "[get_lsm_index_idx] the requested lsm_index is not in the buffer");
+    // find an empty slot and register
+    int slot_num = register_lsm_index(index->rd_id);
+    if (slot_num == -1)
+    {
+        elog(ERROR, "[get_lsm_index_idx] no free slot to register a new lsm index");
+        return -1;
+    }
+    
+    // Check if the index is already loaded (another process may have finished loading)
+    LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[slot_num];
+    uint32 valid = pg_atomic_read_u32(&slot->valid);
+    if (valid == 1 && slot->lsmIndex.indexRelId == index->rd_id && slot->lsmIndex.dim > 0)
+    {
+        // Index is already fully loaded, no need to call load_lsm_index
+        elog(DEBUG1, "[get_lsm_index_idx] index %u already loaded in slot %u", index->rd_id, slot_num);
+        return slot_num;
+    }
+    
+    // Index is registered but not yet loaded, proceed with loading
+    load_lsm_index(index, slot_num);
+    return slot_num;
+}
+
+LSMIndex
+get_lsm_index(Relation index)
+{
+    Oid index_relid = RelationGetRelid(index);
+    // check if it's already in the buffer
+    for (int i = 0; i < INDEX_BUF_SIZE; i++)
+    {
+        uint32 valid = pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[i].valid);
+        if (valid > 0 && SharedLSMIndexBuffer->slots[i].lsmIndex.indexRelId == index_relid)
+        {
+            // If loading (valid == 2), wait for it to complete
+            if (valid == 2)
+            {
+                LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[i];
+                while (pg_atomic_read_u32(&slot->valid) == 2)
+                {
+                    pg_usleep(1000);  // Sleep 1ms
+                }
+                // Verify it's now loaded
+                if (pg_atomic_read_u32(&slot->valid) == 1 && 
+                    slot->lsmIndex.indexRelId == index_relid)
+                {
+                    return &slot->lsmIndex;
+                }
+            }
+            else if (valid == 1)
+            {
+                return &SharedLSMIndexBuffer->slots[i].lsmIndex;
+            }
         }
     }
     
     elog(DEBUG1, "[get_lsm_index] the requested lsm_index is not in the buffer");
-    // find an empty slot
-    int slot_num = register_lsm_index();
+    // find an empty slot and register
+    int slot_num = register_lsm_index(index_relid);
     if (slot_num == -1)
     {
         elog(ERROR, "[get_lsm_index] no free slot to register a new lsm index");
         return NULL;
     }
-    load_lsm_index(index_relid, slot_num);
+    
+    // Check if the index is already loaded (another process may have finished loading)
+    LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[slot_num];
+    uint32 valid = pg_atomic_read_u32(&slot->valid);
+    if (valid == 1 && slot->lsmIndex.indexRelId == index_relid && slot->lsmIndex.dim > 0)
+    {
+        // Index is already fully loaded, no need to call load_lsm_index
+        elog(DEBUG1, "[get_lsm_index] index %u already loaded in slot %u", index_relid, slot_num);
+        return &slot->lsmIndex;
+    }
+    
+    // Index is registered but not yet loaded, proceed with loading
+    load_lsm_index(index, slot_num);
     return &SharedLSMIndexBuffer->slots[slot_num].lsmIndex;
 }
 
@@ -604,7 +1165,7 @@ enqueue_sealed_memtable(LSMIndex lsm, int mt_idx)
 }
 
 static void
-rotate_growing_memtable(LSMIndex lsm)
+rotate_growing_memtable(LSMIndex lsm, Relation index, bool need_enqueue)
 {
     int cur_idx;
     ConcurrentMemTable cur;
@@ -622,33 +1183,33 @@ rotate_growing_memtable(LSMIndex lsm)
         return;
     }
 
-    if (cur_idx < 0 || cur_idx >= MEMTABLE_BUF_SIZE)
+    if (cur_idx >= MEMTABLE_BUF_SIZE)
     {
         LWLockRelease(lsm->mt_lock);
         elog(ERROR, "[rotate_growing_memtable] invalid growing_memtable_idx = %d", cur_idx);
     }
 
-    cur = MT_FROM_SLOTIDX(cur_idx);
-    cur_id = cur->memtable_id;
-
-    // if not sealed, no need to rotate
-    if (pg_atomic_read_u32(&cur->sealed) == 0)
+    if (need_enqueue)
     {
-        LWLockRelease(lsm->mt_lock);
-        return;
-    }
+        cur = MT_FROM_SLOTIDX(cur_idx);
+        cur_id = cur->memtable_id;
 
+        // if not sealed, no need to rotate
+        if (pg_atomic_read_u32(&cur->sealed) == 0)
+        {
+            LWLockRelease(lsm->mt_lock);
+            return;
+        }
+        lsm->growing_memtable_id  = cur_id;
+    }
     lsm->growing_memtable_idx = MT_IDX_ROTATING;
-    lsm->growing_memtable_id  = cur_id;
 
     LWLockRelease(lsm->mt_lock);
 
-    // wait for publish 
-    // wait can be done in the background
-    // wait_for_publish(cur);
-    enqueue_sealed_memtable(lsm, cur_idx);
+    int new_idx = allocate_new_growing_memtable(lsm, index, false, NULL);
 
-    int new_idx = allocate_new_growing_memtable(lsm);
+    if (need_enqueue)
+        enqueue_sealed_memtable(lsm, cur_idx);
 
     LWLockAcquire(lsm->mt_lock, LW_EXCLUSIVE);
     lsm->growing_memtable_idx = new_idx;
@@ -662,7 +1223,7 @@ rotate_growing_memtable(LSMIndex lsm)
 void 
 insert_lsm_index(Relation index, const void *vector, const int64_t tid)
 {
-    LSMIndex lsm_index = get_lsm_index(index->rd_id);
+    LSMIndex lsm_index = get_lsm_index(index);
 
     // Check for flushed but not released memtables and release them
     // Only one backend should release at a time to avoid duplicate work
@@ -711,8 +1272,15 @@ insert_lsm_index(Relation index, const void *vector, const int64_t tid)
             pg_usleep(50);
             continue;
         }
+
+        if (gidx == MT_IDX_INVALID)
+        {
+            LWLockRelease(lsm_index->mt_lock);
+            rotate_growing_memtable(lsm_index, index, false);
+            continue;
+        }
         
-        if (gidx < 0 || gidx >= MEMTABLE_BUF_SIZE)
+        if (gidx >= MEMTABLE_BUF_SIZE)
         {
             LWLockRelease(lsm_index->mt_lock);
             elog(ERROR, "[insert_lsm_index] invalid growing memtable idx");
@@ -736,7 +1304,7 @@ insert_lsm_index(Relation index, const void *vector, const int64_t tid)
         }
 
         // slow path: current growing memtable is sealed. 
-        rotate_growing_memtable(lsm_index);        
+        rotate_growing_memtable(lsm_index, index, true);        
     }
 }
 
@@ -932,7 +1500,7 @@ search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs)
 {
     // elog(DEBUG1, "enter search_lsm_index, k = %d, nprobe_efs = %d", k, nprobe_efs);
 
-    LSMIndex lsm = get_lsm_index(index->rd_id);
+    LSMIndex lsm = get_lsm_index(index);
     Assert(lsm);
 
     // step 1. get a snapshot of the current memtables
@@ -1019,14 +1587,14 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
         stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
     }
     
-    int lsm_idx = get_lsm_index_idx(index->rd_id);
+    int lsm_idx = get_lsm_index_idx(index);
     if (lsm_idx < 0)
     {
         return stats;
     }
     
-    LSMIndex lsm = &SharedLSMIndexBuffer->slots[lsm_idx].lsmIndex;
     Oid indexRelId = index->rd_id;
+    LSMIndex lsm = &SharedLSMIndexBuffer->slots[lsm_idx].lsmIndex;
     
     // Track memtable IDs that have been vacuumed to avoid duplicates
     SegmentId vacuumed_memtable_ids[MEMTABLE_NUM + 1]; // +1 for growing memtable
@@ -1482,6 +2050,367 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
     return stats;
 }
 
+// Forward declaration for TestConsistencyContext
+typedef struct TestConsistencyContext
+{
+    BlockNumber block_id;
+    OffsetNumber *offset_numbers;
+    int total_count;
+    uint8_t *bitmap; // 1 stands for visible, 0 stands for invisible
+    int valid_count;
+    uint8_t *visit_map;
+    int visit_count;
+    int visit_valid_count;
+} TestConsistencyContext;
+
+// Helper function to check if a TID exists in the heap and mark it as visited
+static bool
+check_and_mark_tid(ItemPointerData tid, TestConsistencyContext *ctx)
+{
+    BlockNumber blkno = BlockIdGetBlockNumber(&tid.ip_blkid);
+    OffsetNumber offno = tid.ip_posid;
+
+    // Find the offset in the context using binary search (offset_numbers is in ascending order)
+    int idx = -1;
+    int left = 0;
+    int right = ctx->total_count - 1;
+    
+    while (left <= right)
+    {
+        int mid = left + (right - left) / 2;
+        OffsetNumber mid_offno = ctx->offset_numbers[mid];
+        
+        if (mid_offno == offno)
+        {
+            idx = mid;
+            break;
+        }
+        else if (mid_offno < offno)
+        {
+            left = mid + 1;
+        }
+        else
+        {
+            right = mid - 1;
+        }
+    }
+    
+    if (idx < 0)
+    {
+        elog(DEBUG1, "[test_consistency] TID (%u,%u) offset %u not found in block %u", 
+             blkno, offno, offno, blkno);
+        return false;
+    }
+    
+    // Mark as visited
+    if (!IS_SLOT_SET(ctx->visit_map, idx))
+    {
+        SET_SLOT(ctx->visit_map, idx);
+        ctx->visit_count++;
+        
+        // If this TID is visible in the heap, increment visit_valid_count
+        if (IS_SLOT_SET(ctx->bitmap, idx))
+        {
+            ctx->visit_valid_count++;
+        }
+    }
+    
+    return true;
+}
+
+static bool
+test_consistency(Relation heap_rel, LSMIndex lsm_index, int lsm_slot_idx)
+{
+    elog(DEBUG1, "[test_consistency] testing consistency of the LSM index %u", lsm_index->indexRelId);
+
+    // get the curren snapshot 
+    Snapshot snapshot = GetActiveSnapshot();
+    // initialize the heap scan
+    BufferAccessStrategy bas = GetAccessStrategy(BAS_BULKREAD);
+    BlockNumber nblocks = RelationGetNumberOfBlocks(heap_rel);
+    TestConsistencyContext *context = (TestConsistencyContext *) palloc(sizeof(TestConsistencyContext) * nblocks);
+    for (int i = 0; i < nblocks; i++)
+    {
+        context[i].block_id = InvalidBlockNumber;
+        context[i].offset_numbers = NULL;
+        context[i].total_count = 0;
+        context[i].bitmap = NULL;
+        context[i].valid_count = 0;
+        context[i].visit_map = NULL;
+        context[i].visit_count = 0;
+        context[i].visit_valid_count = 0;
+    }
+
+    for (BlockNumber blkno = 0; blkno < nblocks; blkno++)
+    {
+        Buffer buf = ReadBufferExtended(heap_rel, MAIN_FORKNUM, blkno,
+            RBM_NORMAL, bas);
+
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+        Page page = BufferGetPage(buf);
+
+        if (!PageIsNew(page) && !PageIsEmpty(page))
+        {
+            OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+            context[blkno].block_id = blkno;
+            context[blkno].offset_numbers = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxoff);
+            context[blkno].bitmap = (uint8_t *) palloc(GET_BITMAP_SIZE(maxoff));
+            context[blkno].visit_map = (uint8_t *) palloc(GET_BITMAP_SIZE(maxoff));
+            // set all the slots in the bitmap and visit_map to 0
+            memset(context[blkno].bitmap, 0, GET_BITMAP_SIZE(maxoff));
+            memset(context[blkno].visit_map, 0, GET_BITMAP_SIZE(maxoff));
+
+            for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+            {
+                ItemId itemId = PageGetItemId(page, off);
+                int idx = context[blkno].total_count;
+                context[blkno].offset_numbers[context[blkno].total_count++] = off;
+
+                if (ItemIdIsNormal(itemId))
+                {
+                    HeapTupleData tuple;
+
+                    tuple.t_len = ItemIdGetLength(itemId);
+                    ItemPointerSet(&tuple.t_self, blkno, off);
+                    tuple.t_tableOid = RelationGetRelid(heap_rel);
+                    tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemId);
+
+                    bool visible = HeapTupleSatisfiesVisibility(&tuple, snapshot, buf);
+                    if (visible)
+                    {
+                        SET_SLOT(context[blkno].bitmap, idx);
+                        context[blkno].valid_count++;
+                    }
+                    else
+                        CLEAR_SLOT(context[blkno].bitmap, idx);
+                }
+                else {
+                    if (ItemIdIsRedirected(itemId))
+                        elog(DEBUG1, "[test_consistency] redirected item id");
+
+                    if (ItemIdIsDead(itemId))
+                        elog(DEBUG1, "[test_consistency] dead item id");
+
+                    if (!ItemIdIsUsed(itemId))
+                        elog(DEBUG1, "[test_consistency] unused item id, table pruning detected");
+                    CLEAR_SLOT(context[blkno].bitmap, idx);
+                }
+            }
+        }
+        UnlockReleaseBuffer(buf);
+    }
+
+    // Visibility check 1: all existing tid in the lsm index should be in the heap
+    // iterate over all lsm index segments, load the bitmap and mapping file, check if the tids are in the heap 
+    // iterate over all sealed memtables and the growing memtable, check if the tids are in the heap 
+    
+    bool consistency_ok = true;
+    Oid index_relid = lsm_index->indexRelId;
+    
+    // Step 1: Iterate over all flushed segments using SharedSegmentArray
+    if (merge_worker_manager != NULL)
+    {
+        SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_slot_idx];
+        
+        // Iterate through the linked list of segments (head_idx is always 0)
+        uint32_t cur_idx = 0;  // head_idx is always 0
+        while (cur_idx != (uint32_t)-1 && cur_idx < MAX_SEGMENTS_COUNT)
+        {
+            MergeSegmentInfo *segment = &seg_array->segments[cur_idx];
+
+            // Capture next_idx before potentially releasing lock
+            uint32_t next_idx = segment->next_idx;
+            
+            if (segment->in_used)
+            {
+                SegmentId start_sid = segment->start_sid;
+                SegmentId end_sid = segment->end_sid;
+                uint32_t vec_count = segment->vec_count;
+                
+                // Load bitmap and mapping files from disk
+                uint8_t *bitmap_ptr = NULL;
+                int64_t *mapping_ptr = NULL;
+                uint32_t delete_count;
+                
+                uint32_t version = find_latest_segment_version(index_relid, start_sid, end_sid);
+                load_bitmap_file(index_relid, start_sid, end_sid, version, &bitmap_ptr, true, &delete_count);
+                load_mapping_file(index_relid, start_sid, end_sid, version, &mapping_ptr, true);
+                
+                if (bitmap_ptr != NULL && mapping_ptr != NULL)
+                {
+                    // Iterate over all vectors in the segment
+                    for (uint32_t i = 0; i < vec_count; i++)
+                    {
+                        // Check if this vector is not deleted (bitmap bit is 0 means not deleted)
+                        if (!IS_SLOT_SET(bitmap_ptr, i))
+                        {
+                            // Get the TID from the mapping
+                            int64_t tid_int64 = mapping_ptr[i];
+                            ItemPointerData tid = Int64ToItemPointer(tid_int64);
+                            
+                            // Check if TID exists in heap and mark as visited
+                            for (int j = 0; j < nblocks; j++)
+                            {
+                                if (context[j].block_id == BlockIdGetBlockNumber(&tid.ip_blkid))
+                                {
+                                    if (!check_and_mark_tid(tid, &context[j]))
+                                        consistency_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                else {
+                    elog(ERROR, "[test_consistency] failed to load bitmap and mapping files for segment %u-%u", start_sid, end_sid);
+                    return false;
+                }
+                
+                // Free the loaded files
+                if (bitmap_ptr != NULL)
+                    pfree(bitmap_ptr);
+                if (mapping_ptr != NULL)
+                    pfree(mapping_ptr);
+                
+            }
+            
+            // Move to next segment in the linked list
+            cur_idx = next_idx;
+        }
+    }
+    else {
+        elog(ERROR, "[test_consistency] merge_worker_manager is NULL");
+        return false;
+    }
+    
+    // Step 2: Iterate over sealed memtables
+    LWLockAcquire(lsm_index->mt_lock, LW_SHARED);
+    uint32_t memtable_count = lsm_index->memtable_count;
+    int32_t *memtable_idxs = lsm_index->memtable_idxs;
+    int32_t growing_memtable_idx = lsm_index->growing_memtable_idx;
+    LWLockRelease(lsm_index->mt_lock);
+
+    // Process sealed memtables
+    for (uint32_t i = 0; i < memtable_count; i++)
+    {
+        int mt_idx = memtable_idxs[i];
+        if (mt_idx < 0 || mt_idx >= MEMTABLE_BUF_SIZE)
+            continue;
+        
+        ConcurrentMemTable mt = MT_FROM_SLOTIDX(mt_idx);
+        
+        // Verify this memtable belongs to this index
+        if (mt->rel != index_relid)
+            continue;
+        
+        uint32_t current_size = pg_atomic_read_u32(&mt->current_size);
+        uint32_t valid_size = (current_size > mt->capacity) ? mt->capacity : current_size;
+        
+        // Iterate over all slots in the sealed memtable
+        for (uint32_t j = 0; j < valid_size; j++)
+        {
+            // Check if slot is not deleted (bitmap bit is 0 means not deleted)
+            if (!IS_SLOT_SET(mt->bitmap, j))
+            {
+                int64_t tid_int64 = mt->tids[j];
+                ItemPointerData tid = Int64ToItemPointer(tid_int64);
+                
+                // Check if TID exists in heap and mark as visited
+                for (int j = 0; j < nblocks; j++)
+                {
+                    if (context[j].block_id == BlockIdGetBlockNumber(&tid.ip_blkid))
+                    {
+                        if (!check_and_mark_tid(tid, &context[j]))
+                            consistency_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3: Iterate over growing memtable
+    if (growing_memtable_idx >= 0 && growing_memtable_idx != MT_IDX_INVALID && growing_memtable_idx != MT_IDX_ROTATING)
+    {
+        ConcurrentMemTable mt = MT_FROM_SLOTIDX(growing_memtable_idx);
+        
+        // Verify this memtable belongs to this index
+        if (mt->rel == index_relid)
+        {
+            uint32_t current_size = pg_atomic_read_u32(&mt->current_size);
+            uint32_t valid_size = (current_size > mt->capacity) ? mt->capacity : current_size;
+            
+            // Iterate over ready slots in the growing memtable
+            for (uint32_t j = 0; j < valid_size; j++)
+            {
+                // For growing memtable, check ready flag
+                if (!IS_SLOT_SET(mt->bitmap, j))
+                {
+                    int64_t tid_int64 = mt->tids[j];
+                    ItemPointerData tid = Int64ToItemPointer(tid_int64);
+                    
+                    // Check if TID exists in heap and mark as visited
+                    for (int j = 0; j < nblocks; j++)
+                    {
+                        if (context[j].block_id == BlockIdGetBlockNumber(&tid.ip_blkid))
+                        {
+                            if (!check_and_mark_tid(tid, &context[j]))
+                                consistency_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Visibility check 2: all visible tid in the heap should be existing in the lsm index     
+    for (BlockNumber blkno = 0; blkno < nblocks; blkno++)
+    {
+        TestConsistencyContext *ctx = &context[blkno];
+        
+        if (ctx->block_id == InvalidBlockNumber || ctx->offset_numbers == NULL)
+            continue;
+        
+        // Check if all visible TIDs in this block are visited
+        if (ctx->valid_count > 0)
+        {
+            // valid_count is the number of visible TIDs in the heap
+            // visit_valid_count is the number of visible TIDs that were visited (exist in LSM index)
+            if (ctx->valid_count != ctx->visit_valid_count)
+            {
+                consistency_ok = false;
+                
+                // Output missing TIDs
+                for (int i = 0; i < ctx->total_count; i++)
+                {
+                    // Check if this TID is visible but not visited
+                    if (IS_SLOT_SET(ctx->bitmap, i) && !IS_SLOT_SET(ctx->visit_map, i))
+                    {
+                        OffsetNumber offno = ctx->offset_numbers[i];
+                        ItemPointerData tid;
+                        BlockIdSet(&tid.ip_blkid, blkno);
+                        tid.ip_posid = offno;
+                        
+                        elog(WARNING, "[test_consistency] Missing TID in LSM index: (%u,%u)", 
+                             blkno, offno);
+                    }
+                }
+            }
+        }
+    }
+        
+    if (!consistency_ok)
+    {
+        elog(ERROR, "[test_consistency] Consistency check failed: some visible TIDs in heap are missing in LSM index");
+    }
+    else {
+        elog(DEBUG1, "[test_consistency] Consistency check passed");
+    }
+    
+    return consistency_ok;
+}
 
 // -------------------------------- for debugging ----------------------------------
 // static void*

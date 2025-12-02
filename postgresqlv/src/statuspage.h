@@ -17,6 +17,8 @@ typedef struct StatusPageMetaData
 {
     BlockNumber freePageHead;
     BlockNumber freePageTail;
+    
+    SegmentId max_memtable_sid;
     // BlockNumber MemtableArray;
 } StatusPageMetaData;
 typedef StatusPageMetaData* StatusPageMeta;
@@ -60,5 +62,8 @@ void InitializeStatusMemtableArray(Relation index, ForkNumber forkNum);
 void RegisterStatusMemtable(Relation index, SegmentId sid);
 void ReleaseStatusMemtable(Relation index, SegmentId sid);
 void AddToStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid, ItemPointerData tid);
+SegmentId GetStatusGrowingSid(Relation index, ForkNumber forkNum);
+SegmentId* GetStatusMemtableSids(Relation index, ForkNumber forkNum, int *num_sids);
+ItemPointerData* GetStatusMemtableTids(Relation index, ForkNumber forkNum, SegmentId sid, int *num_tids);
 
 #endif

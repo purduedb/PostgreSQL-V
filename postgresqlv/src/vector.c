@@ -95,6 +95,15 @@ _PG_init(void)
 	// Need MEMTABLE_BUF_SIZE locks (one per memtable slot)
 	RequestNamedLWLockTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE, MEMTABLE_BUF_SIZE);
 	LWLockRegisterTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE_ID, LSM_MEMTABLE_VACUUM_LWTRANCHE);
+	
+	// reserve LWLock tranche for flushed release locks
+	// Need INDEX_BUF_SIZE locks (one per index slot)
+	RequestNamedLWLockTranche(LSM_FLUSHED_RELEASE_LWTRANCHE, INDEX_BUF_SIZE);
+	LWLockRegisterTranche(LSM_FLUSHED_RELEASE_LWTRANCHE_ID, LSM_FLUSHED_RELEASE_LWTRANCHE);
+	
+	// reserve LWLock tranche for LSM index buffer lock
+	RequestNamedLWLockTranche(LSM_INDEX_BUFFER_LWTRANCHE, 1);
+	LWLockRegisterTranche(LSM_INDEX_BUFFER_LWTRANCHE_ID, LSM_INDEX_BUFFER_LWTRANCHE);
 
 	// TODO: reserve shared memory for lsm index
 

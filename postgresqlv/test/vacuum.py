@@ -436,9 +436,9 @@ def main():
         print("STEP 5: Run VACUUM")
         vacuum_table(conn, args.tablename)
         
-        # # Wait 10 seconds after vacuum before running queries
-        # print("Waiting 10 seconds after vacuum before running queries...")
-        # time.sleep(10)
+        # Wait 10 seconds after vacuum before running queries
+        print("Waiting 10 seconds after vacuum before running queries...")
+        time.sleep(10)
 
         # Step 6: Conduct similarity search and verify correctness
         print("STEP 6: Similarity Search and Verification")

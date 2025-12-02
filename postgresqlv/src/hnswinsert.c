@@ -32,7 +32,6 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 
 	// insert the vector into the HNSW index
 	insert_lsm_index(index, vector->x, ItemPointerToInt64(heaptid));
-	// TODO: update status page
 
 }
 

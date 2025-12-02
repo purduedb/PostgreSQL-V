@@ -45,6 +45,8 @@ typedef enum IndexType
 #define LSM_MEMTABLE_VACUUM_LWTRANCHE_ID 1005
 #define LSM_FLUSHED_RELEASE_LWTRANCHE "lsm_flushed_release_lock"
 #define LSM_FLUSHED_RELEASE_LWTRANCHE_ID 1006
+#define LSM_INDEX_BUFFER_LWTRANCHE "lsm_index_buffer_lock"
+#define LSM_INDEX_BUFFER_LWTRANCHE_ID 1007
 
 // Sentinel for rotation-in-progress
 #define MT_IDX_INVALID   (-1)
@@ -146,27 +148,37 @@ typedef LSMIndexData * LSMIndex;
 
 typedef struct LSMIndexBufferSlot
 {
-    pg_atomic_uint32 valid;   /* atomic flag */
+    pg_atomic_uint32 valid;   /* atomic flag: 0 = free, 1 = registered/loaded, 2 = loading */
     LSMIndexData lsmIndex;
 }   LSMIndexBufferSlot;
 
 typedef struct LSMIndexBuffer
 {
+    LWLock *lock;  /* Lock to protect index registration and loading */
     LSMIndexBufferSlot slots[INDEX_BUF_SIZE];
 }   LSMIndexBuffer;
 
 extern LSMIndexBuffer *SharedLSMIndexBuffer;
 
 void lsm_index_buffer_shmem_initialize();
-void build_lsm_index(IndexType type, Oid relId, void *vector_index, int64_t *tids, uint32_t dim, uint32_t elem_size, uint64_t count);
+void build_lsm_index(IndexType type, Relation index, void *vector_index, int64_t *tids, uint32_t dim, uint32_t elem_size, uint64_t count);
 void insert_lsm_index(Relation index, const void *vector, const int64_t tid);
-LSMIndex get_lsm_index(Oid index_relid);
-int get_lsm_index_idx(Oid index_relid);
+LSMIndex get_lsm_index(Relation index);
+int get_lsm_index_idx_no_loading(Oid index_relid);
+int get_lsm_index_idx(Relation index);
 TopKTuples search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs);
 IndexBulkDeleteResult *bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state);
 
 // storage
 #define VECTOR_STORAGE_BASE_DIR "/ssd_root/liu4127/pg_vector_extension_indexes/"
+
+// Offset file structure
+typedef struct SegmentOffsetRange
+{
+    SegmentId sid;
+    Size start_offset;
+    Size end_offset;
+} SegmentOffsetRange;
 
 // flushed segment
 typedef struct PrepareFlushMetaData
@@ -183,6 +195,7 @@ typedef struct PrepareFlushMetaData
     uint32_t delete_count;  // Number of deleted vectors in this segment
     void *index_bin;
     IndexType index_type;
+    SegmentOffsetRange *offsets;  // Offset ranges for each SegmentId in the segment
 } PrepareFlushMetaData;
 typedef PrepareFlushMetaData* PrepareFlushMeta;
 
@@ -207,6 +220,11 @@ void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, ui
 void write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size, uint32_t delete_count);
 void write_bitmap_for_memtable(Oid indexRelId, SegmentId memtable_id, uint8_t *bitmap, Size bitmap_size, uint32_t delete_count);
 void load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, int64_t **mapping, bool pg_alloc);
+
+// Offset file functions
+void write_offset_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, const SegmentOffsetRange *offsets);
+void load_offset_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, SegmentOffsetRange **offsets, bool pg_alloc);
+
 #define LOAD_LATEST_VERSION UINT32_MAX
 
 // helper functions (memtable)

@@ -158,11 +158,13 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	{
 		ItemPointerData heaptid_data = Int64ToItemPointer(so->topkTuples.pairs[so->topkTuplesIdx++].id);
 
+		MemoryContextSwitchTo(oldCtx);
 		scan->xs_heaptid = heaptid_data;
 		scan->xs_recheck = false;
 		scan->xs_recheckorderby = false;
 		return true;
 	}
+
 	// TODO: do iterative search if necessary and enable
 	MemoryContextSwitchTo(oldCtx);
 	return false;
@@ -178,8 +180,12 @@ hnswendscan(IndexScanDesc scan)
 
 	MemoryContextDelete(so->tmpCtx);
 
-	// free resources in so if any
-	pfree(so->topkTuples.pairs);
-	pfree(so);
+	// pfree(so->topkTuples.pairs); // already freed by MemoryContextDelete
+
+	// Free the scan opaque structure
+	if (so != NULL)
+	{
+		pfree(so);
+	}
 	scan->opaque = NULL;
 }

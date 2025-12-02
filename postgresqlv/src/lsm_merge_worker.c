@@ -59,7 +59,7 @@ initialize_merge_segment_array(SharedSegmentArray *seg_array)
     seg_array->segment_count = 0;
     seg_array->tail_idx = -1;  // -1 indicates empty list
     seg_array->insert_idx = 0;
-    seg_array->max_end_segment_id = 0;
+    // seg_array->max_end_segment_id = 0;
     pg_atomic_init_u32(&seg_array->flat_count, 0);
     pg_atomic_init_u32(&seg_array->memtable_capacity_le_count, 0);
     pg_atomic_init_u32(&seg_array->small_segment_le_count, 0);
@@ -309,7 +309,11 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     int64_t *old_mapping_ptr = NULL;
     load_mapping_file(index_relid, segment->start_sid, segment->end_sid, version, &old_mapping_ptr, true);
     Assert(old_mapping_ptr != NULL);
-    
+    // load the offsets from disk
+    SegmentOffsetRange *old_offsets_ptr = NULL;
+    load_offset_file(index_relid, segment->start_sid, segment->end_sid, version, &old_offsets_ptr, true);
+    Assert(old_offsets_ptr != NULL);
+
     // Create new index with filtered vectors
     void *new_index_ptr = NULL;
     int new_index_count = 0;
@@ -319,8 +323,7 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     uint32_t dim, elem_size;
     if (!read_lsm_index_metadata(index_relid, &current_index_type, &dim, &elem_size)) {
         elog(ERROR, "rebuild_index: failed to read LSM index metadata for index %u", index_relid);
-        IndexFree(old_index_ptr);
-        pfree(old_bitmap_ptr);
+        Assert(0);
         return;
     }
     
@@ -338,17 +341,14 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     Assert(new_index_ptr != NULL);
     
     // Save original bitmap state for mapping generation (new index was built from this state)
-    Size original_bitmap_size = GET_BITMAP_SIZE(segment->vec_count);
-    uint8_t *original_bitmap_ptr = (uint8_t *) palloc(original_bitmap_size);
-    memcpy(original_bitmap_ptr, old_bitmap_ptr, original_bitmap_size);
+    // Just assign the pointer - no need to copy since load_bitmap_file will allocate new memory
+    uint8_t *original_bitmap_ptr = old_bitmap_ptr;
+    old_bitmap_ptr = NULL;
     
     // Acquire exclusive bitmap lock before reloading bitmap
     LWLockAcquire(&segment->bitmap_lock, LW_EXCLUSIVE);
     
-    // Free old bitmap before reloading
-    pfree(old_bitmap_ptr);
-    
-    // Reload bitmap from disk after acquiring lock
+    // Reload bitmap from disk after acquiring lock (will allocate new memory)
     load_bitmap_file(index_relid, segment->start_sid, segment->end_sid, version, &old_bitmap_ptr, true, &delete_count);
     Assert(old_bitmap_ptr != NULL);
     
@@ -369,10 +369,50 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     Assert(new_bitmap_ptr != NULL);
     uint32_t new_delete_count = 0;
     
+    // Allocate and initialize new offsets array
+    SegmentId start_sid = task->merged_start_sid;
+    SegmentId end_sid = task->merged_end_sid;
+    uint32_t segment_count = end_sid - start_sid + 1;
+    SegmentOffsetRange *new_offsets_ptr = (SegmentOffsetRange *) palloc0(segment_count * sizeof(SegmentOffsetRange));
+    Assert(new_offsets_ptr != NULL);
+    
+    // Initialize offsets with sentinel values to track first occurrence
+    for (uint32_t j = 0; j < segment_count; j++)
+    {
+        new_offsets_ptr[j].sid = old_offsets_ptr[j].sid;  // Set the SegmentId
+        new_offsets_ptr[j].start_offset = SIZE_MAX;  // Sentinel: not yet seen
+        new_offsets_ptr[j].end_offset = 0;
+    }
+    
     {
         int write_idx = 0;
+        uint32_t current_sid_idx = 0;  // Track current SegmentId index (since ranges are continuous)
+        
         for (int i = 0; i < (int)segment->vec_count; i++)
         {
+            // Advance to the correct SegmentId if we've moved past the current one
+            // Since ranges are continuous and ascending, we only need to check forward
+            // Range is [start_offset, end_offset) - inclusive on left, exclusive on right
+            // Skip empty ranges (where start_offset == end_offset) in old offsets
+            while (current_sid_idx < segment_count)
+            {
+                // If this SegmentId has an empty range, skip it (will be handled in post-processing)
+                if (old_offsets_ptr[current_sid_idx].start_offset == old_offsets_ptr[current_sid_idx].end_offset)
+                {
+                    current_sid_idx++;
+                }
+                // If we've moved past this SegmentId's range, advance
+                else if (i >= (int)old_offsets_ptr[current_sid_idx].end_offset)
+                {
+                    current_sid_idx++;
+                }
+                else
+                {
+                    // Found the correct SegmentId (non-empty range)
+                    break;
+                }
+            }
+            
             // Only include vectors that were not deleted in the original bitmap (used for index building)
             if (!IS_SLOT_SET(original_bitmap_ptr, i))
             {
@@ -386,13 +426,46 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
                     new_delete_count++;
                 }
                 
+                // Update offsets for the current SegmentId
+                // Verify that i is within the range [start_offset, end_offset) for safety
+                if (current_sid_idx < segment_count && 
+                    i >= (int)old_offsets_ptr[current_sid_idx].start_offset && 
+                    i < (int)old_offsets_ptr[current_sid_idx].end_offset)
+                {
+                    if (new_offsets_ptr[current_sid_idx].start_offset == SIZE_MAX)
+                    {
+                        // First vector for this SegmentId
+                        new_offsets_ptr[current_sid_idx].start_offset = write_idx;
+                    }
+                    new_offsets_ptr[current_sid_idx].end_offset = write_idx + 1;  // end_offset is exclusive
+                }
+                
                 write_idx++;
             }
         }
         Assert(write_idx == new_index_count);
     }
     
-    // Free the saved original bitmap
+    // Handle SegmentIds with no vectors in new index (empty ranges: start_offset == end_offset)
+    // For empty ranges, use the offset where the previous SegmentId ended (or 0 if first)
+    Size prev_end_offset = 0;
+    for (uint32_t j = 0; j < segment_count; j++)
+    {
+        if (new_offsets_ptr[j].start_offset == SIZE_MAX)
+        {
+            // Empty range: no vectors for this SegmentId
+            // Use prev_end_offset to maintain continuity
+            new_offsets_ptr[j].start_offset = prev_end_offset;
+            new_offsets_ptr[j].end_offset = prev_end_offset;  // Empty range: start == end
+        }
+        else
+        {
+            // Update prev_end_offset for next empty range
+            prev_end_offset = new_offsets_ptr[j].end_offset;
+        }
+    }
+    
+    // Free the original bitmap
     pfree(original_bitmap_ptr);
 
     // Update the segment information in task
@@ -412,7 +485,8 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     prep.delete_count = new_delete_count;
     prep.map_ptr = new_mapping_ptr;
     prep.map_size = new_map_size;
-    
+    prep.offsets = new_offsets_ptr;
+
     // Use flush_segment_to_disk to write everything to disk
     // note that the new_index_bin will be freed in flush_segment_to_disk
     flush_segment_to_disk(index_relid, &prep);
@@ -424,7 +498,8 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
     pfree(old_mapping_ptr);
     pfree(new_bitmap_ptr);
     pfree(new_mapping_ptr);
-    
+    pfree(old_offsets_ptr);
+
     elog(DEBUG1, "rebuild_index: successfully rebuilt index for segment %u-%u, new count = %d", 
          segment->start_sid, segment->end_sid, new_index_count);
 }
@@ -475,6 +550,14 @@ merge_adjacent_segments(MergeTaskData *task)
     load_mapping_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &mapping1_ptr, true);
     Assert(mapping1_ptr != NULL);
 
+    // Load offsets for both segments
+    SegmentOffsetRange *offsets0_ptr = NULL;
+    load_offset_file(index_relid, segment0->start_sid, segment0->end_sid, version0, &offsets0_ptr, true);
+    Assert(offsets0_ptr != NULL);
+    SegmentOffsetRange *offsets1_ptr = NULL;
+    load_offset_file(index_relid, segment1->start_sid, segment1->end_sid, version1, &offsets1_ptr, true);
+    Assert(offsets1_ptr != NULL);
+
     // Decide which index is larger outside of MergeTwoIndices
     void *larger_index_ptr;
     void *smaller_index_ptr;
@@ -482,6 +565,10 @@ merge_adjacent_segments(MergeTaskData *task)
     uint8_t *smaller_bitmap_ptr;
     int64_t *larger_mapping_ptr;
     int64_t *smaller_mapping_ptr;
+    SegmentOffsetRange *larger_offsets_ptr;
+    SegmentOffsetRange *smaller_offsets_ptr;
+    uint32_t larger_sid_count;
+    uint32_t smaller_sid_count;
     int larger_count;
     int smaller_count;
     IndexType larger_index_type;
@@ -494,6 +581,10 @@ merge_adjacent_segments(MergeTaskData *task)
         smaller_bitmap_ptr = bitmap1_ptr;
         larger_mapping_ptr = mapping0_ptr;
         smaller_mapping_ptr = mapping1_ptr;
+        larger_offsets_ptr = offsets0_ptr;
+        smaller_offsets_ptr = offsets1_ptr;
+        larger_sid_count = segment0->end_sid - segment0->start_sid + 1;
+        smaller_sid_count = segment1->end_sid - segment1->start_sid + 1;
         larger_count = segment0->vec_count;
         smaller_count = segment1->vec_count;
         larger_index_type = segment0->index_type;
@@ -505,6 +596,10 @@ merge_adjacent_segments(MergeTaskData *task)
         smaller_bitmap_ptr = bitmap0_ptr;
         larger_mapping_ptr = mapping1_ptr;
         smaller_mapping_ptr = mapping0_ptr;
+        larger_offsets_ptr = offsets1_ptr;
+        smaller_offsets_ptr = offsets0_ptr;
+        larger_sid_count = segment1->end_sid - segment1->start_sid + 1;
+        smaller_sid_count = segment0->end_sid - segment0->start_sid + 1;
         larger_count = segment1->vec_count;
         smaller_count = segment0->vec_count;
         larger_index_type = segment1->index_type;
@@ -597,6 +692,22 @@ merge_adjacent_segments(MergeTaskData *task)
     // Compute merged_delete_count as sum of the two segments' delete counts
     uint32_t merged_delete_count = delete_count0 + delete_count1;
     
+    // Generate merged offsets by combining offsets from both segments
+    uint32_t merged_segment_count = task->merged_end_sid - task->merged_start_sid + 1;
+    SegmentOffsetRange *merged_offsets_ptr = (SegmentOffsetRange *) palloc0(merged_segment_count * sizeof(SegmentOffsetRange));
+    Assert(merged_offsets_ptr != NULL);
+    
+    // Copy larger offsets to merged offsets
+    for (int i = 0; i < larger_sid_count; i++) {
+        merged_offsets_ptr[i] = larger_offsets_ptr[i];
+    }
+    // Copy smaller offsets to merged offsets
+    for (int i = 0; i < smaller_sid_count; i++) {
+        merged_offsets_ptr[larger_sid_count + i] = smaller_offsets_ptr[i];
+        merged_offsets_ptr[larger_sid_count + i].start_offset += larger_count;
+        merged_offsets_ptr[larger_sid_count + i].end_offset += larger_count;
+    }
+    
     // Serialize the merged index
     void *merged_index_bin = NULL;
     IndexSerialize(merged_index_ptr, &merged_index_bin);
@@ -620,6 +731,7 @@ merge_adjacent_segments(MergeTaskData *task)
     prep.map_ptr = merged_mapping_ptr;
     prep.map_size = sizeof(int64_t) * (Size)merged_count;
     prep.delete_count = merged_delete_count;
+    prep.offsets = merged_offsets_ptr;
     
     // Write the merged segment to disk
     flush_segment_to_disk(index_relid, &prep);
@@ -634,6 +746,9 @@ merge_adjacent_segments(MergeTaskData *task)
     pfree(mapping0_ptr);
     pfree(mapping1_ptr);
     pfree(merged_mapping_ptr);
+    pfree(offsets0_ptr);
+    pfree(offsets1_ptr);
+    pfree(merged_offsets_ptr);
     
     elog(DEBUG1, "merge_adjacent_segments: successfully merged segments %u-%u and %u-%u into %u-%u, merged count = %d", 
          segment0->start_sid, segment0->end_sid, segment1->start_sid, segment1->end_sid,
@@ -1009,7 +1124,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (seg_array->current_index_relid == InvalidOid)
+        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
             continue;
             
         uint32 flat_cnt = pg_atomic_read_u32(&seg_array->flat_count);
@@ -1025,7 +1140,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (seg_array->current_index_relid == InvalidOid)
+        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
             continue;
             
         uint32 mem_le_cnt = pg_atomic_read_u32(&seg_array->memtable_capacity_le_count);
@@ -1041,7 +1156,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (seg_array->current_index_relid == InvalidOid)
+        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
             continue;
             
         if (traverse_and_check_priority(worker_id, lsm_idx, 3))
@@ -1053,7 +1168,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (seg_array->current_index_relid == InvalidOid)
+        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
             continue;
             
         uint32 small_le_cnt = pg_atomic_read_u32(&seg_array->small_segment_le_count);
@@ -1069,7 +1184,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (seg_array->current_index_relid == InvalidOid)
+        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
             continue;
             
         if (traverse_and_check_priority(worker_id, lsm_idx, 5))

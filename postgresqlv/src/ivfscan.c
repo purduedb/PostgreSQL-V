@@ -209,7 +209,10 @@ ivfflatendscan(IndexScanDesc scan)
 	MemoryContextDelete(so->tmpCtx);
 
 	// free resources in so if any
-	pfree(so->topkTuples.pairs);
-	pfree(so);
+	// pfree(so->topkTuples.pairs); // already freed by MemoryContextDelete
+	if (so != NULL)
+	{
+		pfree(so);
+	}
 	scan->opaque = NULL;
 }

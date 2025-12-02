@@ -64,6 +64,11 @@ static void GetLSMMappingFilePathWithVersion(char *buf, size_t buflen, Oid index
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "mapping");
 }
 
+static void GetLSMOffsetFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
+{
+    GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "offset");
+}
+
 static void GetLSMSegmentMetadataPathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "metadata");
@@ -739,6 +744,12 @@ flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
     GetLSMMappingFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
     write_segment_file(file_path, prep->map_ptr, prep->map_size, NULL);
 
+    // offset file - write with new version (if offsets are provided)
+    if (prep->offsets != NULL)
+    {
+        write_offset_file(indexRelId, prep->start_sid, prep->end_sid, new_version, prep->offsets);
+    }
+
     // metadata file - write with new version (this is the last step, making it atomic)
     write_lsm_segment_metadata(indexRelId, prep, new_version);
     
@@ -872,4 +883,59 @@ load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t
     char path[MAXPGPATH];
     GetLSMIndexFilePathWithVersion(path, sizeof(path), indexRelId, start_sid, end_sid, version);
     IndexLoadAndSave(path, index_type, index);
+}
+
+// Write offset file for a segment
+// offsets array should contain (end_sid - start_sid + 1) entries
+// Each entry corresponds to a SegmentId from start_sid to end_sid (inclusive)
+void 
+write_offset_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, const SegmentOffsetRange *offsets)
+{
+    if (start_sid > end_sid)
+        elog(ERROR, "[write_offset_file] Invalid segment range: start_sid %u > end_sid %u", start_sid, end_sid);
+    
+    uint32_t segment_count = end_sid - start_sid + 1;
+    Size file_size = segment_count * sizeof(SegmentOffsetRange);
+    
+    char file_path[MAXPGPATH];
+    GetLsmDirPath(file_path, MAXPGPATH, indexRelId);
+    ensure_dir_exists(file_path);
+    
+    GetLSMOffsetFilePathWithVersion(file_path, sizeof(file_path), indexRelId, start_sid, end_sid, version);
+    write_segment_file(file_path, offsets, file_size, NULL);
+    
+    elog(DEBUG1, "[write_offset_file] Successfully wrote offset file for segment %u-%u version %u", 
+         start_sid, end_sid, version);
+}
+
+// Load offset file for a segment
+// Returns allocated array of SegmentOffsetRange (caller must free if pg_alloc is false)
+// The array contains (end_sid - start_sid + 1) entries, indexed by (SegmentId - start_sid)
+void 
+load_offset_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, SegmentOffsetRange **offsets, bool pg_alloc)
+{
+    if (start_sid > end_sid)
+        elog(ERROR, "[load_offset_file] Invalid segment range: start_sid %u > end_sid %u", start_sid, end_sid);
+    
+    // If version is UINT32_MAX, find latest version
+    if (version == UINT32_MAX)
+    {
+        version = find_latest_segment_version(indexRelId, start_sid, end_sid);
+    }
+    
+    char path[MAXPGPATH];
+    GetLSMOffsetFilePathWithVersion(path, sizeof(path), indexRelId, start_sid, end_sid, version);
+    
+    void *data = read_segment_file(path, pg_alloc, NULL);
+    if (!data)
+    {
+        elog(ERROR, "[load_offset_file] Failed to read offset file: %s", path);
+    }
+    
+    // Verify the size matches expected
+    // Note: read_segment_file doesn't return size, so we trust the file format
+    *offsets = (SegmentOffsetRange *)data;
+    
+    elog(DEBUG1, "[load_offset_file] Successfully loaded offset file for segment %u-%u version %u", 
+         start_sid, end_sid, version);
 }

@@ -28,6 +28,7 @@
 #include "vectorindeximpl.hpp"
 #include "lsm_segment.h"
 #include "lsm_merge_worker.h"
+#include "catalog/index.h"
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -505,6 +506,7 @@ handle_task(TaskSlot *task_slot, int slot_idx)
 
         // conduct the search (concurrent search will handle merging, writing results, and setting latch)
         VectorSearchResult result = vs_search_result_at(task->backend_pgprocno);
+
         vector_search(task, result);
 
         // Note: The latch is set by the concurrent search function (last-finisher continuation)
@@ -551,10 +553,9 @@ static void
 vector_search(VectorSearchTask task, VectorSearchResult result)
 {
     // traverse all flushed segments
-    int lsm_idx = get_lsm_index_idx(task->index_relid);
+    int lsm_idx = get_lsm_index_idx_no_loading(task->index_relid);
     FlushedSegmentPool *pool = get_flushed_segment_pool(lsm_idx);
-    Assert(lsm);
-    
+
     // Acquire segment lock to prevent concurrent segment updates during search
     // Use shared lock to allow multiple concurrent searches but prevent updates
     pthread_rwlock_rdlock(&pool->seg_lock);
@@ -579,15 +580,15 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
             idx = pool->flushed_segments[idx].next_idx;
         } while (true);
     }
-    
+
     // Release lock early to minimize contention
     pthread_rwlock_unlock(&pool->seg_lock);
-    
+
     // Filter segments and build SegmentSearchInfo array for segments that need to be searched
     // Note: this should be freed after the search is complete by the last-finisher thread, but not in this function
     SegmentSearchInfo *segments_to_search = malloc(sizeof(SegmentSearchInfo) * segment_count);
     uint32_t search_count = 0;
-    
+
     for (uint32_t i = 0; i < segment_count; i++) {
         uint32_t seg_idx = segment_indices[i];
         FlushedSegment segment = &pool->flushed_segments[seg_idx];
@@ -625,7 +626,7 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
 
     // Get the client backend process for setting the latch
     PGPROC *client = &ProcGlobal->allProcs[task->backend_pgprocno];
-    
+
     // Conduct concurrent search on all segments that need to be searched
     // The concurrent function will handle merging, writing results, and setting the latch
     if (search_count > 0) {
@@ -650,7 +651,6 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
         result->result_count = 0;
         SetLatch(&client->procLatch);
     }
-
 }
 
 // TaskDesc *task_decs = NULL;
