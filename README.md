@@ -52,10 +52,15 @@ For an executable prototype, please switch to the [cidr branch](https://github.c
 If you find our system useful for your research, please cite the following paper:
 
 @inproceedings{PostgreSQLV-CIDR26,
-  title = {{<a href="https://cs.purdue.edu/homes/csjgwang/pubs/CIDR26_PostgreSQLVector.pdf">Fast Vector Search in PostgreSQL: A Decoupled Approach</a>}},
-  author={Jiayi Liu and Yunan Zhang and Chenzhe Jin and Aditya Gupta and Shige Liu and Jianguo Wang},
-  booktitle={Conference on Innovative Data Systems Research (CIDR)},
-  year={2026}
+
+author={Jiayi Liu and Yunan Zhang and Chenzhe Jin and Aditya Gupta and Shige Liu and Jianguo Wang},
+
+title = {{<a href="https://cs.purdue.edu/homes/csjgwang/pubs/CIDR26_PostgreSQLVector.pdf">Fast Vector Search in PostgreSQL: A Decoupled Approach</a>}},
+
+booktitle={Conference on Innovative Data Systems Research (CIDR)},
+
+year={2026},
+
 }
 
 ## Contact
