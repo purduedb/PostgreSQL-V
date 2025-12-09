@@ -9,9 +9,6 @@ Unlike prior systems (e.g., [pgvector](https://github.com/pgvector/pgvector)) th
 
 PostgreSQL-V is fully compatible with pgvector (by implementing the same APIs in IndexAmRoutine), making it a viable drop-in replacement.
 
-**Reference:**  
-Jiayi Liu, Yunan Zhang, Chenzhe Jin, Aditya Gupta, Shige Liu, and Jianguo Wang. *Fast Vector Search in PostgreSQL: A Decoupled Approach.* Conference on Innovative Data Systems Research (**CIDR**), 2026.
-
 ## Installation
 ### 1. Install PostgreSQL
 Follow the official [PostgreSQL installation guide](https://www.postgresql.org/download/) for your operating system.
@@ -55,14 +52,17 @@ The full implementation is under development in the main branch. 🚧
 ## Citation
 If you find our system useful for your research, please cite the following paper:
 
-```
 @inproceedings{PostgreSQLV-CIDR26,
-  title={Fast Vector Search in PostgreSQL: A Decoupled Approach},
-  author={Jiayi Liu and Yunan Zhang and Chenzhe Jin and Aditya Gupta and Shige Liu and Jianguo Wang},
-  booktitle={Conference on Innovative Data Systems Research (CIDR)},
-  year={2026}
+
+author={Jiayi Liu and Yunan Zhang and Chenzhe Jin and Aditya Gupta and Shige Liu and Jianguo Wang},
+
+title = {{<a href="https://cs.purdue.edu/homes/csjgwang/pubs/CIDR26_PostgreSQLVector.pdf">Fast Vector Search in PostgreSQL: A Decoupled Approach</a>}},
+
+booktitle={Conference on Innovative Data Systems Research (CIDR)},
+
+year={2026},
+
 }
-```
 
 ## Contact
 If you have any questions, you are more than welcome to contact Dr. [Jianguo Wang](https://cs.purdue.edu/homes/csjgwang/)
