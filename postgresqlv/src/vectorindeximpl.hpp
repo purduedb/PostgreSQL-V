@@ -28,6 +28,10 @@ extern "C" {
 int HnswIndexInit(int dimension, int M, int efConstruction, void** hnswIndexPtr);
 int HnswIndexcreate(void* hnswIndexPtr, int M, int efConstruction, VectorArray vectors);
 
+// diskann
+int DiskANNIndexInit(int dimension, void** diskannIndexPtr);
+int DiskANNIndexBuildFromFile(void* diskannIndexPtr, const char* data_path, const char* index_prefix, int max_degree, int ef_construction, double pq_code_budget_gb, double build_dram_budget_gb);
+
 // ivfflat
 int IvfflatTrain(VectorArray samples, int lists, void** ivfIndexPtr);
 int IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors);
@@ -64,6 +68,14 @@ void MergeIndex(void *index_ptr, uint8_t *bitmap_ptr, int count, IndexType old_i
 void* MergeTwoIndices(void *lindex_ptr, int lcount, IndexType lindex_type,
                      void *sindex_ptr, int scount, IndexType sindex_type,
                      int *merged_count);
+
+// DiskANN disk file management functions
+// Create a new disk file for DiskANN raw data
+void* DiskANNCreateDataFile(const char* data_path, uint32_t dim);
+// Add a batch of vectors to the disk file
+int DiskANNAddVectorsToFile(void* file_handle, const float* vectors, uint32_t num_vectors, uint32_t dim);
+// Close the disk file
+void DiskANNCloseDataFile(void* file_handle);
 
 // concurrent vector search on multiple segments using knowhere thread pool
 // Structure for segment search information (must match C++ struct)

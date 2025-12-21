@@ -41,6 +41,7 @@
 #include "access/parallel.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupdesc.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
@@ -56,6 +57,8 @@
 #include "vectorindeximpl.hpp"
 #include "lsmindex.h"
 #include "statuspage.h"
+#include <sys/stat.h>
+#include <unistd.h>
 
 #if PG_VERSION_NUM >= 140000
 #include "utils/backend_progress.h"
@@ -167,6 +170,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->tids = (int64_t *) palloc(sizeof(int64_t) * DEFAULT_TIDS_SIZE);
 	buildstate->num_tids = 0;
 	buildstate->cap_tids = DEFAULT_TIDS_SIZE;
+	buildstate->diskFileHandle = NULL;
 
 	/* Create visibility tuple description */
 	buildstate->vitupdesc = CreateTemplateTupleDesc(1);
@@ -179,9 +183,18 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 static void
 FreeBuildState(HnswBuildState * buildstate)
 {
+	if (buildstate->vitupdesc)
+		ReleaseTupleDesc(buildstate->vitupdesc);
 	VectorArrayFree(buildstate->vectors);
 	pfree(buildstate->tids);
+#if IS_DISK_BASED
+	if (buildstate->diskFileHandle)
+		DiskANNCloseDataFile(buildstate->diskFileHandle);
+	if (buildstate->hnswIndex)
+		IndexFree(buildstate->hnswIndex);
+#else
 	IndexFree(buildstate->hnswIndex);
+#endif
 	MemoryContextDelete(buildstate->graphCtx);
 	MemoryContextDelete(buildstate->tmpCtx);
 }
@@ -226,12 +239,37 @@ AddVector(Datum *values, bool *isnull, ItemPointer tid, HnswBuildState * buildst
 		elog(ERROR, "[AddVector] An error occurs when building the HNSW index");
 	}
 
-	// batch add vectors to the IVFFlat index
+#if IS_DISK_BASED
+	// For DiskANN, write vectors to disk file in batches
+	if (vectors->length == targvectors)
+	{
+		// Flatten vectors for writing to disk
+		Vector *vec_ptr;
+		float *flat_buf = (float *) palloc(sizeof(float) * targvectors * buildstate->dimensions);
+		for (int i = 0; i < targvectors; i++)
+		{
+			vec_ptr = (Vector *) VectorArrayGet(vectors, i);
+			memcpy(flat_buf + i * buildstate->dimensions, vec_ptr->x, sizeof(float) * buildstate->dimensions);
+		}
+		
+		// Write batch to disk file
+		if (DiskANNAddVectorsToFile(buildstate->diskFileHandle, flat_buf, targvectors, buildstate->dimensions) != 0)
+		{
+			pfree(flat_buf);
+			elog(ERROR, "[AddVector] Failed to write vectors to disk file");
+		}
+		
+		pfree(flat_buf);
+		vectors->length = 0;
+	}
+#else
+	// batch add vectors to the HNSW index
 	if (vectors->length == targvectors)
 	{
 		HnswIndexcreate(buildstate->hnswIndex, buildstate->m, buildstate->efConstruction, buildstate->vectors);
 		vectors->length = 0;
 	}
+#endif
 }
 
 /*
@@ -273,12 +311,37 @@ ScanAllRows(HnswBuildState *buildstate)
     buildstate->reltuples = table_index_build_scan(buildstate->heap, buildstate->index, buildstate->indexInfo,
 		true, true, BuildCallback, (void *) buildstate, NULL);
 	
+#if IS_DISK_BASED
+	// For DiskANN, write remaining vectors to disk file
+	if (buildstate->vectors->length > 0)
+	{
+		// Flatten remaining vectors
+		Vector *vec_ptr;
+		float *flat_buf = (float *) palloc(sizeof(float) * buildstate->vectors->length * buildstate->dimensions);
+		for (int i = 0; i < buildstate->vectors->length; i++)
+		{
+			vec_ptr = (Vector *) VectorArrayGet(buildstate->vectors, i);
+			memcpy(flat_buf + i * buildstate->dimensions, vec_ptr->x, sizeof(float) * buildstate->dimensions);
+		}
+		
+		// Write remaining vectors to disk file
+		if (DiskANNAddVectorsToFile(buildstate->diskFileHandle, flat_buf, buildstate->vectors->length, buildstate->dimensions) != 0)
+		{
+			pfree(flat_buf);
+			elog(ERROR, "[ScanAllRows] Failed to write remaining vectors to disk file");
+		}
+		
+		pfree(flat_buf);
+		buildstate->vectors->length = 0;
+	}
+#else
 	// add the remaining vectors
 	if (buildstate->vectors->length > 0)
 	{
 		HnswIndexcreate(buildstate->hnswIndex, buildstate->m, buildstate->efConstruction, buildstate->vectors);
 		buildstate->vectors->length = 0;
 	}
+#endif
 }
 
 /*
@@ -291,7 +354,6 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 #ifdef HNSW_MEMORY
 	SeedRandom(42);
 #endif
-	elog(DEBUG1, "enter BuildIndex");
 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
 
 	MemoryContext hnswBuildCtx = AllocSetContextCreate(CurrentMemoryContext,
@@ -301,6 +363,85 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 
 	uint32_t dim = buildstate->dimensions;
 
+#if IS_DISK_BASED
+	// For DiskANN, create disk file and initialize DiskANN index
+	Oid relId = RelationGetRelid(index);
+	char data_path[MAXPGPATH];
+	char index_prefix[MAXPGPATH];
+	char dir_path[MAXPGPATH];
+	
+	// Get directory path and ensure it exists
+	snprintf(dir_path, sizeof(dir_path), VECTOR_STORAGE_BASE_DIR "%u/", relId);
+	struct stat st;
+	if (stat(dir_path, &st) != 0)
+	{
+		if (mkdir(dir_path, S_IRWXU) != 0)
+		{
+			elog(ERROR, "[BuildIndex] Failed to create directory: %s", dir_path);
+		}
+	}
+	else if (!S_ISDIR(st.st_mode))
+	{
+		elog(ERROR, "[BuildIndex] Path exists but is not a directory: %s", dir_path);
+	}
+	
+	// Create data file path: VECTOR_STORAGE_BASE_DIR/indexRelId/diskann_data.bin
+	snprintf(data_path, sizeof(data_path), VECTOR_STORAGE_BASE_DIR "%u/diskann_data.bin", relId);
+	
+	// Create index prefix: VECTOR_STORAGE_BASE_DIR/indexRelId/diskann_index
+	snprintf(index_prefix, sizeof(index_prefix), VECTOR_STORAGE_BASE_DIR "%u/diskann_index", relId);
+	
+	// Create disk file
+	buildstate->diskFileHandle = DiskANNCreateDataFile(data_path, dim);
+	if (buildstate->diskFileHandle == NULL)
+	{
+		elog(ERROR, "[BuildIndex] Failed to create DiskANN data file");
+	}
+	
+	// Initialize DiskANN index
+	DiskANNIndexInit(dim, &(buildstate->hnswIndex));
+	
+	CreateMetaPage(buildstate);
+	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
+		log_newpage_range(index, forkNum, 0, RelationGetNumberOfBlocksInFork(index, forkNum), true);
+	
+	// Scan all rows and write to disk file
+	ScanAllRows(buildstate);
+	
+	// Close disk file
+	DiskANNCloseDataFile(buildstate->diskFileHandle);
+	buildstate->diskFileHandle = NULL;
+	
+	// TODO: adjust the parameters
+	// Build DiskANN index from disk file
+	// Use default parameters (can be made configurable later)
+	int max_degree = 56;  // Default DiskANN max_degree
+	double pq_code_budget_gb = -1.0;  // Auto-calculate
+	double build_dram_budget_gb = 32.0;  // Default DiskANN build_dram_budget_gb
+	
+	// Auto-calculate pq_code_budget_gb: 0.125 * raw data size
+	// Estimate: num_tids * dim * sizeof(float) * 0.125 / (1024^3)
+	if (pq_code_budget_gb < 0 && buildstate->num_tids > 0)
+	{
+		pq_code_budget_gb = sizeof(float) * dim * buildstate->num_tids * 0.125 / (1024.0 * 1024.0 * 1024.0);
+	}
+	
+	if (DiskANNIndexBuildFromFile(buildstate->hnswIndex, data_path, index_prefix, 
+	                               max_degree, buildstate->efConstruction, 
+	                               pq_code_budget_gb, build_dram_budget_gb) != 0)
+	{
+		elog(ERROR, "[BuildIndex] Failed to build DiskANN index from disk file");
+	}
+	
+	void *tids = buildstate->tids;
+	uint32_t elem_size = buildstate->vectors->itemsize / buildstate->dimensions;
+	
+	// create the status pages
+	CreateStatusMetaPage(index, MAIN_FORKNUM);
+	InitializeStatusMemtableArray(index, MAIN_FORKNUM);
+	
+	build_lsm_index(DISKANN, buildstate->index, buildstate->hnswIndex, (int64_t *)tids, dim, elem_size, buildstate->num_tids);
+#else
 	HnswIndexInit(dim, buildstate->m, buildstate->efConstruction, &(buildstate->hnswIndex));
 	CreateMetaPage(buildstate);
 	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
@@ -315,6 +456,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	InitializeStatusMemtableArray(index, MAIN_FORKNUM);
 	
 	build_lsm_index(HNSW, buildstate->index, buildstate->hnswIndex, (int64_t *)tids, dim, elem_size, buildstate->num_tids);
+#endif
 
 	MemoryContextSwitchTo(oldCtx);
     MemoryContextDelete(hnswBuildCtx);

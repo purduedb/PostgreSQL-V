@@ -116,6 +116,25 @@ cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
     
     atomic_store(&segment->ref_count, 0);
     
+    // Update insert_idx to allow reuse of this slot in reserve_flushed_segment
+    // Try to acquire write lock to update insert_idx safely
+    // If we can't acquire it (e.g., already held by caller), we skip the update
+    // This is safe because reserve_flushed_segment will eventually wrap around and find the slot
+    int lock_acquired = pthread_rwlock_trywrlock(&pool->seg_lock);
+    if (lock_acquired == 0)
+    {
+        // Successfully acquired lock - read insert_idx while holding lock to avoid race condition
+        // Update insert_idx if this segment is before current insert_idx
+        uint32_t current_insert_idx = pool->insert_idx;
+        if (segment_idx < current_insert_idx)
+        {
+            pool->insert_idx = segment_idx;
+        }
+        pthread_rwlock_unlock(&pool->seg_lock);
+    }
+    // If lock acquisition failed, another thread holds it - skip insert_idx update
+    // This is safe because reserve_flushed_segment will eventually find freed slots
+    
     fprintf(stderr, "[cleanup_flushed_segment] Segment idx = %d cleaned up and unlinked from list\n", segment_idx);
 }
 

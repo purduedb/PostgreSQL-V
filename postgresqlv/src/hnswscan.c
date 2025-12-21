@@ -10,6 +10,11 @@
 
 #include "lsmindex.h"
 
+// Circular buffer to store last 100 execution times (for average calculation)
+static long execution_times[100];
+static int call_count = 0;
+static int buffer_index = 0;
+
 /*
  * Get scan value
  */
@@ -148,6 +153,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		Vector *query_vector = (Vector *) PointerGetDatum(value);
 		// FIXME: how are we going to set top_k?
 		int top_k = 100;
+
 		so->topkTuples = search_lsm_index(scan->indexRelation, query_vector->x, top_k, hnsw_ef_search);
 		so->topkTuplesIdx = 0;	
 		so->first = false;

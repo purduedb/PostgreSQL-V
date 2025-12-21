@@ -5,7 +5,9 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/parallel.h"
+#include "access/tupdesc.h"
 #include "access/xact.h"
+#include "executor/executor.h"
 #include "bitvec.h"
 #include "catalog/index.h"
 #include "catalog/pg_operator_d.h"
@@ -303,6 +305,10 @@ InitBuildState(IvfflatBuildState * buildstate, Relation heap, Relation index, In
 static void
 FreeBuildState(IvfflatBuildState * buildstate)
 {
+	if (buildstate->slot)
+		ExecDropSingleTupleTableSlot(buildstate->slot);
+	if (buildstate->sortdesc)
+		ReleaseTupleDesc(buildstate->sortdesc);
 	VectorArrayFree(buildstate->centers);
 	pfree(buildstate->listInfo);
 	IndexFree(buildstate->ivfflatIndex);

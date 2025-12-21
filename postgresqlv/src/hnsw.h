@@ -301,6 +301,7 @@ typedef struct HnswBuildState
 	int      num_tids;
 	int      cap_tids;
 	void *hnswIndex; // add for storing the pointer to the index during the building phase
+	void *diskFileHandle; // add for storing the disk file handle for DiskANN builds
 
 	/* Visibility slot */
 	TupleDesc vitupdesc;

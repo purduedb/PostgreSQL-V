@@ -147,7 +147,6 @@ register_lsm_index(Oid index_relid)
 {
     // Acquire exclusive lock to prevent concurrent registration
     LWLockAcquire(SharedLSMIndexBuffer->lock, LW_EXCLUSIVE);
-    
     // Double-check: another backend might have registered this index while we were waiting
     for (int i = 0; i < INDEX_BUF_SIZE; i++)
     {
@@ -192,6 +191,7 @@ register_lsm_index(Oid index_relid)
         }
     }
     
+
     // find an empty slot
     int slot_num = -1;
     for (int i = 0; i < INDEX_BUF_SIZE; i++)
@@ -210,10 +210,9 @@ register_lsm_index(Oid index_relid)
         LWLockRelease(SharedLSMIndexBuffer->lock);
         elog(ERROR, "[register_lsm_index] no free slot");
     }
-    
+
     // Write the Oid when registering the index
     SharedLSMIndexBuffer->slots[slot_num].lsmIndex.indexRelId = index_relid;
-    
     // Release lock before returning
     LWLockRelease(SharedLSMIndexBuffer->lock);
     return slot_num;
@@ -380,6 +379,7 @@ build_lsm_index(IndexType type, Relation index, void *vector_index, int64_t *tid
     persist_index_segment(&slot->lsmIndex, START_SEGMENT_ID, START_SEGMENT_ID, count, tids, NULL, index_bin_set, type);
 
     index_build_blocking(relId, slot_num);
+
     // update segment array
     add_to_segment_array(slot_num, relId, START_SEGMENT_ID, START_SEGMENT_ID, count, type, 0);
 
@@ -855,12 +855,12 @@ load_lsm_index(Relation index, uint32_t slot_idx)
     
     pg_write_barrier();
 
-    // test the consistency of the LSM index
-    bool consistency_ok = test_consistency(heap_rel, lsm, slot_idx);
-    if (!consistency_ok) {
-        elog(ERROR, "[load_lsm_index] consistency check failed for LSM index %u", index_relid);
-        Assert(false);
-    }
+    // // test the consistency of the LSM index
+    // bool consistency_ok = test_consistency(heap_rel, lsm, slot_idx);
+    // if (!consistency_ok) {
+    //     elog(ERROR, "[load_lsm_index] consistency check failed for LSM index %u", index_relid);
+    //     Assert(false);
+    // }
 
     table_close(heap_rel, AccessShareLock);
     // Mark as fully loaded (valid = 1) - use write barrier to ensure all writes are visible

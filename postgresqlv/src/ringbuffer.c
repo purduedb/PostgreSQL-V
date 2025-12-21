@@ -118,6 +118,8 @@ ring_buffer_init(void)
         ring_buffer_shmem->lock = &tr[0].lock;
 
         ring_buffer_shmem->ring_size = MaxBackends; // each backend can have one task
+        // TODO: for debugging
+        elog(DEBUG1, "[ring_buffer_init] ring buffer size = %d", ring_buffer_shmem->ring_size);
         ring_buffer_shmem->head = 0;
         ring_buffer_shmem->tail = 0;
         ring_buffer_shmem->count = 0;

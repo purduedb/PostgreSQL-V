@@ -245,6 +245,13 @@ remove_from_segment_array(SharedSegmentArray *seg_array, uint32_t idx)
     seg_array->segments[idx].prev_idx = -1;
     --seg_array->segment_count;
     
+    // Update insert_idx to allow reuse of this slot in reserve_merge_segment_slot
+    // We hold the lock (LW_EXCLUSIVE) so we can safely update insert_idx
+    if (idx < seg_array->insert_idx)
+    {
+        seg_array->insert_idx = idx;
+    }
+    
     elog(DEBUG1, "remove_merge_segment successfully removed from list, idx = %u", idx);
 }
 
@@ -959,14 +966,17 @@ finish_merge_task(int worker_id)
 
 // Choose an adjacent segment (prev or next) that is in use and not compacting.
 // Prefer the one with smaller vec_count when both exist.
+// Skip DiskANN segments as they don't support incremental updates/merges.
 // (Need to hold the shared lock)
 static bool
 choose_adjacent_smaller(SharedSegmentArray *seg_array, uint32_t idx, uint32_t *chosen_adj_idx)
 {
     uint32_t prev_idx = seg_array->segments[idx].prev_idx;
     uint32_t next_idx = seg_array->segments[idx].next_idx;
-    bool have_prev = (prev_idx != (uint32_t)-1) && seg_array->segments[prev_idx].in_used && !seg_array->segments[prev_idx].is_compacting;
-    bool have_next = (next_idx != (uint32_t)-1) && seg_array->segments[next_idx].in_used && !seg_array->segments[next_idx].is_compacting;
+    bool have_prev = (prev_idx != (uint32_t)-1) && seg_array->segments[prev_idx].in_used && !seg_array->segments[prev_idx].is_compacting
+                     && seg_array->segments[prev_idx].index_type != DISKANN;
+    bool have_next = (next_idx != (uint32_t)-1) && seg_array->segments[next_idx].in_used && !seg_array->segments[next_idx].is_compacting
+                     && seg_array->segments[next_idx].index_type != DISKANN;
 
     if (!have_prev && !have_next)
         return false;
@@ -1001,8 +1011,6 @@ choose_adjacent_smaller(SharedSegmentArray *seg_array, uint32_t idx, uint32_t *c
 static bool
 traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
 {
-    uint32_t adj;
-    
     SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
     LWLockAcquire(seg_array->lock, LW_SHARED);
     if (!seg_array->segments[0].in_used)
@@ -1036,6 +1044,9 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
                 break;
                 
             case 2: // vec_count <= MEMTABLE_MAX_CAPACITY
+                // Skip DiskANN indices - they don't support incremental updates/merges
+                if (seg_array->segments[cur].index_type == DISKANN)
+                    break;
                 if (seg_array->segments[cur].vec_count <= MEMTABLE_MAX_CAPACITY)
                 {
                     if (choose_adjacent_smaller(seg_array, cur, &adj_segment))
@@ -1054,6 +1065,9 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
                 break;
                 
             case 4: // vec_count <= THRESHOLD_SMALL_SEGMENT_SIZE
+                // Skip DiskANN indices - they don't support incremental updates/merges
+                if (seg_array->segments[cur].index_type == DISKANN)
+                    break;
                 if (seg_array->segments[cur].vec_count <= THRESHOLD_SMALL_SEGMENT_SIZE)
                 {
                     if (choose_adjacent_smaller(seg_array, cur, &adj_segment))
@@ -1064,6 +1078,9 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
                 break;
                 
             case 5: // vec_count <= MAX_SEGMENTS_SIZE
+                // Skip DiskANN indices - they don't support incremental updates/merges
+                if (seg_array->segments[cur].index_type == DISKANN)
+                    break;
                 if (seg_array->segments[cur].vec_count <= MAX_SEGMENTS_SIZE)
                 {
                     if (choose_adjacent_smaller(seg_array, cur, &adj_segment))

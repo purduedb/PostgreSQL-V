@@ -14,8 +14,15 @@ typedef enum IndexType
 {
     FLAT, // no indexing
     IVFFLAT, 
-    HNSW
+    HNSW,
+    DISKANN
 }IndexType;
+
+// Global macro to indicate whether DiskANN is used
+// Set this to 1 to enable DiskANN, 0 to use HNSW
+#ifndef IS_DISK_BASED
+#define IS_DISK_BASED 0
+#endif
 
 // FIXME: find a better way to manage memtables' memory
 // memtable

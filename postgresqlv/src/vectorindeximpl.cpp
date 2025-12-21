@@ -54,6 +54,7 @@
 #include <algorithm>
 #include <utility>
 #include <queue>
+#include <string>
 // TODO: for evaluation
 #include <chrono>
 #include <iostream>
@@ -113,6 +114,7 @@
 #include "simd/hook.h"
 #include "knowhere/comp/brute_force.h"
 #include "knowhere/comp/thread_pool.h"
+#include "knowhere/comp/local_file_manager.h"
 #include <atomic>
 #include <memory>
 
@@ -303,6 +305,66 @@ HnswIndexcreate(void* hnswIndexPtr, int M, int efConstruction, VectorArray vecto
     return 0;
 }
 
+extern "C" int
+DiskANNIndexInit(int dimension, void** diskannIndexPtr)
+{
+    elog(DEBUG1, "enter DiskANNIndexInit, dimension = %d", dimension);
+
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+    auto diskann_index_pack = knowhere::Pack(file_manager);
+    auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+        knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack).value();
+    knowhere::Index<knowhere::IndexNode> * kindex_ptr = new knowhere::Index<knowhere::IndexNode>(kindex);
+    // Return pointer
+    *diskannIndexPtr = static_cast<void*>(kindex_ptr);
+    return 0;
+}
+
+extern "C" int
+DiskANNIndexBuildFromFile(void* diskannIndexPtr, const char* data_path, const char* index_prefix, 
+                          int max_degree, int ef_construction, double pq_code_budget_gb, double build_dram_budget_gb)
+{
+    elog(DEBUG1, "enter DiskANNIndexBuildFromFile, data_path = %s, index_prefix = %s", data_path, index_prefix);
+
+    knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(diskannIndexPtr);
+
+    // Create index directory if needed
+    std::string prefix_str(index_prefix);
+    size_t last_slash = prefix_str.find_last_of('/');
+    if (last_slash != std::string::npos) {
+        std::string dir_path = prefix_str.substr(0, last_slash);
+        // Create directory (similar to fs::create_directories)
+        // For now, we'll let knowhere handle directory creation
+    }
+
+    // Configuration for DiskANN build
+    knowhere::Json conf;
+    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
+    conf[knowhere::meta::DATA_PATH] = data_path;
+    conf[knowhere::indexparam::MAX_DEGREE] = max_degree;
+    conf[knowhere::indexparam::SEARCH_LIST_SIZE] = ef_construction;  // Use ef_construction for build
+    conf[knowhere::indexparam::PQ_CODE_BUDGET_GB] = pq_code_budget_gb;
+    conf[knowhere::indexparam::BUILD_DRAM_BUDGET_GB] = build_dram_budget_gb;
+
+    // For DiskANN, build directly (data already on disk)
+    knowhere::DataSetPtr ds_ptr = nullptr;
+    auto build_res = index->Build(ds_ptr, conf);
+    if (build_res != knowhere::Status::success) {
+        elog(ERROR, "[DiskANNIndexBuildFromFile] Failed to build DiskANN index");
+        return -1;
+    }
+
+    // Note: We do NOT deserialize here during build phase to avoid setting up
+    // thread contexts and AIO contexts (which can exhaust system resources with
+    // many CPU cores and cause hangs). The index will be deserialized when
+    // loaded for search operations in IndexLoadAndSave().
+    // The built index is already serialized and saved by build_lsm_index().
+
+    return 0;
+}
+
 extern "C" int 
 IvfflatTrain(VectorArray samples, int lists, void** ivfIndexPtr)
 {
@@ -379,6 +441,13 @@ IndexBuild(IndexType type, ConcurrentMemTable mt, uint32_t valid_rows, void** in
     elog(DEBUG1, "enter IndexBuild, type = %d, relation = %d, segment id = %d, valid_rows = %d, M = %d, efConstruction = %d, lists = %d",
          type, mt->rel, mt->memtable_id, valid_rows, M, efConstruction, lists);
     
+    // DiskANN is not supported in IndexBuild (used for REBUILD_FLAT which should use HNSW instead)
+    if (type == DISKANN)
+    {
+        elog(ERROR, "[IndexBuild] DiskANN is not supported in IndexBuild. Use HNSW for REBUILD_FLAT operations.");
+        return;
+    }
+    
     // initialize
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
     knowhere::Index<knowhere::IndexNode> kindex;
@@ -393,6 +462,10 @@ IndexBuild(IndexType type, ConcurrentMemTable mt, uint32_t valid_rows, void** in
         case IVFFLAT:
             kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version).value();
             break;
+        case DISKANN:
+            // Should not reach here due to check above, but handle for completeness
+            elog(ERROR, "[IndexBuild] DiskANN is not supported in IndexBuild");
+            return;
     }
     knowhere::Index<knowhere::IndexNode> * kindex_ptr = new knowhere::Index<knowhere::IndexNode>(kindex);
 
@@ -447,12 +520,11 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     // Timing instrumentation
     auto start_time = std::chrono::high_resolution_clock::now();
     
-    // elog(DEBUG1, "enter VectorIndexSearch, type = %d, efs_nprobe = %d, k = %d, count = %d", type, efs_nprobe, k, count);
     knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(indexPtr);
 
     if (index->Count() <= 0)
     {
-        elog(ERROR, "IvfflatIndexSearch: the index is empty");
+        fprintf(stderr, "IvfflatIndexSearch: the index is empty\n");
         return nullptr;
     }
 
@@ -470,8 +542,12 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
         case HNSW:
             conf[knowhere::indexparam::EF] = efs_nprobe;
             break;
+        case DISKANN:
+            conf[knowhere::indexparam::SEARCH_LIST_SIZE] = efs_nprobe;
+            conf[knowhere::indexparam::BEAMWIDTH] = 8;  // Default beamwidth
+            break;
         default:
-            elog(ERROR, "VectorIndexSearch: unsupported index type %d", type);
+            fprintf(stderr, "VectorIndexSearch: unsupported index type %d\n", type);
     }
 
     // generate query dataset
@@ -498,11 +574,11 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
     
-    // Static arrays to store last 1000 execution times
-    int interval = 10000;
-    static long execution_times[10000];
-    static int call_count = 0;
-    static int array_index = 0;
+    // Thread-local arrays to store last 10000 execution times (per thread)
+    int interval = 1000;
+    thread_local static long execution_times[1000];
+    thread_local static int call_count = 0;
+    thread_local static int array_index = 0;
     
     // Store current execution time
     execution_times[array_index] = duration.count();
@@ -523,7 +599,7 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
         }
         
         double avg_time = static_cast<double>(total_time) / (double)interval;
-        elog(DEBUG1, "[VectorIndexSearchImpl] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs", 
+        fprintf(stderr, "[VectorIndexSearchImpl] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs\n", 
              interval, avg_time, min_time, max_time);
     }
     // TODO: for evaluation (end here)
@@ -537,6 +613,7 @@ VectorIndexSearch(IndexType type, void *index_ptr, uint8_t *bitmap_ptr, uint32_t
     // fprintf(stderr, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
 
     knowhere::BitsetView bitset_view(bitmap_ptr, count);
+    // knowhere::BitsetView bitset_view(nullptr);
     return VectorIndexSearchImpl(type, index_ptr, bitset_view, count, query_vector, k, efs_nprobe);
 }
 
@@ -792,12 +869,138 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
             *indexPtr = static_cast<void*>(index);
             break;
         }
+        case DISKANN:
+        {
+            std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+            auto diskann_index_pack = knowhere::Pack(file_manager);
+            auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+                knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack).value();
+            
+            // For DiskANN, we need to set INDEX_PREFIX in the configuration
+            // The path format is: VECTOR_STORAGE_BASE_DIR + indexRelId + "/index_" + start_sid + "_" + end_sid + "_v" + version
+            // We need to extract indexRelId and construct the index_prefix
+            std::string path_str(path);
+            std::string base_dir(VECTOR_STORAGE_BASE_DIR);
+            
+            // Find the indexRelId in the path (the number after the base directory)
+            size_t base_dir_pos = path_str.find(base_dir);
+            if (base_dir_pos != std::string::npos) {
+                size_t relid_start = base_dir_pos + base_dir.length();
+                size_t relid_end = path_str.find('/', relid_start);
+                if (relid_end != std::string::npos) {
+                    std::string relid_str = path_str.substr(relid_start, relid_end - relid_start);
+                    // Construct index_prefix: VECTOR_STORAGE_BASE_DIR + indexRelId + "/diskann_index"
+                    std::string index_prefix = base_dir + relid_str + "/diskann_index";
+                    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+                    conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
+                    conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 0.0;
+                }
+            }
+            
+            read_index(kindex, path, conf);
+            auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
+            *indexPtr = static_cast<void*>(index);
+            break;
+        }
         default:
         {
             fprintf(stderr, "[IndexLoadAndSave] Unsupported index type\n");
             break;
         }
     }
+}
+
+// ------------------ DiskANN disk file management ------------------
+
+// Structure to hold file handle and metadata
+struct DiskANNFileHandle {
+    std::fstream fs;
+    std::string path;
+    uint32_t dim;
+    uint32_t num_vectors;
+    bool header_written;
+};
+
+extern "C" void*
+DiskANNCreateDataFile(const char* data_path, uint32_t dim)
+{
+    DiskANNFileHandle* handle = new DiskANNFileHandle();
+    handle->path = std::string(data_path);
+    handle->dim = dim;
+    handle->num_vectors = 0;
+    handle->header_written = false;
+    
+    // Open file for writing (binary mode)
+    handle->fs.open(handle->path, std::ios::out | std::ios::binary);
+    if (!handle->fs.is_open()) {
+        delete handle;
+        elog(ERROR, "[DiskANNCreateDataFile] Cannot open file for writing: %s", data_path);
+        return nullptr;
+    }
+    
+    // Write header: num_vectors (uint32_t), dim (uint32_t)
+    // We'll write num_vectors as 0 initially, and update it when closing
+    uint32_t num_vectors_placeholder = 0;
+    handle->fs.write(reinterpret_cast<const char*>(&num_vectors_placeholder), sizeof(uint32_t));
+    handle->fs.write(reinterpret_cast<const char*>(&dim), sizeof(uint32_t));
+    handle->header_written = true;
+    
+    return static_cast<void*>(handle);
+}
+
+extern "C" int
+DiskANNAddVectorsToFile(void* file_handle, const float* vectors, uint32_t num_vectors, uint32_t dim)
+{
+    if (file_handle == nullptr || vectors == nullptr) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] Invalid parameters");
+        return -1;
+    }
+    
+    DiskANNFileHandle* handle = static_cast<DiskANNFileHandle*>(file_handle);
+    
+    if (!handle->fs.is_open()) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] File is not open: %s", handle->path.c_str());
+        return -1;
+    }
+    
+    if (handle->dim != dim) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] Dimension mismatch: expected %u, got %u", handle->dim, dim);
+        return -1;
+    }
+    
+    // Write vectors to file
+    size_t vector_data_size = sizeof(float) * num_vectors * dim;
+    handle->fs.write(reinterpret_cast<const char*>(vectors), vector_data_size);
+    
+    if (!handle->fs.good()) {
+        elog(ERROR, "[DiskANNAddVectorsToFile] Failed to write vectors to file");
+        return -1;
+    }
+    
+    handle->num_vectors += num_vectors;
+    return 0;
+}
+
+extern "C" void
+DiskANNCloseDataFile(void* file_handle)
+{
+    if (file_handle == nullptr) {
+        return;
+    }
+    
+    DiskANNFileHandle* handle = static_cast<DiskANNFileHandle*>(file_handle);
+    
+    if (handle->fs.is_open()) {
+        // Update the num_vectors in the header
+        if (handle->header_written) {
+            handle->fs.seekp(0, std::ios::beg);
+            handle->fs.write(reinterpret_cast<const char*>(&handle->num_vectors), sizeof(uint32_t));
+        }
+        
+        handle->fs.close();
+    }
+    
+    delete handle;
 }
 
 // ------------------ brute scan implementation ------------------
@@ -827,9 +1030,9 @@ ComputeDistance(const float *a, const float *b, uint32_t dim)
 extern "C" topKVector*
 BruteForceSearch(const float* vectors, const float* query_vector, const uint8_t *bitmap, int count, int k, int dim)
 {
-    // TODO: for evaluation
-    // Timing instrumentation
-    auto start_time = std::chrono::high_resolution_clock::now();
+    // // TODO: for evaluation
+    // // Timing instrumentation
+    // auto start_time = std::chrono::high_resolution_clock::now();
 
     auto query_dataset = knowhere::GenDataSet(1, dim, query_vector);
     auto base_dataset = knowhere::GenDataSet(count, dim, vectors);
@@ -868,40 +1071,40 @@ BruteForceSearch(const float* vectors, const float* query_vector, const uint8_t 
         topk_result->vids = nullptr;
     }
 
-    // TODO: for evaluation
-    // Timing instrumentation - calculate and log execution time
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    // // TODO: for evaluation
+    // // Timing instrumentation - calculate and log execution time
+    // auto end_time = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
     
-    // Static arrays to store last 1000 execution times
-    int interval = 10000;
-    static long execution_times[10000];
-    static int call_count = 0;
-    static int array_index = 0;
+    // // Static arrays to store last 1000 execution times
+    // int interval = 10000;
+    // static long execution_times[10000];
+    // static int call_count = 0;
+    // static int array_index = 0;
     
-    // Store current execution time
-    execution_times[array_index] = duration.count();
-    array_index = (array_index + 1) % interval;
-    call_count++;
+    // // Store current execution time
+    // execution_times[array_index] = duration.count();
+    // array_index = (array_index + 1) % interval;
+    // call_count++;
     
-    // Log statistics every 1000 calls
-    if (call_count % interval == 0) {
-        long total_time = 0;
-        long min_time = LONG_MAX;
-        long max_time = 0;
+    // // Log statistics every 1000 calls
+    // if (call_count % interval == 0) {
+    //     long total_time = 0;
+    //     long min_time = LONG_MAX;
+    //     long max_time = 0;
         
-        // Calculate stats for the last 1000 calls
-        for (int i = 0; i < interval; i++) {
-            total_time += execution_times[i];
-            if (execution_times[i] < min_time) min_time = execution_times[i];
-            if (execution_times[i] > max_time) max_time = execution_times[i];
-        }
+    //     // Calculate stats for the last 1000 calls
+    //     for (int i = 0; i < interval; i++) {
+    //         total_time += execution_times[i];
+    //         if (execution_times[i] < min_time) min_time = execution_times[i];
+    //         if (execution_times[i] > max_time) max_time = execution_times[i];
+    //     }
         
-        double avg_time = static_cast<double>(total_time) / (double)interval;
-        elog(DEBUG1, "[BruteForceSearch] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs", 
-             interval, avg_time, min_time, max_time);
-    }
-    // TODO: for evaluation (end here)
+    //     double avg_time = static_cast<double>(total_time) / (double)interval;
+    //     elog(DEBUG1, "[BruteForceSearch] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs", 
+    //          interval, avg_time, min_time, max_time);
+    // }
+    // // TODO: for evaluation (end here)
     
     return topk_result;
 }
@@ -1348,7 +1551,6 @@ ConcurrentVectorSearchOnSegments(
     // Each task will run asynchronously in the thread pool
     // The last-finisher thread will handle merging, writing results, and setting the latch
     for (uint32_t i = 0; i < segment_count; i++) {
-        // elog(DEBUG1, "[ConcurrentVectorSearchOnSegments] launching search on segment %d", i);
         search_pool->push([ctx, i]() {
             knowhere::ThreadPool::ScopedSearchOmpSetter setter(1);  // Set OMP threads to 1 per task
             search_segment_task(ctx, i);
