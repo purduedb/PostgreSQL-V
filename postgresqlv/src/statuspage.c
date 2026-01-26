@@ -127,6 +127,8 @@ ReleaseStatusMemtable(Relation index, SegmentId sid)
                     Buffer tailPageBuf = ReadBuffer(index, tailPageNumber);
                     Page tailPage = BufferGetPage(tailPageBuf);
                     BlockNumber nextblkno = StatusPageGetOpaque(tailPage)->nextblkno;
+
+                    ReleaseBuffer(tailPageBuf);
                     
                     if (!BlockNumberIsValid(nextblkno))
                     {
@@ -742,6 +744,98 @@ GetStatusMemtableTids(Relation index, ForkNumber forkNum, SegmentId sid, int *nu
 
     *num_tids = count;
     return tids;
+}
+
+// TODO: improvement: handle in batch
+bool
+RemoveFromStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid, ItemPointerData tid)
+{
+    BlockNumber nextblkno = STATUS_MEMTABLE_ARRAY_BLKNO;
+    BlockNumber memtablePageHead = InvalidBlockNumber;
+    Buffer memtableArrayBuf = InvalidBuffer;
+    Buffer buf;
+    Page page;
+    GenericXLogState *state;
+    OffsetNumber maxoffno;
+    bool found_memtable = false;
+
+    /* Find the memtable with the given sid and get its page head */
+    while (BlockNumberIsValid(nextblkno) && !found_memtable)
+    {
+        buf = ReadBuffer(index, nextblkno);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buf);
+        maxoffno = PageGetMaxOffsetNumber(page);
+
+        for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+        {
+            ItemId iid = PageGetItemId(page, offno);
+            if (!ItemIdIsUsed(iid))
+                continue;
+
+            StatusMemtable mt;
+
+            mt = (StatusMemtable) PageGetItem(page, PageGetItemId(page, offno));
+            if (mt->sid == sid)
+            {
+                memtablePageHead = mt->memtablePageHead;
+                memtableArrayBuf = buf;  /* Keep locked to prevent ReleaseStatusMemtable */
+                found_memtable = true;
+                break;
+            }
+        }
+
+        if (!found_memtable)
+        {
+            nextblkno = StatusPageGetOpaque(page)->nextblkno;
+            UnlockReleaseBuffer(buf);
+        }
+    }
+
+    if (!found_memtable || !BlockNumberIsValid(memtablePageHead))
+    {
+        if (BufferIsValid(memtableArrayBuf))
+            UnlockReleaseBuffer(memtableArrayBuf);
+        return false;
+    }
+
+    /* Iterate through all pages of the memtable to find and remove the tid */
+    BlockNumber currentPage = memtablePageHead;
+    while (BlockNumberIsValid(currentPage))
+    {
+        buf = ReadBuffer(index, currentPage);
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+        state = GenericXLogStart(index);
+        page = GenericXLogRegisterBuffer(state, buf, 0);
+        maxoffno = PageGetMaxOffsetNumber(page);
+
+        for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+        {
+            ItemId iid = PageGetItemId(page, offno);
+            if (!ItemIdIsUsed(iid))
+                continue;
+
+            StatusTuple tuple;
+
+            tuple = (StatusTuple) PageGetItem(page, PageGetItemId(page, offno));
+            if (ItemPointerEquals(&tuple->t_tid, &tid))
+            {
+                PageIndexTupleDelete(page, offno);
+                GenericXLogFinish(state);
+                UnlockReleaseBuffer(buf);
+                UnlockReleaseBuffer(memtableArrayBuf);
+                return true;
+            }
+        }
+
+        currentPage = StatusPageGetOpaque(page)->nextblkno;
+        GenericXLogAbort(state);
+        UnlockReleaseBuffer(buf);
+    }
+
+    UnlockReleaseBuffer(memtableArrayBuf);
+    return false;
 }
 
 

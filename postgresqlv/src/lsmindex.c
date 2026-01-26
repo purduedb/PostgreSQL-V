@@ -20,6 +20,7 @@
 #include "access/tableam.h"
 #include "vector.h"
 #include "access/heapam.h"
+#include "portability/instr_time.h"
 
 LSMIndexBuffer *SharedLSMIndexBuffer = NULL;
 MemtableBuffer *SharedMemtableBuffer = NULL;
@@ -372,8 +373,12 @@ build_lsm_index(IndexType type, Relation index, void *vector_index, int64_t *tid
     pg_atomic_write_u32(&slot->lsmIndex.next_segment_id, START_SEGMENT_ID + 1);
 
     // serialize the index
-    void *index_bin_set;
-    IndexSerialize(vector_index, &index_bin_set);
+    // if the index type is Diskann, the index is already written to disk during building
+    void *index_bin_set = NULL;
+    if (type != DISKANN)
+    {
+        IndexSerialize(vector_index, &index_bin_set);
+    }
 
     // persist the index segment
     persist_index_segment(&slot->lsmIndex, START_SEGMENT_ID, START_SEGMENT_ID, count, tids, NULL, index_bin_set, type);
@@ -477,13 +482,21 @@ load_lsm_index(Relation index, uint32_t slot_idx)
     SegmentFileInfo files[MAX_SEGMENTS_COUNT];
     int file_count = scan_segment_metadata_files(index_relid, files, MAX_SEGMENTS_COUNT);
 
+    // Recovery - start timing
+    instr_time recovery_start_time;
+    INSTR_TIME_SET_CURRENT(recovery_start_time);
+
     // Recovery
     // For segments that include sids > max_memtable_sid, mark those vectors as deleted
     for (int i = file_count - 1; i >= 0; i--)
     {
+        // TODO: for debugging
+        elog(DEBUG1, "[load_lsm_index] In recovery step 1, checking segment %u-%u", files[i].start_sid, files[i].end_sid);
         // Check if this segment includes any sids greater than max_memtable_sid
         if (files[i].end_sid > max_memtable_sid)
         {
+            // TODO: for debugging
+            elog(DEBUG1, "[load_lsm_index] In recovery step 1, processing segment %u-%u", files[i].start_sid, files[i].end_sid);
             SegmentId start_sid_disk, end_sid_disk;
             uint32_t valid_rows;
             IndexType seg_index_type;
@@ -713,6 +726,13 @@ load_lsm_index(Relation index, uint32_t slot_idx)
             f_idx--;
         }
     }
+
+    // Recovery - end timing and output overhead
+    instr_time recovery_end_time;
+    INSTR_TIME_SET_CURRENT(recovery_end_time);
+    INSTR_TIME_SUBTRACT(recovery_end_time, recovery_start_time);
+    double recovery_overhead_ms = INSTR_TIME_GET_MILLISEC(recovery_end_time);
+    elog(DEBUG1, "[load_lsm_index] Recovery step 1&2 overhead: %.3f ms", recovery_overhead_ms);
     
     // Update SharedSegmentArray with segments from disk
     if (merge_worker_manager != NULL)
@@ -780,6 +800,10 @@ load_lsm_index(Relation index, uint32_t slot_idx)
     TupleTableSlot *heap_slot = table_slot_create(heap_rel, NULL);
 
     bool growing_memtable_allocated = false;
+
+    // Recovery - start timing
+    INSTR_TIME_SET_CURRENT(recovery_start_time);
+
     // Recovery step 3: construct the memtables
     for (int i = num_sids - 1; i >= 0; i--)
     {
@@ -846,6 +870,12 @@ load_lsm_index(Relation index, uint32_t slot_idx)
             }
         }
     }
+
+    // Recovery - end timing and output overhead
+    INSTR_TIME_SET_CURRENT(recovery_end_time);
+    INSTR_TIME_SUBTRACT(recovery_end_time, recovery_start_time);
+    recovery_overhead_ms = INSTR_TIME_GET_MILLISEC(recovery_end_time);
+    elog(DEBUG1, "[load_lsm_index] Recovery step 3 overhead: %.3f ms", recovery_overhead_ms);
 
     if (!growing_memtable_allocated) {
         // update the next_segment_id
@@ -1651,6 +1681,8 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                     {
                         // Vector is deleted, mark it in bitmap
                         SET_SLOT(mt->bitmap, i);
+                        // remove the tid from the status page
+                        RemoveFromStatusMemtable(index, MAIN_FORKNUM, mt->memtable_id, tid);
                         bitmap_changed = true;
                         stats->tuples_removed++;
                     }
@@ -1813,6 +1845,8 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                 {
                     // Vector is deleted, mark it in bitmap
                     SET_SLOT(mt->bitmap, j);
+                    // remove the tid from the status page
+                    RemoveFromStatusMemtable(index, MAIN_FORKNUM, mt->memtable_id, tid);
                     bitmap_changed = true;
                     stats->tuples_removed++;
                 }
@@ -1879,17 +1913,17 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
         }
     }
 
-    // step 3. vacuum the merged segments
+    // step 3. vacuum the flushed segments
     /*
-    * 1. iterate over all merged segments
-    * 2. for each merged segment, acquire the vacuum lock
-    * 3. load the bitmap and the mapping of the latest version of the merged segment
-    * 4. conduct vacuum on the merged segment to generate a new bitmap
-    * 5. flush the merged segment to disk
+    * 1. iterate over all flushed segments
+    * 2. for each flushed segment, acquire the vacuum lock
+    * 3. load the bitmap and the mapping of the latest version of the flushed segment
+    * 4. conduct vacuum on the flushed segment to generate a new bitmap
+    * 5. flush the flushed segment to disk
     * 6. notify the index worker to update the bitmap
-    * 7. release the vacuum lock of the merged segment
+    * 7. release the vacuum lock of the flushed segment
     */
-    // elog(DEBUG1, "[bulk_delete_lsm_index] step 3. vacuum the merged segments");
+    // elog(DEBUG1, "[bulk_delete_lsm_index] step 3. vacuum the flushed segments");
     {
         if (merge_worker_manager == NULL)
         {
@@ -1900,7 +1934,7 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
         
         LWLockAcquire(seg_array->lock, LW_SHARED);
         
-        // Maintain the largest segment ID that has been merged/vacuumed
+        // Maintain the largest segment ID that has been flushed/vacuumed
         // We guarantee to vacuum segments in ascending order
         SegmentId max_vacuumed_segment_id = 0;
         
@@ -2015,7 +2049,7 @@ bulk_delete_lsm_index(Relation index, IndexBulkDeleteResult *stats, IndexBulkDel
                     
                     // notify the index worker to update the bitmap (use VACUUM operation type)
                     segment_update_blocking(lsm_idx, indexRelId, SEGMENT_UPDATE_VACUUM, segment->start_sid, segment->end_sid);
-                    elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for merged segment %u", segment->start_sid);
+                    elog(DEBUG1, "[bulk_delete_lsm_index] notified the index worker to update the bitmap for flushed segment %u", segment->start_sid);
                 }
                 
                 // Cleanup
@@ -2186,14 +2220,14 @@ test_consistency(Relation heap_rel, LSMIndex lsm_index, int lsm_slot_idx)
                         CLEAR_SLOT(context[blkno].bitmap, idx);
                 }
                 else {
-                    if (ItemIdIsRedirected(itemId))
-                        elog(DEBUG1, "[test_consistency] redirected item id");
+                    // if (ItemIdIsRedirected(itemId))
+                    //     elog(DEBUG1, "[test_consistency] redirected item id");
 
-                    if (ItemIdIsDead(itemId))
-                        elog(DEBUG1, "[test_consistency] dead item id");
+                    // if (ItemIdIsDead(itemId))
+                    //     elog(DEBUG1, "[test_consistency] dead item id");
 
-                    if (!ItemIdIsUsed(itemId))
-                        elog(DEBUG1, "[test_consistency] unused item id, table pruning detected");
+                    // if (!ItemIdIsUsed(itemId))
+                    //     elog(DEBUG1, "[test_consistency] unused item id, table pruning detected");
                     CLEAR_SLOT(context[blkno].bitmap, idx);
                 }
             }

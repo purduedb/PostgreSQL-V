@@ -10,10 +10,7 @@
 
 #include "lsmindex.h"
 
-// Circular buffer to store last 100 execution times (for average calculation)
-static long execution_times[100];
-static int call_count = 0;
-static int buffer_index = 0;
+#include "portability/instr_time.h"
 
 /*
  * Get scan value

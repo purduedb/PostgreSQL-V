@@ -117,6 +117,9 @@
 #include "knowhere/comp/local_file_manager.h"
 #include <atomic>
 #include <memory>
+#include <thread>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
 
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
@@ -334,8 +337,6 @@ DiskANNIndexBuildFromFile(void* diskannIndexPtr, const char* data_path, const ch
     size_t last_slash = prefix_str.find_last_of('/');
     if (last_slash != std::string::npos) {
         std::string dir_path = prefix_str.substr(0, last_slash);
-        // Create directory (similar to fs::create_directories)
-        // For now, we'll let knowhere handle directory creation
     }
 
     // Configuration for DiskANN build
@@ -355,13 +356,7 @@ DiskANNIndexBuildFromFile(void* diskannIndexPtr, const char* data_path, const ch
         elog(ERROR, "[DiskANNIndexBuildFromFile] Failed to build DiskANN index");
         return -1;
     }
-
-    // Note: We do NOT deserialize here during build phase to avoid setting up
-    // thread contexts and AIO contexts (which can exhaust system resources with
-    // many CPU cores and cause hangs). The index will be deserialized when
-    // loaded for search operations in IndexLoadAndSave().
-    // The built index is already serialized and saved by build_lsm_index().
-
+    
     return 0;
 }
 
@@ -516,10 +511,6 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
 {
     // fprintf(stderr, "enter VectorIndexSearchImpl, type = %d, index_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, indexPtr, count, query_vector, k, efs_nprobe);
 
-    // TODO: for evaluation
-    // Timing instrumentation
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
     knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(indexPtr);
 
     if (index->Count() <= 0)
@@ -554,8 +545,16 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     int dim = index->Dim();
     auto dataset = knowhere::GenDataSet(1, dim, query_vector);
 
+    // TODO: for evaluation
+    // Timing instrumentation - measure only the actual search operation
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     // conduct search
+    knowhere::ThreadPool::ScopedSearchOmpSetter setter(8);  // Set OMP 
     auto res = index->Search(dataset, conf, bitset_view);
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
 
     // convert knowhere::Dataset to topKVector
     topKVector* topk_result = (topKVector *) malloc(sizeof(topKVector));
@@ -571,12 +570,10 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
 
     // TODO: for evaluation
     // Timing instrumentation - calculate and log execution time
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
     
     // Thread-local arrays to store last 10000 execution times (per thread)
-    int interval = 1000;
-    thread_local static long execution_times[1000];
+    int interval = 10000;
+    thread_local static long execution_times[10000];
     thread_local static int call_count = 0;
     thread_local static int array_index = 0;
     
@@ -585,13 +582,13 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     array_index = (array_index + 1) % interval;
     call_count++;
     
-    // Log statistics every 1000 calls
+    // Log statistics every 10000 calls
     if (call_count % interval == 0) {
         long total_time = 0;
         long min_time = LONG_MAX;
         long max_time = 0;
         
-        // Calculate stats for the last 1000 calls
+        // Calculate stats for the last 10000 calls
         for (int i = 0; i < interval; i++) {
             total_time += execution_times[i];
             if (execution_times[i] < min_time) min_time = execution_times[i];
@@ -876,28 +873,37 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
                 knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack).value();
             
-            // For DiskANN, we need to set INDEX_PREFIX in the configuration
-            // The path format is: VECTOR_STORAGE_BASE_DIR + indexRelId + "/index_" + start_sid + "_" + end_sid + "_v" + version
-            // We need to extract indexRelId and construct the index_prefix
+            // Construct DiskANN index prefix directly from path: "<path>_diskann"
             std::string path_str(path);
-            std::string base_dir(VECTOR_STORAGE_BASE_DIR);
+            std::string index_prefix = path_str + "_diskann";
+            conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+            conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
+            // TODO: make this configurable
+            conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 1.8f;
+            conf[knowhere::indexparam::BEAMWIDTH] = 8;
             
-            // Find the indexRelId in the path (the number after the base directory)
-            size_t base_dir_pos = path_str.find(base_dir);
-            if (base_dir_pos != std::string::npos) {
-                size_t relid_start = base_dir_pos + base_dir.length();
-                size_t relid_end = path_str.find('/', relid_start);
-                if (relid_end != std::string::npos) {
-                    std::string relid_str = path_str.substr(relid_start, relid_end - relid_start);
-                    // Construct index_prefix: VECTOR_STORAGE_BASE_DIR + indexRelId + "/diskann_index"
-                    std::string index_prefix = base_dir + relid_str + "/diskann_index";
-                    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-                    conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
-                    conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 0.0;
+            // Configure AIO context count to avoid hitting system limits
+            // Knowhere's DiskANN implementation initializes a global AioContextPool with 128 contexts by default.
+            // If you see "io_setup() failed; returned -11, errno=11: Resource temporarily unavailable" errors,
+            // it means the system doesn't have enough AIO resources. Solutions:
+            // 1. Increase system limit: sudo sysctl -w fs.aio-max-nr=1048576 (and add to /etc/sysctl.conf)
+            // 2. Set environment variable: export KNOWHERE_AIO_CONTEXT_NUM=32 (before starting PostgreSQL)
+            // 3. Check current usage: cat /proc/sys/fs/aio-nr /proc/sys/fs/aio-max-nr
+            const char* aio_context_num_env = getenv("KNOWHERE_AIO_CONTEXT_NUM");
+            if (aio_context_num_env != nullptr) {
+                int aio_context_num = atoi(aio_context_num_env);
+                if (aio_context_num > 0) {
+                    conf["aio_context_num"] = aio_context_num;
+                    elog(DEBUG1, "[IndexLoadAndSave] Setting AIO context num to %d (from KNOWHERE_AIO_CONTEXT_NUM env)", aio_context_num);
                 }
             }
+            // Note: The AioContextPool is initialized globally by knowhere when the first DiskANN index is loaded.
+            // If the parameter above doesn't work, you must increase fs.aio-max-nr system limit.
             
-            read_index(kindex, path, conf);
+            // TODO: for debugging
+            elog(DEBUG1, "[IndexLoadAndSave] index_prefix = %s", index_prefix.c_str());
+
+            kindex.Deserialize(knowhere::BinarySet(), conf); // For Diskann, the index does not have a binary set
             auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
             *indexPtr = static_cast<void*>(index);
             break;
@@ -978,6 +984,7 @@ DiskANNAddVectorsToFile(void* file_handle, const float* vectors, uint32_t num_ve
     }
     
     handle->num_vectors += num_vectors;
+    elog(DEBUG1, "[DiskANNAddVectorsToFile] Added %u vectors to file, total number of vectors = %u", num_vectors, handle->num_vectors);
     return 0;
 }
 
@@ -1456,10 +1463,7 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
     
     // Atomic countdown: decrement and check if we're the last one
     int remaining = ctx->remaining_count.fetch_sub(1) - 1;
-
     if (remaining == 0) {
-        // fprintf(stderr, "search_segment_task: we are the last thread to finish, seg_idx = %d\n", seg_idx);
-
         // We are the last thread to finish - merge results, write to result structure, and set latch
         merge_all_segment_results(ctx);
         // Write results to the result structure
@@ -1481,7 +1485,6 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
         if (ctx->result_info && ctx->result_info->client_proc) {
             SetLatch(&ctx->result_info->client_proc->procLatch);
         }
-        
         // Free the context and all its sub-structures (allocated with malloc)
         if (ctx->final_pairs) {
             free(ctx->final_pairs);
@@ -1499,6 +1502,16 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
     }
 }
 
+// Global singleton executor for outer search fan-out
+// This is separate from Knowhere's internal thread pool to avoid conflicts
+static folly::CPUThreadPoolExecutor& GetPgOuterSearchExecutor() {
+    static folly::CPUThreadPoolExecutor exec(
+        /*numThreads=*/std::max(1u, std::thread::hardware_concurrency() / 2),
+        std::make_shared<folly::NamedThreadFactory>("pg_outer_search")
+    );
+    return exec;
+}
+
 // C wrapper function for concurrent vector search
 extern "C" void
 ConcurrentVectorSearchOnSegments(
@@ -1510,8 +1523,8 @@ ConcurrentVectorSearchOnSegments(
     VectorSearchResult result,
     PGPROC* client_proc,
     FlushedSegmentPool* pool) {
-    // Get the global search thread pool
-    auto search_pool = knowhere::ThreadPool::GetGlobalSearchThreadPool();
+    // Get the dedicated outer search executor (separate from Knowhere's internal pool)
+    auto& exec = GetPgOuterSearchExecutor();
 
     // Allocate context structure using malloc (thread-safe allocation)
     ConcurrentSearchContext* ctx = (ConcurrentSearchContext*) 
@@ -1547,12 +1560,12 @@ ConcurrentVectorSearchOnSegments(
         ctx->segment_results[i].searched = false;
     }
 
-    // Launch concurrent searches on all segments using the thread pool
-    // Each task will run asynchronously in the thread pool
+    // Launch concurrent searches on all segments using the dedicated outer executor
+    // Each task will run asynchronously in the executor
     // The last-finisher thread will handle merging, writing results, and setting the latch
     for (uint32_t i = 0; i < segment_count; i++) {
-        search_pool->push([ctx, i]() {
-            knowhere::ThreadPool::ScopedSearchOmpSetter setter(1);  // Set OMP threads to 1 per task
+        exec.add([ctx, i]() {
+            // knowhere::ThreadPool::ScopedSearchOmpSetter setter(1);  // Set OMP threads to 1 per task
             search_segment_task(ctx, i);
         });
     }

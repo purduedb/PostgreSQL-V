@@ -730,8 +730,11 @@ flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
     elog(DEBUG1, "[flush_segment_to_disk] Writing segment with version %u (previous: %u)", new_version, latest_version);
 
     // index file - write with new version
-    GetLSMIndexFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
-    IndexBinarySetFlush(file_path, prep->index_bin);
+    if (prep->index_bin != NULL) // if the index type is Diskann, the index is already written to disk during building
+    {
+        GetLSMIndexFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
+        IndexBinarySetFlush(file_path, prep->index_bin);
+    }
 
     // bitmap file - write with new version (include delete_count)
     GetLSMBitmapFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);

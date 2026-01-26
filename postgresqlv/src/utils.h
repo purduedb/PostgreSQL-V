@@ -29,8 +29,8 @@ typedef struct topKVector {
 void free_topk_vector(topKVector *tkv);
 
 // for index building
-#define INDEX_BUILD_BATCH 1000000
-#define DEFAULT_TIDS_SIZE 1000000
+#define INDEX_BUILD_BATCH 200000
+#define DEFAULT_TIDS_SIZE 200000
 
 typedef struct VectorArrayData
 {

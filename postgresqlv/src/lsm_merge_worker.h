@@ -10,9 +10,9 @@
 #define MERGE_DELETION_RATIO_THRESHOLD 0.3f  // 30% deletion ratio threshold
 #define MAX_MERGE_WORKERS 4                  // Maximum number of merge workers
 #define MERGE_TASK_QUEUE_SIZE 1024           // Size of merge task queue
-#define MAX_SEGMENTS_SIZE 10000000            // The max number of vectors in a segment, the segment will not be merged if the number of vectors is larger than this value
+#define MAX_SEGMENTS_SIZE 5000000            // The max number of vectors in a segment, the segment will not be merged if the number of vectors is larger than or equal to this value
 #define THRESHOLD_SMALL_SEGMENT_SIZE 1000000   // The min number of vectors in a segment, the segment will be merged if the number of vectors is smaller than this value
-#define MERGE_WORKERS_COUNT 1                  // number of merge workers
+#define MERGE_WORKERS_COUNT 2                  // number of merge workers
 
 // LWLock tranche for merge segment bitmap locks
 #define LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE "LSM Merge Segment Bitmap"

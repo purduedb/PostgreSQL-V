@@ -98,12 +98,12 @@ prepare_for_flushing(LSMIndex lsm, int slot_idx, ConcurrentMemTable mt, PrepareF
     prep->start_sid = mt->memtable_id;
     prep->end_sid = mt->memtable_id;
     prep->valid_rows = valid;
-    prep->index_type = FLAT;
+    prep->index_type = HNSW;
 
     // build hnsw type index on the segment
     // TODO: tune the parameters
     void *vector_index;
-    IndexBuild(prep->index_type, mt, valid, &vector_index, 16, 100, (int)sqrt(MEMTABLE_MAX_CAPACITY));
+    IndexBuild(prep->index_type, mt, valid, &vector_index, 32, 200, (int)sqrt(MEMTABLE_MAX_CAPACITY));
 
     // serialize and flush the flat vector index
     IndexSerialize(vector_index, &prep->index_bin);

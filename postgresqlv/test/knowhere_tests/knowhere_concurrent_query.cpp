@@ -28,7 +28,6 @@ namespace fs = std::experimental::filesystem;
 #include "knowhere/bitsetview.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/binaryset.h"
-#include "knowhere/comp/local_file_manager.h"
 #include "knowhere/object.h"
 
 // Index serialization helpers
@@ -309,22 +308,6 @@ struct BvecsReader {
     }
 };
 
-// Helper function to write raw data to disk in binary format for DiskANN
-static void
-write_raw_data_to_disk(const std::string& data_path, const float* raw_data, int64_t num, int dim) {
-    std::ofstream writer(data_path, std::ios::binary);
-    if (!writer.is_open()) {
-        throw std::runtime_error("Cannot open file for writing: " + data_path);
-    }
-    uint32_t num_u32 = static_cast<uint32_t>(num);
-    uint32_t dim_u32 = static_cast<uint32_t>(dim);
-    writer.write(reinterpret_cast<const char*>(&num_u32), sizeof(uint32_t));
-    writer.write(reinterpret_cast<const char*>(&dim_u32), sizeof(uint32_t));
-    uint64_t size = sizeof(float) * num * dim;
-    writer.write(reinterpret_cast<const char*>(raw_data), size);
-    writer.close();
-}
-
 struct IvecsReader {
     std::ifstream file;
     int k;
@@ -430,9 +413,7 @@ void query_worker(
     int k,
     int ef_search,
     int nprobe,
-    int search_list_size,
     bool is_hnsw,
-    bool is_diskann,
     std::atomic<bool>& stop_flag
 ) {
     knowhere::BitsetView bitset_view(nullptr);
@@ -470,10 +451,7 @@ void query_worker(
         knowhere::Json conf;
         conf[knowhere::meta::TOPK] = k;
         conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-        if (is_diskann) {
-            conf[knowhere::indexparam::SEARCH_LIST_SIZE] = search_list_size;
-            conf[knowhere::indexparam::BEAMWIDTH] = 8;  // Default beamwidth
-        } else if (is_hnsw) {
+        if (is_hnsw) {
             conf[knowhere::indexparam::EF] = ef_search;
         } else {
             conf[knowhere::indexparam::NPROBE] = nprobe;
@@ -574,20 +552,15 @@ int main(int argc, char* argv[]) {
                   << "  base_file: Path to .fvecs or .bvecs file for building index\n"
                   << "  query_file: Path to .fvecs or .bvecs file for queries\n"
                   << "  ground_truth_file: Path to .ivecs file for ground truth\n"
-                  << "  index_type: 'hnsw', 'ivfflat', or 'diskann'\n"
+                  << "  index_type: 'hnsw' or 'ivfflat'\n"
                   << "  num_threads: Number of concurrent query threads\n"
                   << "  k: Top-k for search\n"
-                  << "  ef_search/nprobe/search_list_size: ef_search for HNSW, nprobe for IVFFLAT, or search_list_size for DiskANN (single value or comma-separated list)\n"
+                  << "  ef_search/nprobe: ef_search for HNSW, nprobe for IVFFLAT (single value or comma-separated list)\n"
                   << "Options:\n"
                   << "  --use-bvecs: Use .bvecs format (default: .fvecs)\n"
                   << "  --M <value>: HNSW M parameter (default: 16)\n"
                   << "  --ef-construction <value>: HNSW ef_construction (default: 64)\n"
                   << "  --nlist <value>: IVFFLAT nlist parameter (default: 100)\n"
-                  << "  --max-degree <value>: DiskANN max_degree parameter (default: 56)\n"
-                  << "  --pq-code-budget-gb <value>: DiskANN pq_code_budget_gb parameter (default: auto-calculated)\n"
-                  << "  --build-dram-budget-gb <value>: DiskANN build_dram_budget_gb parameter (default: 32.0)\n"
-                  << "  --beamwidth <value>: DiskANN beamwidth parameter (default: 8)\n"
-                  << "  --index-prefix <path>: DiskANN index prefix directory (required for diskann)\n"
                   << "  --base-skip <value>: Skip N vectors from base file before reading (default: 0)\n"
                   << "  --base-num <value>: Number of vectors to read from base file (default: all)\n"
                   << "  --query-skip <value>: Skip N queries from query file before reading (default: 0)\n"
@@ -621,7 +594,7 @@ int main(int argc, char* argv[]) {
     }
     
     if (ef_search_nprobe_list.empty()) {
-        std::cerr << "Error: At least one ef_search/nprobe/search_list_size value must be specified\n";
+        std::cerr << "Error: At least one ef_search/nprobe value must be specified\n";
         return 1;
     }
     
@@ -629,11 +602,6 @@ int main(int argc, char* argv[]) {
     int M = 16;
     int ef_construction = 40;
     int nlist = 100;
-    int max_degree = 56;  // DiskANN default
-    double pq_code_budget_gb = -1.0;  // Auto-calculate if not specified
-    double build_dram_budget_gb = 32.0;  // DiskANN default
-    int beamwidth = 8;  // DiskANN default
-    std::string index_prefix;  // Required for DiskANN
     int64_t base_skip = 0;
     int64_t base_num = -1;
     int64_t query_skip = 0;
@@ -654,16 +622,6 @@ int main(int argc, char* argv[]) {
             ef_construction = std::stoi(argv[++i]);
         } else if (arg == "--nlist" && i + 1 < argc) {
             nlist = std::stoi(argv[++i]);
-        } else if (arg == "--max-degree" && i + 1 < argc) {
-            max_degree = std::stoi(argv[++i]);
-        } else if (arg == "--pq-code-budget-gb" && i + 1 < argc) {
-            pq_code_budget_gb = std::stod(argv[++i]);
-        } else if (arg == "--build-dram-budget-gb" && i + 1 < argc) {
-            build_dram_budget_gb = std::stod(argv[++i]);
-        } else if (arg == "--beamwidth" && i + 1 < argc) {
-            beamwidth = std::stoi(argv[++i]);
-        } else if (arg == "--index-prefix" && i + 1 < argc) {
-            index_prefix = argv[++i];
         } else if (arg == "--base-skip" && i + 1 < argc) {
             base_skip = std::stoll(argv[++i]);
         } else if (arg == "--base-num" && i + 1 < argc) {
@@ -693,15 +651,9 @@ int main(int argc, char* argv[]) {
     
     bool is_hnsw = (index_type == "hnsw");
     bool is_ivfflat = (index_type == "ivfflat");
-    bool is_diskann = (index_type == "diskann");
     
-    if (!is_hnsw && !is_ivfflat && !is_diskann) {
-        std::cerr << "Error: index_type must be 'hnsw', 'ivfflat', or 'diskann'\n";
-        return 1;
-    }
-    
-    if (is_diskann && index_prefix.empty() && load_index_path.empty()) {
-        std::cerr << "Error: --index-prefix is required for DiskANN index type\n";
+    if (!is_hnsw && !is_ivfflat) {
+        std::cerr << "Error: index_type must be 'hnsw' or 'ivfflat'\n";
         return 1;
     }
     
@@ -721,20 +673,6 @@ int main(int argc, char* argv[]) {
         std::cout << "\n";
         std::cout << "M: " << M << "\n";
         std::cout << "ef_construction: " << ef_construction << "\n";
-    } else if (is_diskann) {
-        std::cout << "search_list_size values: ";
-        for (size_t i = 0; i < ef_search_nprobe_list.size(); i++) {
-            std::cout << ef_search_nprobe_list[i];
-            if (i < ef_search_nprobe_list.size() - 1) std::cout << ", ";
-        }
-        std::cout << "\n";
-        std::cout << "max_degree: " << max_degree << "\n";
-        std::cout << "beamwidth: " << beamwidth << "\n";
-        std::cout << "build_dram_budget_gb: " << build_dram_budget_gb << "\n";
-        if (pq_code_budget_gb > 0) {
-            std::cout << "pq_code_budget_gb: " << pq_code_budget_gb << "\n";
-        }
-        std::cout << "index_prefix: " << index_prefix << "\n";
     } else {
         std::cout << "nprobe values: ";
         for (size_t i = 0; i < ef_search_nprobe_list.size(); i++) {
@@ -852,16 +790,6 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 loaded_index = idx.value();
-            } else if (is_diskann) {
-                std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
-                auto diskann_index_pack = knowhere::Pack(file_manager);
-                auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
-                    knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack);
-                if (!idx.has_value()) {
-                    std::cerr << "Error creating DiskANN index\n";
-                    return 1;
-                }
-                loaded_index = idx.value();
             } else {
                 auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
                     knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version);
@@ -874,13 +802,6 @@ int main(int argc, char* argv[]) {
             
             knowhere::Json conf;
             conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-            if (is_diskann) {
-                if (index_prefix.empty()) {
-                    std::cerr << "Error: --index-prefix is required when loading DiskANN index\n";
-                    return 1;
-                }
-                conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
-            }
             
             try {
                 read_index(loaded_index, load_index_path, conf);
@@ -968,16 +889,6 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             index = idx.value();
-        } else if (is_diskann) {
-            std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
-            auto diskann_index_pack = knowhere::Pack(file_manager);
-            auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
-                knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack);
-            if (!idx.has_value()) {
-                std::cerr << "Error creating DiskANN index\n";
-                return 1;
-            }
-            index = idx.value();
         } else {
             auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
                 knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version);
@@ -995,107 +906,14 @@ int main(int argc, char* argv[]) {
         if (is_hnsw) {
             conf[knowhere::indexparam::M] = M;
             conf[knowhere::indexparam::EFCONSTRUCTION] = ef_construction;
-        } else if (is_diskann) {
-            // DiskANN requires data to be written to disk first
-            std::string data_path = index_prefix + "_data.bin";
-            std::cout << "Writing base vectors to disk: " << data_path << "\n";
-            
-            // We'll write data in batches as we load it
-            // For now, we need to collect all vectors first for DiskANN
-            std::cout << "Note: DiskANN requires all vectors to be written to disk before building.\n";
-            std::cout << "Loading all vectors first...\n";
-            
-            // Load all vectors
-            std::vector<std::vector<float>> all_vectors;
-            if (use_bvecs) {
-                BvecsReader reader(base_file);
-                reader.read_all_vectors(all_vectors, base_skip, total_vectors_to_load, true);
-            } else {
-                FvecsReader reader(base_file);
-                reader.read_all_vectors(all_vectors, base_skip, total_vectors_to_load, true);
-            }
-            
-            // Flatten and write to disk
-            int64_t num_vectors = static_cast<int64_t>(all_vectors.size());
-            std::vector<float> flat_data(num_vectors * dim);
-            for (int64_t i = 0; i < num_vectors; i++) {
-                std::memcpy(flat_data.data() + i * dim, all_vectors[i].data(), dim * sizeof(float));
-            }
-            
-            write_raw_data_to_disk(data_path, flat_data.data(), num_vectors, dim);
-            std::cout << "Wrote " << num_vectors << " vectors to disk\n";
-            
-            // Create index directory if needed
-            fs::path prefix_path(index_prefix);
-            fs::create_directories(prefix_path.parent_path());
-            
-            conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
-            conf[knowhere::meta::DATA_PATH] = data_path;
-            conf[knowhere::indexparam::MAX_DEGREE] = max_degree;
-            conf[knowhere::indexparam::SEARCH_LIST_SIZE] = ef_search_nprobe_list[0];  // Use first value for build
-            if (pq_code_budget_gb < 0) {
-                // Auto-calculate: 0.125 * raw data size
-                pq_code_budget_gb = sizeof(float) * dim * num_vectors * 0.125 / (1024.0 * 1024.0 * 1024.0);
-            }
-            conf[knowhere::indexparam::PQ_CODE_BUDGET_GB] = pq_code_budget_gb;
-            conf[knowhere::indexparam::BUILD_DRAM_BUDGET_GB] = build_dram_budget_gb;
-            
-            // For DiskANN, build directly (data already on disk)
-            std::cout << "Building DiskANN index...";
-            std::cout.flush();
-            knowhere::DataSetPtr ds_ptr = nullptr;
-            auto build_res = index.Build(ds_ptr, conf);
-            if (build_res != knowhere::Status::success) {
-                std::cerr << "\nError building DiskANN index\n";
-                return 1;
-            }
-            std::cout << " done\n";
-            
-            auto end_build = std::chrono::high_resolution_clock::now();
-            double build_time = std::chrono::duration<double>(end_build - start_build).count();
-            std::cout << "Index built in " << std::fixed << std::setprecision(4) << build_time << " seconds\n";
-            std::cout << "Index count: " << index.Count() << "\n";
-            
-            // Validate that index is not empty
-            if (index.Count() <= 0) {
-                std::cerr << "ERROR: DiskANN index is empty after building! Index count is " << index.Count() << "\n";
-                std::cerr << "This will cause all queries to return no results (recall = 0.0000).\n";
-                std::cerr << "Please check:\n";
-                std::cerr << "  - Data file: " << data_path << "\n";
-                std::cerr << "  - Index prefix: " << index_prefix << "\n";
-                std::cerr << "  - DiskANN build parameters\n";
-                return 1;
-            }
-            
-            // Deserialize to prepare for search
-            knowhere::BinarySet binset;
-            index.Serialize(binset);
-            knowhere::Json deserialize_conf;
-            deserialize_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-            deserialize_conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
-            deserialize_conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 0.0;
-            index.Deserialize(binset, deserialize_conf);
-            
-            // Save index if requested
-            if (!save_index_path.empty()) {
-                std::cout << "Saving index to: " << save_index_path << "\n";
-                try {
-                    write_index(index, save_index_path);
-                    std::cout << "Index saved successfully\n";
-                } catch (const std::exception& e) {
-                    std::cerr << "Error saving index: " << e.what() << "\n";
-                    return 1;
-                }
-            }
-            std::cout << "\n";
         } else {
             // IVFFLAT specific configuration
             conf[knowhere::indexparam::NLIST] = nlist;
         }
         
-        // Load and add vectors in batches (skip for DiskANN, already done)
-        if (!is_diskann) {
-            // Open file readers for non-DiskANN indices
+        // Load and add vectors in batches
+        {
+            // Open file readers
             std::unique_ptr<FvecsReader> fvecs_reader;
             std::unique_ptr<BvecsReader> bvecs_reader;
             
@@ -1346,7 +1164,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             std::cout << "\n";
-            }  // End of if (!is_diskann)
+        }  // End of batch loading
     }  // End of if (load_index_path.empty() || !index_loaded)
     
     // Step 3: Load queries
@@ -1399,9 +1217,9 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Index validation: Index contains " << index.Count() << " vectors, ready for queries\n\n";
     
-    // Step 5: Run queries for each ef_search/nprobe/search_list_size value
+    // Step 5: Run queries for each ef_search/nprobe value
     std::cout << "Step 5: Running queries for " << ef_search_nprobe_list.size() << " different " 
-              << (is_hnsw ? "ef_search" : (is_diskann ? "search_list_size" : "nprobe")) << " value(s)...\n\n";
+              << (is_hnsw ? "ef_search" : "nprobe") << " value(s)...\n\n";
     
     // Store results for each ef_search/nprobe value
     std::vector<std::pair<int, std::vector<std::vector<int64_t>>>> all_results;
@@ -1417,7 +1235,7 @@ int main(int argc, char* argv[]) {
         int ef_search_nprobe = ef_search_nprobe_list[ef_idx];
         
         std::cout << "========================================\n";
-        std::cout << "Running queries with " << (is_hnsw ? "ef_search" : (is_diskann ? "search_list_size" : "nprobe")) 
+        std::cout << "Running queries with " << (is_hnsw ? "ef_search" : "nprobe") 
                   << " = " << ef_search_nprobe << " (" << (ef_idx + 1) << "/" 
                   << ef_search_nprobe_list.size() << ")\n";
         std::cout << "========================================\n";
@@ -1451,9 +1269,7 @@ int main(int argc, char* argv[]) {
                                k,
                                ef_search_nprobe,
                                ef_search_nprobe,
-                               ef_search_nprobe,  // search_list_size for DiskANN
                                is_hnsw,
-                               is_diskann,
                                std::ref(stop_flag));
         }
         
@@ -1521,11 +1337,11 @@ int main(int argc, char* argv[]) {
         all_stats.push_back({ef_search_nprobe, snapshot});
     }
     
-    // Step 6: Summary for all ef_search/nprobe/search_list_size values
+    // Step 6: Summary for all ef_search/nprobe values
     std::cout << "\n========================================\n";
-    std::cout << "SUMMARY FOR ALL " << (is_hnsw ? "EF_SEARCH" : (is_diskann ? "SEARCH_LIST_SIZE" : "NPROBE")) << " VALUES << (CONCURRENCY = " << num_threads << ")\n";
+    std::cout << "SUMMARY FOR ALL " << (is_hnsw ? "EF_SEARCH" : "NPROBE") << " VALUES (CONCURRENCY = " << num_threads << ")\n";
     std::cout << "========================================\n";
-    std::cout << std::left << std::setw(12) << (is_hnsw ? "ef_search" : (is_diskann ? "search_ls" : "nprobe"))
+    std::cout << std::left << std::setw(12) << (is_hnsw ? "ef_search" : "nprobe")
               << std::setw(12) << "Recall@" << std::to_string(k)
               << std::setw(18) << "Avg Query Time"
               << std::setw(18) << "Throughput (q/s)" << "\n";
@@ -1559,14 +1375,14 @@ int main(int argc, char* argv[]) {
 // Build HNSW index and save it (with custom M and ef_construction)
 // ./knowhere_concurrent_query /ssd_root/dataset/sift/bigann_base.bvecs \
 // /ssd_root/dataset/sift/bigann_query.bvecs /ssd_root/dataset/sift/gnd/idx_10M.ivecs \
-// hnsw 1 100  "100,200,300,400,500,600,700,800" \
+// hnsw 1 100  "100,200,300,400,500,600,700,800,900,1000" \
 //     --use-bvecs --base-num 10000000 --M 16 --ef-construction 40 \
 //     --save-index /ssd_root/liu4127/knowhere_indexes/hnsw_sift10M_index.idxls
 
 // Load existing index (much faster, skips building)
 // ./knowhere_concurrent_query /ssd_root/dataset/sift/bigann_base.bvecs \
 // /ssd_root/dataset/sift/bigann_query.bvecs /ssd_root/dataset/sift/gnd/idx_10M.ivecs \
-// hnsw 1 100  "100,200,300,400,500,600,700,800" \
+// hnsw 1 100  "100,200,300,400,500,600,700,800,900,1000" \
 //     --use-bvecs --load-index /ssd_root/liu4127/knowhere_indexes/hnsw_sift10M_index.idxls
 
 // Build IVFFLAT index with different parameters and save
@@ -1575,18 +1391,3 @@ int main(int argc, char* argv[]) {
 // ivfflat 1 100 "10,20,50,100" \
 //     --use-bvecs --base-num 10000000 --nlist 3162 \
 //     --save-index /ssd_root/liu4127/knowhere_indexes/ivfflat_sift10M_index.idx
-
-// Build DiskANN index and save it
-// ./knowhere_concurrent_query /ssd_root/dataset/sift/bigann_base.bvecs \
-// /ssd_root/dataset/sift/bigann_query.bvecs /ssd_root/dataset/sift/gnd/idx_10M.ivecs \
-// diskann 1 100 "100,200,300,400" \
-//     --use-bvecs --base-num 10000000 --max-degree 56 --beamwidth 8 \
-//     --index-prefix /ssd_root/liu4127/knowhere_indexes/diskann_sift10M \
-//     --save-index /ssd_root/liu4127/knowhere_indexes/diskann_sift10M_index.idx
-
-// Load existing DiskANN index (much faster, skips building)
-// ./knowhere_concurrent_query /ssd_root/dataset/sift/bigann_base.bvecs \
-// /ssd_root/dataset/sift/bigann_query.bvecs /ssd_root/dataset/sift/gnd/idx_10M.ivecs \
-// diskann 1 100 "100,200,300,400" \
-//     --use-bvecs --load-index /ssd_root/liu4127/knowhere_indexes/diskann_sift10M_index.idx \
-//     --index-prefix /ssd_root/liu4127/knowhere_indexes/diskann_sift10M

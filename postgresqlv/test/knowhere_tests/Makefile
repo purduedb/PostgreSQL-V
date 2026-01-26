@@ -1,4 +1,4 @@
-# Makefile for knowhere_concurrent_query test
+# Makefile for knowhere test programs
 
 CXX = g++
 CXXFLAGS = -std=c++17 -O3 -march=native -fopenmp -pthread
@@ -26,16 +26,23 @@ CPPFLAGS = $(KNOWHERE_INC) $(NLOHMANN_INC) $(FOLLY_INC) $(GLOG_INC) -DGLOG_NO_AB
 LDFLAGS = $(KNOWHERE_LIBS) $(FOLLY_LIB) $(GLOG_LIB) -lgflags -lpthread -lstdc++ -lc -lblas -fopenmp \
           -Wl,-rpath,$(KNOWHERE_LIBDIR) -Wl,-rpath,$(GLOG_LIBDIR)
 
-TARGET = knowhere_concurrent_query
-SOURCE = knowhere_concurrent_query.cpp
+# Targets
+TARGET_CONCURRENT = knowhere_concurrent_query
+SOURCE_CONCURRENT = knowhere_concurrent_query.cpp
 
-all: $(TARGET)
+TARGET_DISKANN = knowhere_diskann
+SOURCE_DISKANN = knowhere_diskann.cpp
 
-$(TARGET): $(SOURCE)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $(TARGET) $(SOURCE) $(LDFLAGS)
+all: $(TARGET_CONCURRENT) $(TARGET_DISKANN)
+
+$(TARGET_CONCURRENT): $(SOURCE_CONCURRENT)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $(TARGET_CONCURRENT) $(SOURCE_CONCURRENT) $(LDFLAGS)
+
+$(TARGET_DISKANN): $(SOURCE_DISKANN)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $(TARGET_DISKANN) $(SOURCE_DISKANN) $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET_CONCURRENT) $(TARGET_DISKANN)
 
 .PHONY: all clean
 

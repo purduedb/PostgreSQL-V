@@ -334,10 +334,10 @@ rebuild_index(MergeTaskData *task, IndexType target_type)
         return;
     }
     
-    // TODO: make the parameters configurable
+    // TODO: get the parameters from the index metadata
     // Default parameters for new index (could be made configurable)
-    int M = 16;                    // HNSW M parameter
-    int efConstruction = 200;      // HNSW efConstruction parameter
+    int M = 32;                    // HNSW M parameter
+    int efConstruction = 400;      // HNSW efConstruction parameter
     int lists = 1024;              // IVFFLAT nlist parameter
     
     // Call MergeIndex to rebuild with bitmap filtering
@@ -766,8 +766,8 @@ merge_adjacent_segments(MergeTaskData *task)
 static bool
 claim_merge_task(int worker_id, int lsm_idx, uint32_t segment_idx0, uint32_t segment_idx1, int task_type)
 {
-    elog(DEBUG1, "enter claim_merge_task for worker %d, lsm_idx = %d, segment_idx0 = %u, segment_idx1 = %u, task_type = %d", 
-         worker_id, lsm_idx, segment_idx0, segment_idx1, task_type);
+    // elog(DEBUG1, "enter claim_merge_task for worker %d, lsm_idx = %d, segment_idx0 = %u, segment_idx1 = %u, task_type = %d", 
+    //      worker_id, lsm_idx, segment_idx0, segment_idx1, task_type);
 
     SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
     LWLockAcquire(seg_array->lock, LW_EXCLUSIVE);
@@ -832,6 +832,8 @@ claim_merge_task(int worker_id, int lsm_idx, uint32_t segment_idx0, uint32_t seg
     }
     merge_worker_manager->workers[worker_id].current_task.start_time = GetCurrentTimestamp();
     merge_worker_manager->workers[worker_id].current_task.lsm_idx = lsm_idx;
+    elog(DEBUG1, "claim_merge_task: successfully claimed task for worker %d, lsm_idx = %d, segment_idx0 = %u, segment_idx1 = %u, task_type = %d", 
+         worker_id, lsm_idx, segment_idx0, segment_idx1, task_type);
     return true;
 }
 
@@ -1005,7 +1007,7 @@ choose_adjacent_smaller(SharedSegmentArray *seg_array, uint32_t idx, uint32_t *c
  * 2) vec_count <= MEMTABLE_MAX_CAPACITY => SEGMENT_UPDATE_MERGE with adjacent smaller
  * 3) deletion_ratio > MERGE_DELETION_RATIO_THRESHOLD => SEGMENT_UPDATE_REBUILD_DELETION
  * 4) vec_count <= THRESHOLD_SMALL_SEGMENT_SIZE => SEGMENT_UPDATE_MERGE with adjacent smaller
- * 5) vec_count <= MAX_SEGMENTS_SIZE => SEGMENT_UPDATE_MERGE with adjacent smaller
+ * 5) vec_count < MAX_SEGMENTS_SIZE => SEGMENT_UPDATE_MERGE with adjacent smaller
  */
 // Helper function to traverse and check segments for a specific priority
 static bool
@@ -1051,7 +1053,13 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
                 {
                     if (choose_adjacent_smaller(seg_array, cur, &adj_segment))
                     {
-                        should_claim = true;
+                        // Check that adjacent segment doesn't exceed or equal to MAX_SEGMENTS_SIZE
+                        // and combined size doesn't exceed or equal to MAX_SEGMENTS_SIZE
+                        if (seg_array->segments[adj_segment].vec_count < MAX_SEGMENTS_SIZE &&
+                            seg_array->segments[cur].vec_count + seg_array->segments[adj_segment].vec_count < MAX_SEGMENTS_SIZE)
+                        {
+                            should_claim = true;
+                        }
                     }
                 }
                 break;
@@ -1072,12 +1080,18 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
                 {
                     if (choose_adjacent_smaller(seg_array, cur, &adj_segment))
                     {
-                        should_claim = true;
+                        // Check that adjacent segment doesn't exceed or equal to MAX_SEGMENTS_SIZE
+                        // and combined size doesn't exceed or equal to MAX_SEGMENTS_SIZE
+                        if (seg_array->segments[adj_segment].vec_count < MAX_SEGMENTS_SIZE &&
+                            seg_array->segments[cur].vec_count + seg_array->segments[adj_segment].vec_count < MAX_SEGMENTS_SIZE)
+                        {
+                            should_claim = true;
+                        }
                     }
                 }
                 break;
                 
-            case 5: // vec_count <= MAX_SEGMENTS_SIZE
+            case 5: // vec_count < MAX_SEGMENTS_SIZE
                 // Skip DiskANN indices - they don't support incremental updates/merges
                 if (seg_array->segments[cur].index_type == DISKANN)
                     break;
@@ -1085,7 +1099,13 @@ traverse_and_check_priority(int worker_id, int lsm_idx, int priority_type)
                 {
                     if (choose_adjacent_smaller(seg_array, cur, &adj_segment))
                     {
-                        should_claim = true;
+                        // Check that adjacent segment doesn't exceed or equal to MAX_SEGMENTS_SIZE
+                        // and combined size doesn't exceed or equal to MAX_SEGMENTS_SIZE
+                        if (seg_array->segments[adj_segment].vec_count < MAX_SEGMENTS_SIZE &&
+                            seg_array->segments[cur].vec_count + seg_array->segments[adj_segment].vec_count < MAX_SEGMENTS_SIZE)
+                        {
+                            should_claim = true;
+                        }
                     }
                 }
                 break;
@@ -1141,7 +1161,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
+        if (pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) != 1 || seg_array->current_index_relid == InvalidOid)
             continue;
             
         uint32 flat_cnt = pg_atomic_read_u32(&seg_array->flat_count);
@@ -1157,7 +1177,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
+        if (pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) != 1 || seg_array->current_index_relid == InvalidOid)
             continue;
             
         uint32 mem_le_cnt = pg_atomic_read_u32(&seg_array->memtable_capacity_le_count);
@@ -1173,7 +1193,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
+        if (pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) != 1 || seg_array->current_index_relid == InvalidOid)
             continue;
             
         if (traverse_and_check_priority(worker_id, lsm_idx, 3))
@@ -1185,7 +1205,7 @@ scan_and_claim_merge_task(int worker_id)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
+        if (pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) != 1 || seg_array->current_index_relid == InvalidOid)
             continue;
             
         uint32 small_le_cnt = pg_atomic_read_u32(&seg_array->small_segment_le_count);
@@ -1196,12 +1216,12 @@ scan_and_claim_merge_task(int worker_id)
             return true;
     }
     
-    /* Priority 5: vec_count <= MAX_SEGMENTS_SIZE => merge with adjacent smaller (lowest priority) */
+    /* Priority 5: vec_count < MAX_SEGMENTS_SIZE => merge with adjacent smaller (lowest priority) */
     for (lsm_idx = 0; lsm_idx < INDEX_BUF_SIZE; lsm_idx++)
     {
         SharedSegmentArray *seg_array = &merge_worker_manager->segment_arrays[lsm_idx];
         
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) && seg_array->current_index_relid == InvalidOid)
+        if (pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid) != 1 || seg_array->current_index_relid == InvalidOid)
             continue;
             
         if (traverse_and_check_priority(worker_id, lsm_idx, 5))
@@ -1321,7 +1341,7 @@ lsm_merge_worker_main(Datum main_arg)
         {
             // No task claimed, sleep for a short time before retrying
             ResetLatch(MyLatch);
-            WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT, 100, 0);
+            WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT, 400, 0);
         }
     }
     

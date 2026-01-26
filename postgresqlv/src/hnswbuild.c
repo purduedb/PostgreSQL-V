@@ -53,6 +53,7 @@
 #include "storage/bufmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
+#include "utils/elog.h"
 #include "utils/memutils.h"
 #include "vectorindeximpl.hpp"
 #include "lsmindex.h"
@@ -384,13 +385,17 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	{
 		elog(ERROR, "[BuildIndex] Path exists but is not a directory: %s", dir_path);
 	}
-	
+
 	// Create data file path: VECTOR_STORAGE_BASE_DIR/indexRelId/diskann_data.bin
 	snprintf(data_path, sizeof(data_path), VECTOR_STORAGE_BASE_DIR "%u/diskann_data.bin", relId);
+	// snprintf(data_path, sizeof(data_path), "/ssd_root/dataset/cohere/cohere_large_10m.fbin", relId);
 	
-	// Create index prefix: VECTOR_STORAGE_BASE_DIR/indexRelId/diskann_index
-	snprintf(index_prefix, sizeof(index_prefix), VECTOR_STORAGE_BASE_DIR "%u/diskann_index", relId);
-	
+	// Create index prefix using the same format as GetLSMIndexFilePathWithVersion
+	// index_<START_SEGMENT_ID>_<START_SEGMENT_ID>_v1
+	snprintf(index_prefix, sizeof(index_prefix),
+	         VECTOR_STORAGE_BASE_DIR "%u/index_%u_%u_v%u_diskann",
+	         relId, START_SEGMENT_ID, START_SEGMENT_ID, 1U);
+
 	// Create disk file
 	buildstate->diskFileHandle = DiskANNCreateDataFile(data_path, dim);
 	if (buildstate->diskFileHandle == NULL)
@@ -415,24 +420,22 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	// TODO: adjust the parameters
 	// Build DiskANN index from disk file
 	// Use default parameters (can be made configurable later)
-	int max_degree = 56;  // Default DiskANN max_degree
-	double pq_code_budget_gb = -1.0;  // Auto-calculate
-	double build_dram_budget_gb = 32.0;  // Default DiskANN build_dram_budget_gb
+	double pq_code_budget_gb = 1.2;  // Auto-calculate
+	double build_dram_budget_gb = 60.0;  // Default DiskANN build_dram_budget_gb
 	
-	// Auto-calculate pq_code_budget_gb: 0.125 * raw data size
-	// Estimate: num_tids * dim * sizeof(float) * 0.125 / (1024^3)
-	if (pq_code_budget_gb < 0 && buildstate->num_tids > 0)
-	{
-		pq_code_budget_gb = sizeof(float) * dim * buildstate->num_tids * 0.125 / (1024.0 * 1024.0 * 1024.0);
-	}
+	// // Auto-calculate pq_code_budget_gb: 0.125 * raw data size
+	// // Estimate: num_tids * dim * sizeof(float) * 0.125 / (1024^3)
+	// if (pq_code_budget_gb < 0 && buildstate->num_tids > 0)
+	// {
+	// 	pq_code_budget_gb = sizeof(float) * dim * buildstate->num_tids * 0.125 / (1024.0 * 1024.0 * 1024.0);
+	// }
 	
 	if (DiskANNIndexBuildFromFile(buildstate->hnswIndex, data_path, index_prefix, 
-	                               max_degree, buildstate->efConstruction, 
+	                               68, 75, 
 	                               pq_code_budget_gb, build_dram_budget_gb) != 0)
 	{
 		elog(ERROR, "[BuildIndex] Failed to build DiskANN index from disk file");
 	}
-	
 	void *tids = buildstate->tids;
 	uint32_t elem_size = buildstate->vectors->itemsize / buildstate->dimensions;
 	

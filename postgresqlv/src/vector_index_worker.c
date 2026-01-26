@@ -41,6 +41,13 @@ static volatile sig_atomic_t got_sigterm = false;
 
 typedef struct MaintenanceTask {
     TaskSlot *task_slot;
+    VectorTaskType task_type;
+    // Copied task data (one of the following unions)
+    union {
+        IndexBuildTaskData build_task;
+        SegmentUpdateTaskData update_task;
+        IndexLoadTaskData load_task;
+    } task_data;
     struct MaintenanceTask *next;
 } MaintenanceTask;
 
@@ -97,17 +104,13 @@ maintenance_worker_thread(void *arg)
         
         if (task != NULL) {
             // Handle the maintenance task
-            TaskSlot *task_slot = task->task_slot;
             PGPROC *client = NULL;
-            dsm_segment *task_seg = NULL;
             
-            switch (task_slot->type) {
+            switch (task->task_type) {
             case IndexBuildTaskType:
             {
                 fprintf(stderr, "[maintenance_worker] IndexBuildTaskType case entered\n");
-                dsm_handle task_hdl = task_slot->handle;
-                task_seg = dsm_attach(task_hdl);
-                IndexBuildTask build_task = (IndexBuildTask) dsm_segment_address(task_seg);
+                IndexBuildTaskData *build_task = &task->task_data.build_task;
                                 
                 Oid index_relid = build_task->index_relid;
                 int lsm_idx = build_task->lsm_idx;
@@ -124,21 +127,18 @@ maintenance_worker_thread(void *arg)
                 }
                 
                 client = &ProcGlobal->allProcs[build_task->backend_pgprocno];
-                dsm_detach(task_seg);
                 break;
             }
             case SegmentUpdateTaskType:
             {
                 fprintf(stderr, "[maintenance_worker] SegmentUpdateTaskType\n");
-                dsm_handle task_hdl = task_slot->handle;
-                task_seg = dsm_attach(task_hdl);
-                SegmentUpdateTask task = (SegmentUpdateTask) dsm_segment_address(task_seg);
+                SegmentUpdateTaskData *update_task = &task->task_data.update_task;
                 
-                Oid index_relid = task->index_relid;
-                int lsm_idx = task->lsm_idx;
+                Oid index_relid = update_task->index_relid;
+                int lsm_idx = update_task->lsm_idx;
                 
                 // Handle different types of segment update operations
-                switch (task->operation_type)
+                switch (update_task->operation_type)
                 {
                     case SEGMENT_UPDATE_REGULAR:
                     {
@@ -148,7 +148,7 @@ maintenance_worker_thread(void *arg)
                         uint32_t seg_idx = reserve_flushed_segment(pool_seg);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
                         
-                        load_and_set_segment(index_relid, seg_idx, &pool_seg->flushed_segments[seg_idx], task->start_sid, task->end_sid, LOAD_LATEST_VERSION);
+                        load_and_set_segment(index_relid, seg_idx, &pool_seg->flushed_segments[seg_idx], update_task->start_sid, update_task->end_sid, LOAD_LATEST_VERSION);
                         
                         pthread_rwlock_wrlock(&pool_seg->seg_lock);
                         register_flushed_segment(pool_seg, seg_idx);
@@ -159,15 +159,15 @@ maintenance_worker_thread(void *arg)
                     case SEGMENT_UPDATE_REBUILD_FLAT:
                     case SEGMENT_UPDATE_REBUILD_DELETION:
                     {
-                        const char *rebuild_type = (task->operation_type == SEGMENT_UPDATE_REBUILD_FLAT) ? 
+                        const char *rebuild_type = (update_task->operation_type == SEGMENT_UPDATE_REBUILD_FLAT) ? 
                             "IndexRebuildFlat" : "IndexRebuildDeletion";
                         fprintf(stderr, "[maintenance_worker] %s task received, start_sid = %d, end_sid = %d\n", 
-                             rebuild_type, task->start_sid, task->end_sid);
+                             rebuild_type, update_task->start_sid, update_task->end_sid);
                         
                         FlushedSegmentPool *pool_seg = get_flushed_segment_pool(lsm_idx);
                         
                         pthread_rwlock_rdlock(&pool_seg->seg_lock);
-                        uint32_t old_seg_idx = find_segment_by_sids(pool_seg, task->start_sid, task->end_sid);
+                        uint32_t old_seg_idx = find_segment_by_sids(pool_seg, update_task->start_sid, update_task->end_sid);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
                         
                         pthread_rwlock_wrlock(&pool_seg->seg_lock);
@@ -178,27 +178,27 @@ maintenance_worker_thread(void *arg)
                             break;
                         }
                         
-                        load_and_set_segment(index_relid, new_seg_idx, &pool_seg->flushed_segments[new_seg_idx], task->start_sid, task->end_sid, LOAD_LATEST_VERSION);
+                        load_and_set_segment(index_relid, new_seg_idx, &pool_seg->flushed_segments[new_seg_idx], update_task->start_sid, update_task->end_sid, LOAD_LATEST_VERSION);
                         
                         pthread_rwlock_wrlock(&pool_seg->seg_lock);
                         replace_flushed_segment(pool_seg, old_seg_idx, -1, new_seg_idx);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
                         
                         fprintf(stderr, "[maintenance_worker] Rebuild completed for segment %d-%d, replaced old at slot %u with new at slot %u\n", 
-                             task->start_sid, task->end_sid, old_seg_idx, new_seg_idx);
+                             update_task->start_sid, update_task->end_sid, old_seg_idx, new_seg_idx);
                         break;
                     }
                     
                     case SEGMENT_UPDATE_MERGE:
                     {
                         fprintf(stderr, "[maintenance_worker] SegmentMerge task received: merging segments to create segment %d-%d\n", 
-                             task->start_sid, task->end_sid);
+                             update_task->start_sid, update_task->end_sid);
                         
                         FlushedSegmentPool *pool_seg = get_flushed_segment_pool(lsm_idx);
                         
                         uint32_t old_seg_idx_0, old_seg_idx_1;
                         pthread_rwlock_rdlock(&pool_seg->seg_lock);
-                        find_two_adjacent_segments(pool_seg, task->start_sid, task->end_sid, &old_seg_idx_0, &old_seg_idx_1);
+                        find_two_adjacent_segments(pool_seg, update_task->start_sid, update_task->end_sid, &old_seg_idx_0, &old_seg_idx_1);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
                         
                         if (old_seg_idx_0 == -1 || old_seg_idx_1 == -1)
@@ -216,7 +216,7 @@ maintenance_worker_thread(void *arg)
                             break;
                         }
                         
-                        load_and_set_segment(index_relid, new_seg_idx, &pool_seg->flushed_segments[new_seg_idx], task->start_sid, task->end_sid, LOAD_LATEST_VERSION);
+                        load_and_set_segment(index_relid, new_seg_idx, &pool_seg->flushed_segments[new_seg_idx], update_task->start_sid, update_task->end_sid, LOAD_LATEST_VERSION);
                         
                         pthread_rwlock_wrlock(&pool_seg->seg_lock);
                         replace_flushed_segment(pool_seg, old_seg_idx_0, old_seg_idx_1, new_seg_idx);
@@ -230,29 +230,29 @@ maintenance_worker_thread(void *arg)
                     case SEGMENT_UPDATE_VACUUM:
                     {
                         fprintf(stderr, "[maintenance_worker] SegmentVacuum task received: reloading bitmap for segment %d-%d\n", 
-                             task->start_sid, task->end_sid);
+                             update_task->start_sid, update_task->end_sid);
                         
                         FlushedSegmentPool *pool_seg = get_flushed_segment_pool(lsm_idx);
                         
                         pthread_rwlock_rdlock(&pool_seg->seg_lock);
-                        uint32_t seg_idx = find_segment_by_sids(pool_seg, task->start_sid, task->end_sid);
+                        uint32_t seg_idx = find_segment_by_sids(pool_seg, update_task->start_sid, update_task->end_sid);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
                         
                         FlushedSegment segment = &pool_seg->flushed_segments[seg_idx];
                         
                         if (segment->bitmap_ptr == NULL) {
                             fprintf(stderr, "[maintenance_worker] ERROR: Segment %d-%d has NULL bitmap pointer, cannot perform vacuum\n", 
-                                 task->start_sid, task->end_sid);
+                                 update_task->start_sid, update_task->end_sid);
                             break;
                         }
                         
                         uint8_t *new_bitmap_ptr = NULL;
                         uint32_t delete_count;
-                        load_bitmap_file(index_relid, task->start_sid, task->end_sid, LOAD_LATEST_VERSION, &new_bitmap_ptr, false, &delete_count);
+                        load_bitmap_file(index_relid, update_task->start_sid, update_task->end_sid, LOAD_LATEST_VERSION, &new_bitmap_ptr, false, &delete_count);
                         
                         if (new_bitmap_ptr == NULL) {
                             fprintf(stderr, "[maintenance_worker] ERROR: Failed to load new bitmap for segment %d-%d during vacuum\n", 
-                                 task->start_sid, task->end_sid);
+                                 update_task->start_sid, update_task->end_sid);
                             break;
                         }
                         
@@ -266,38 +266,34 @@ maintenance_worker_thread(void *arg)
                         free(new_bitmap_ptr);
                         
                         fprintf(stderr, "[maintenance_worker] SegmentVacuum completed, merged new bitmap into segment %d-%d at slot %u\n", 
-                             task->start_sid, task->end_sid, seg_idx);
+                             update_task->start_sid, update_task->end_sid, seg_idx);
                         break;
                     }
                     
                     default:
-                        fprintf(stderr, "[maintenance_worker] WARNING: Unknown segment update operation type %d\n", task->operation_type);
+                        fprintf(stderr, "[maintenance_worker] WARNING: Unknown segment update operation type %d\n", update_task->operation_type);
                         break;
                 }
-                client = &ProcGlobal->allProcs[task->backend_pgprocno];
-                dsm_detach(task_seg);
+                client = &ProcGlobal->allProcs[update_task->backend_pgprocno];
                 break;
             }
             case IndexLoadTaskType:
             {
                 fprintf(stderr, "[maintenance_worker] IndexLoadTaskType\n");
-                dsm_handle task_hdl = task_slot->handle;
-                task_seg = dsm_attach(task_hdl);
-                IndexLoadTask task = (IndexLoadTask) dsm_segment_address(task_seg);
+                IndexLoadTaskData *load_task = &task->task_data.load_task;
                 
-                Oid index_relid = task->index_relid;
-                int lsm_idx = task->lsm_idx;
+                Oid index_relid = load_task->index_relid;
+                int lsm_idx = load_task->lsm_idx;
                 
                 FlushedSegmentPool *pool_seg = get_flushed_segment_pool(lsm_idx);
                 initialize_segment_pool(pool_seg);
                 load_all_segments_from_disk(index_relid, pool_seg);
                 
-                client = &ProcGlobal->allProcs[task->backend_pgprocno];
-                dsm_detach(task_seg);
+                client = &ProcGlobal->allProcs[load_task->backend_pgprocno];
                 break;
             }
             default:
-                fprintf(stderr, "[maintenance_worker] Unknown task type %d\n", task_slot->type);
+                fprintf(stderr, "[maintenance_worker] Unknown task type %d\n", task->task_type);
                 break;
             }
             
@@ -363,14 +359,55 @@ submit_maintenance_task(TaskSlot *task_slot)
         return;
     }
     
+    // Attach DSM segment, copy data, then detach (all in PostgreSQL backend worker process context)
+    dsm_handle task_hdl = task_slot->handle;
+    dsm_segment *task_seg = dsm_attach(task_hdl);
+    if (task_seg == NULL) {
+        elog(ERROR, "[submit_maintenance_task] Failed to attach DSM segment");
+        return;
+    }
+    
     // Allocate task structure
     MaintenanceTask *task = (MaintenanceTask *)malloc(sizeof(MaintenanceTask));
     if (task == NULL) {
         elog(ERROR, "[submit_maintenance_task] Failed to allocate task structure");
+        dsm_detach(task_seg);
         return;
     }
     
     task->task_slot = task_slot;
+    task->task_type = task_slot->type;
+    
+    // Copy task data from DSM segment based on task type
+    switch (task_slot->type) {
+        case IndexBuildTaskType:
+        {
+            IndexBuildTask src_task = (IndexBuildTask) dsm_segment_address(task_seg);
+            task->task_data.build_task = *src_task;  // Copy the structure
+            break;
+        }
+        case SegmentUpdateTaskType:
+        {
+            SegmentUpdateTask src_task = (SegmentUpdateTask) dsm_segment_address(task_seg);
+            task->task_data.update_task = *src_task;  // Copy the structure
+            break;
+        }
+        case IndexLoadTaskType:
+        {
+            IndexLoadTask src_task = (IndexLoadTask) dsm_segment_address(task_seg);
+            task->task_data.load_task = *src_task;  // Copy the structure
+            break;
+        }
+        default:
+            elog(ERROR, "[submit_maintenance_task] Unknown task type %d", task_slot->type);
+            free(task);
+            dsm_detach(task_seg);
+            return;
+    }
+    
+    // Detach DSM segment now that we've copied the data
+    dsm_detach(task_seg);
+    
     task->next = NULL;
     
     // Enqueue the task

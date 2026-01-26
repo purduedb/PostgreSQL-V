@@ -1,64 +1,40 @@
-// pgvector_test.cpp
+// pgvector_test_2.cpp
 //
-// pgvector HNSW sliding window test script - fine-grained parallel version
-// Parallel logic consistent with hnswlib sliding_window_test.cpp:
-//   - Insert: each vector is an independent task
-//   - Delete: each vector is an independent task
-//   - Search: each query is an independent task
+// pgvector HNSW sliding window test script - multi-threaded version with QPS control
+// This script runs the runbook with multiple threads in mixed mode, allowing
+// the user to set the QPS (queries per second) rate per thread for sending requests.
 //
-// Key design:
-//   - Use thread_local connections to avoid connection pool contention
-//   - Use Prepared Statements to reduce SQL parsing overhead
-//   - Same checkpoint_size batching + internal fine-grained parallelism as hnswlib
-//
-// Compilation command (with SIMD optimizations):
-//   g++ -O3 -std=c++17 -mavx2 -mfma -fopenmp pgvector_test.cpp \
-//       -o pgvector_test \
+// Compilation command:
+//   g++ -O3 -std=c++17 -mavx2 -mfma -fopenmp pgvector_test_2.cpp \
+//       -o pgvector_test_2 \
 //       -I/usr/include/postgresql -lpq -lyaml-cpp -lcrypto -pthread
-// Note: -mavx2 enables AVX2 SIMD instructions for faster L2 distance computation
-//       For SSE-only systems, use -msse4.1 instead
-//       For systems without SIMD, the code will automatically fall back to scalar operations
 //
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <vector>
 #include <set>
-#include <unordered_set>
 #include <chrono>
-#include <thread>
 #include <algorithm>
-#include <numeric>
 #include <cstring>
 #include <iomanip>
 #include <cstdint>
 #include <cmath>
-#include <mutex>
-#include <atomic>
-#include <memory>
 #include <random>
 #include <libpq-fe.h>
-#include <omp.h>
 #include <yaml-cpp/yaml.h>
 #include <openssl/md5.h>
+#include <thread>
 #include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <cstdlib>
 #include <cerrno>
-#include <cstring>
-
-// SIMD headers
-#ifdef __AVX2__
-#include <immintrin.h>
-#define USE_AVX2
-#elif defined(__SSE4_1__)
-#include <smmintrin.h>
-#define USE_SSE
-#elif defined(__SSE__)
-#include <xmmintrin.h>
-#define USE_SSE
-#endif
+#include <omp.h>
+#include <mutex>
+#include <atomic>
+#include <limits>
+#include <memory>
 
 // ==================================
 // Configuration structure
@@ -85,80 +61,54 @@ struct Config {
     
     // Dimension will be auto-detected from dataset
     size_t DIMENSION = 0;
+    
+    // QPS rate limiting
+    double TARGET_QPS = 0.0;  // 0 means no rate limiting
 };
 
 // ===================================================
-// SIMD-optimized L2 distance computation
+// Rate limiter for QPS control
 // ===================================================
-namespace SIMDUtils {
-    // Compute L2 distance between two vectors using SIMD
-    inline float l2_distance_simd(const float* a, const float* b, size_t dim) {
-        float dist_squared = 0.0f;
-        
-#ifdef USE_AVX2
-        // AVX2: process 8 floats at a time
-        const size_t simd_width = 8;
-        size_t i = 0;
-        __m256 sum_vec = _mm256_setzero_ps();
-        
-        for (; i + simd_width <= dim; i += simd_width) {
-            __m256 va = _mm256_loadu_ps(a + i);
-            __m256 vb = _mm256_loadu_ps(b + i);
-            __m256 diff = _mm256_sub_ps(va, vb);
-            __m256 sq = _mm256_mul_ps(diff, diff);
-            sum_vec = _mm256_add_ps(sum_vec, sq);
+class RateLimiter {
+private:
+    double qps;
+    double min_interval;  // Minimum time between operations (seconds)
+    std::chrono::high_resolution_clock::time_point last_operation_time;
+    std::mt19937 gen;
+    std::uniform_real_distribution<double> jitter_dist;
+
+public:
+    RateLimiter(double target_qps) : qps(target_qps) {
+        if (qps > 0) {
+            min_interval = 1.0 / qps;
+        } else {
+            min_interval = 0.0;
         }
-        
-        // Horizontal sum of 8 floats (more efficient method)
-        __m128 sum128_lo = _mm256_extractf128_ps(sum_vec, 0);
-        __m128 sum128_hi = _mm256_extractf128_ps(sum_vec, 1);
-        __m128 sum128 = _mm_add_ps(sum128_lo, sum128_hi);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        dist_squared = _mm_cvtss_f32(sum128);
-        
-        // Handle remainder
-        for (; i < dim; i++) {
-            float diff = a[i] - b[i];
-            dist_squared += diff * diff;
-        }
-        
-#elif defined(USE_SSE)
-        // SSE: process 4 floats at a time
-        const size_t simd_width = 4;
-        size_t i = 0;
-        __m128 sum_vec = _mm_setzero_ps();
-        
-        for (; i + simd_width <= dim; i += simd_width) {
-            __m128 va = _mm_loadu_ps(a + i);
-            __m128 vb = _mm_loadu_ps(b + i);
-            __m128 diff = _mm_sub_ps(va, vb);
-            __m128 sq = _mm_mul_ps(diff, diff);
-            sum_vec = _mm_add_ps(sum_vec, sq);
-        }
-        
-        // Horizontal sum of 4 floats
-        sum_vec = _mm_hadd_ps(sum_vec, sum_vec);
-        sum_vec = _mm_hadd_ps(sum_vec, sum_vec);
-        dist_squared = _mm_cvtss_f32(sum_vec);
-        
-        // Handle remainder
-        for (; i < dim; i++) {
-            float diff = a[i] - b[i];
-            dist_squared += diff * diff;
-        }
-        
-#else
-        // Scalar fallback
-        for (size_t i = 0; i < dim; i++) {
-            float diff = a[i] - b[i];
-            dist_squared += diff * diff;
-        }
-#endif
-        
-        return std::sqrt(dist_squared);
+        last_operation_time = std::chrono::high_resolution_clock::now();
+        std::random_device rd;
+        gen = std::mt19937(rd());
+        // Small jitter to avoid thundering herd (0-5% of interval)
+        jitter_dist = std::uniform_real_distribution<double>(0.0, min_interval * 0.05);
     }
-}
+
+    void wait_if_needed() {
+        if (qps <= 0) {
+            return;  // No rate limiting
+        }
+
+        auto now = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - last_operation_time).count();
+        
+        double wait_time = min_interval - elapsed;
+        if (wait_time > 0) {
+            // Add small random jitter to avoid synchronization
+            double jitter = jitter_dist(gen);
+            std::this_thread::sleep_for(std::chrono::duration<double>(wait_time + jitter));
+        }
+        
+        last_operation_time = std::chrono::high_resolution_clock::now();
+    }
+};
 
 // ===================================================
 // Data loader
@@ -280,7 +230,7 @@ std::vector<PGconn*> ThreadLocalConnection::all_connections;
 std::mutex ThreadLocalConnection::conn_mutex;
 
 // =========================================================
-// pgvector sliding window test class
+// pgvector sliding window test class (multi-threaded with QPS control)
 // =========================================================
 class PGVectorSlidingWindowTest {
 private:
@@ -292,6 +242,8 @@ private:
     int hnsw_m;
     int hnsw_ef_construction;
     int hnsw_ef_search;
+    double target_qps;
+    int num_threads;
     
     // Crash simulation
     bool simulate_crash = false;
@@ -304,9 +256,12 @@ private:
     // Skip recall computation
     bool skip_recall_computation = false;
     
-    // Transaction batching (only used when mixed mode is disabled)
-    size_t transaction_batch_size = 0;  // 0 means disabled (each operation is independent)
-
+    // Stop flag - set to true when crash happens or first failure occurs
+    std::atomic<bool> should_stop{false};
+    
+    // Mutex for statistics updates
+    std::mutex stats_mutex;
+    
     // Statistics structure
     struct DetailedStats {
         struct OperationStats {
@@ -320,8 +275,7 @@ private:
             size_t active_count = 0;
             size_t start_idx = 0;
             size_t end_idx = 0;
-            int num_threads = 1;
-            double throughput_per_thread = 0.0;
+            double actual_qps = 0.0;
         };
 
         struct CategoryStats {
@@ -334,8 +288,6 @@ private:
             std::vector<double> recall_values;
             double min_recall = 1.0;
             double max_recall = 0.0;
-            double max_throughput_per_thread = 0.0;
-            double min_throughput_per_thread = std::numeric_limits<double>::max();
         };
 
         double total_time = 0.0;
@@ -343,13 +295,6 @@ private:
         CategoryStats insert_stats;
         CategoryStats delete_stats;
         CategoryStats search_stats;
-        double peak_insert_throughput = 0.0;
-        double peak_delete_throughput = 0.0;
-        double peak_search_qps = 0.0;
-        double peak_insert_throughput_per_thread = 0.0;
-        double peak_delete_throughput_per_thread = 0.0;
-        double peak_search_qps_per_thread = 0.0;
-        int max_threads_used = 0;
     } stats;
 
     // Generate SQL string representation of vector
@@ -396,8 +341,7 @@ private:
             pclose(pipe);
         }
         
-        // Method 2: Try using pg_ctl if available (requires data directory, less reliable)
-        // Method 3: Fallback - try to find postgres process listening on the port
+        // Method 2: Fallback - try to find postgres process listening on the port
         std::stringstream cmd2;
         cmd2 << "ss -tlnp | grep :" << db_port << " | awk '{print $6}' | cut -d',' -f2 | head -1";
         pipe = popen(cmd2.str().c_str(), "r");
@@ -495,8 +439,6 @@ private:
         return gt;
     }
 
-
-
     void updateCategoryStats(DetailedStats::CategoryStats& cat_stats,
                              const DetailedStats::OperationStats& op_stats) {
         cat_stats.count++;
@@ -506,573 +448,11 @@ private:
         cat_stats.total_successful += op_stats.successful;
         cat_stats.total_failed += op_stats.failed;
 
-        if (op_stats.time > 0) {
-            double throughput = (double)(op_stats.successful) / op_stats.time;
-            double throughput_per_thread = throughput / op_stats.num_threads;
-            
-            cat_stats.max_throughput_per_thread = std::max(cat_stats.max_throughput_per_thread, throughput_per_thread);
-            cat_stats.min_throughput_per_thread = std::min(cat_stats.min_throughput_per_thread, throughput_per_thread);
-            
-            if (op_stats.type == "insert") {
-                stats.peak_insert_throughput = std::max(stats.peak_insert_throughput, throughput);
-                stats.peak_insert_throughput_per_thread = std::max(stats.peak_insert_throughput_per_thread, throughput_per_thread);
-            } else if (op_stats.type == "delete") {
-                stats.peak_delete_throughput = std::max(stats.peak_delete_throughput, throughput);
-                stats.peak_delete_throughput_per_thread = std::max(stats.peak_delete_throughput_per_thread, throughput_per_thread);
-            } else if (op_stats.type == "search") {
-                stats.peak_search_qps = std::max(stats.peak_search_qps, throughput);
-                stats.peak_search_qps_per_thread = std::max(stats.peak_search_qps_per_thread, throughput_per_thread);
-            }
-        }
-
-        stats.max_threads_used = std::max(stats.max_threads_used, op_stats.num_threads);
-
         if (op_stats.type == "search" && op_stats.recall > 0) {
             cat_stats.recall_values.push_back(op_stats.recall);
             cat_stats.min_recall = std::min(cat_stats.min_recall, op_stats.recall);
             cat_stats.max_recall = std::max(cat_stats.max_recall, op_stats.recall);
         }
-    }
-
-public:
-    PGVectorSlidingWindowTest(size_t dimension,
-                               const std::string& gt_directory,
-                               const std::string& db_host,
-                               const std::string& db_port,
-                               const std::string& db_name,
-                               const std::string& db_user,
-                               const std::string& db_password,
-                               int hnsw_m,
-                               int hnsw_ef_construction,
-                               int hnsw_ef_search,
-                               bool enable_crash_simulation = false,
-                               size_t crash_step = 0,
-                               size_t crash_operation = 0,
-                               bool skip_recall = false,
-                               size_t txn_batch_size = 0)
-        : dim(dimension), table_name("vectors"), gt_dir(gt_directory),
-          hnsw_m(hnsw_m), hnsw_ef_construction(hnsw_ef_construction), hnsw_ef_search(hnsw_ef_search),
-          simulate_crash(enable_crash_simulation), crash_target_step(crash_step),
-          crash_target_operation(crash_operation), db_host(db_host), db_port(db_port),
-          skip_recall_computation(skip_recall), transaction_batch_size(txn_batch_size) {
-        
-        // Initialize connection manager
-        ThreadLocalConnection::init(
-            db_host, db_port, db_name, db_user, db_password
-        );
-
-        // Ensure GT directory exists
-        std::string cmd = "mkdir -p " + gt_dir;
-        (void)system(cmd.c_str());
-    }
-
-    ~PGVectorSlidingWindowTest() {
-        ThreadLocalConnection::cleanup();
-    }
-
-    // Initialize database table
-    void setup(bool recreate_table = true) {
-        PGconn* conn = ThreadLocalConnection::get_main();
-        if (!conn) {
-            throw std::runtime_error("No database connection available");
-        }
-
-        std::cout << "Setting up database..." << std::endl;
-
-        // Create pgvector extension
-        PGresult* res = PQexec(conn, "CREATE EXTENSION IF NOT EXISTS vector");
-        PQclear(res);
-
-        if (recreate_table) {
-            // Drop old table
-            res = PQexec(conn, ("DROP TABLE IF EXISTS " + table_name).c_str());
-            PQclear(res);
-
-            // Create new table
-            std::stringstream create_sql;
-            create_sql << "CREATE TABLE " << table_name << " ("
-                       << "id BIGINT PRIMARY KEY, "
-                       << "embedding vector(" << dim << ")"
-                       << ")";
-            res = PQexec(conn, create_sql.str().c_str());
-            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-                throw std::runtime_error("Failed to create table: " + std::string(PQerrorMessage(conn)));
-            }
-            PQclear(res);
-
-            std::cout << "✔ Table created: " << table_name << std::endl;
-            std::cout << "✔ Database setup complete (index will be created after initial data load)" << std::endl;
-        } else {
-            std::cout << "✔ Using existing table: " << table_name << std::endl;
-        }
-    }
-
-    // Create HNSW index
-    void create_index() {
-        PGconn* conn = ThreadLocalConnection::get_main();
-        Timer timer;
-
-        std::cout << "Creating HNSW index..." << std::endl;
-
-        PGresult* res = PQexec(conn, "SET maintenance_work_mem = '8GB'");
-        PQclear(res);
-
-        std::stringstream index_sql;
-        index_sql << "CREATE INDEX ON " << table_name 
-                  << " USING hnsw (embedding vector_l2_ops) WITH ("
-                  << "m = " << hnsw_m << ", "
-                  << "ef_construction = " << hnsw_ef_construction
-                  << ")";
-        
-        res = PQexec(conn, index_sql.str().c_str());
-        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-            throw std::runtime_error("Failed to create index: " + std::string(PQerrorMessage(conn)));
-        }
-        PQclear(res);
-
-        double elapsed = timer.elapsed_seconds();
-        std::cout << "✔ HNSW index created in " << elapsed << "s" << std::endl;
-    }
-
-    // ========================================================================
-    // Parallel insert - consistent with hnswlib test logic
-    // Outer: batch by checkpoint_size
-    // Inner: fine-grained parallel, each vector is an independent task
-    // ========================================================================
-    std::map<std::string, double> parallel_insert(float* data, size_t start, size_t end,
-                                                   int num_threads, size_t checkpoint_size,
-                                                   const std::string& step_name, size_t step_num = 0) {
-        Timer timer;
-        std::cout << "Starting parallel insert: range [" << start << ":" << end
-                  << "], threads=" << num_threads << std::endl;
-
-        size_t successful_inserts = 0;
-        size_t failed_inserts = 0;
-
-        // Batch processing
-        for (size_t batch_start = start; batch_start < end; batch_start += checkpoint_size) {
-            size_t batch_end = std::min(batch_start + checkpoint_size, end);
-
-            if (transaction_batch_size > 0) {
-                // Transaction batching mode: group operations into transactions
-                // Calculate number of transaction batches
-                size_t num_txn_batches = (batch_end - batch_start + transaction_batch_size - 1) / transaction_batch_size;
-                
-                // Process transaction batches in parallel
-                #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
-                for (size_t txn_idx = 0; txn_idx < num_txn_batches; txn_idx++) {
-                    PGconn* conn = ThreadLocalConnection::get();
-                    if (!conn) continue;
-                    
-                    // Check for crash simulation
-                    if (should_crash(step_num)) {
-                        #pragma omp critical
-                        {
-                            if (simulate_crash) {
-                                kill_postgres_master();
-                                simulate_crash = false;
-                            }
-                        }
-                        continue;
-                    }
-                    
-                    // Calculate the range for this transaction batch
-                    size_t txn_start = batch_start + txn_idx * transaction_batch_size;
-                    size_t txn_end = std::min(txn_start + transaction_batch_size, batch_end);
-                    
-                    // Execute all INSERTs within a single transaction
-                    PGresult* begin_res = PQexec(conn, "BEGIN");
-                    if (PQresultStatus(begin_res) == PGRES_COMMAND_OK) {
-                        PQclear(begin_res);
-                        
-                        for (size_t i = txn_start; i < txn_end; i++) {
-                            std::stringstream sql;
-                            sql << "INSERT INTO " << table_name << " (id, embedding) VALUES ("
-                                << i << "," << vector_to_sql(data + i * dim, dim)
-                                << ") ON CONFLICT (id) DO NOTHING";
-                            
-                            PGresult* res = PQexec(conn, sql.str().c_str());
-                            PQclear(res);
-                            // Note: individual INSERT failures are ignored (ON CONFLICT DO NOTHING)
-                        }
-                        
-                        PGresult* commit_res = PQexec(conn, "COMMIT");
-                        PQclear(commit_res);
-                    } else {
-                        PQclear(begin_res);
-                    }
-                }
-                
-                // After batch completion, serially update active_indices
-                for (size_t i = batch_start; i < batch_end; i++) {
-                    active_indices.insert(i);
-                }
-                
-                // Assume all inserts succeeded
-                successful_inserts += (batch_end - batch_start);
-            } else {
-                // Original behavior: each operation is independent (dynamic scheduling)
-                #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
-                for (size_t i = batch_start; i < batch_end; i++) {
-                    PGconn* conn = ThreadLocalConnection::get();
-                    if (!conn) continue;
-
-                    // Check for crash simulation (only one thread should trigger)
-                    if (should_crash(step_num)) {
-                        #pragma omp critical
-                        {
-                            if (simulate_crash) {
-                                kill_postgres_master();
-                                simulate_crash = false;  // Prevent multiple kills
-                            }
-                        }
-                        // Exit this thread - crash has been triggered
-                        continue;
-                    }
-
-                    // Build single INSERT SQL
-                    std::stringstream sql;
-                    sql << "INSERT INTO " << table_name << " (id, embedding) VALUES ("
-                        << i << "," << vector_to_sql(data + i * dim, dim)
-                        << ") ON CONFLICT (id) DO NOTHING";
-
-                    PGresult* res = PQexec(conn, sql.str().c_str());
-                    PQclear(res);
-                    // Note: not updating counter here, as hnswlib version also assumes all succeed
-                }
-                
-                // After batch completion, serially update active_indices
-                for (size_t i = batch_start; i < batch_end; i++) {
-                    active_indices.insert(i);
-                }
-                
-                // Assume all inserts succeeded
-                successful_inserts += (batch_end - batch_start);
-            }
-        }
-
-        // Record active range
-        active_ranges.emplace_back("insert", start, end);
-
-        double elapsed = timer.elapsed_seconds();
-        double throughput = successful_inserts / elapsed;
-        double throughput_per_thread = throughput / num_threads;
-
-        std::cout << "Insert completed in " << elapsed << "s: "
-                  << successful_inserts << " successful, " << failed_inserts << " failed"
-                  << "\n  Throughput: " << std::fixed << std::setprecision(0)
-                  << throughput << " vec/s (total), "
-                  << throughput_per_thread << " vec/s/thread" << std::endl;
-
-        // Record statistics
-        DetailedStats::OperationStats op_stats;
-        op_stats.name = step_name;
-        op_stats.type = "insert";
-        op_stats.time = elapsed;
-        op_stats.successful = successful_inserts;
-        op_stats.failed = failed_inserts;
-        op_stats.active_count = active_indices.size();
-        op_stats.start_idx = start;
-        op_stats.end_idx = end;
-        op_stats.num_threads = num_threads;
-        op_stats.throughput_per_thread = throughput_per_thread;
-
-        stats.operations.push_back(op_stats);
-        updateCategoryStats(stats.insert_stats, op_stats);
-
-        return {
-            {"successful", (double)successful_inserts},
-            {"failed", (double)failed_inserts},
-            {"time", elapsed}
-        };
-    }
-
-    // ================================================
-    // Parallel delete - consistent with hnswlib version logic
-    // ================================================
-    std::map<std::string, double> parallel_delete(size_t start, size_t end,
-                                                   int num_threads, size_t checkpoint_size,
-                                                   const std::string& step_name, size_t step_num = 0) {
-        Timer timer;
-        std::cout << "Starting parallel delete: range [" << start << ":" << end
-                  << "], threads=" << num_threads << std::endl;
-
-        size_t successful_deletes = 0;
-        size_t failed_deletes = 0;
-
-        // Batch processing
-        for (size_t batch_start = start; batch_start < end; batch_start += checkpoint_size) {
-            size_t batch_end = std::min(batch_start + checkpoint_size, end);
-            
-            // Track which deletes succeeded (thread-safe using mutex)
-            std::vector<bool> delete_success(batch_end - batch_start, false);
-            std::mutex delete_success_mutex;
-            
-            if (transaction_batch_size > 0) {
-                // Transaction batching mode: group operations into transactions
-                // Calculate number of transaction batches
-                size_t num_txn_batches = (batch_end - batch_start + transaction_batch_size - 1) / transaction_batch_size;
-                
-                // Process transaction batches in parallel
-                #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
-                for (size_t txn_idx = 0; txn_idx < num_txn_batches; txn_idx++) {
-                    PGconn* conn = ThreadLocalConnection::get();
-                    if (!conn) continue;
-                    
-                    // Check for crash simulation
-                    if (should_crash(step_num)) {
-                        #pragma omp critical
-                        {
-                            if (simulate_crash) {
-                                kill_postgres_master();
-                                simulate_crash = false;
-                            }
-                        }
-                        continue;
-                    }
-                    
-                    // Calculate the range for this transaction batch
-                    size_t txn_start = batch_start + txn_idx * transaction_batch_size;
-                    size_t txn_end = std::min(txn_start + transaction_batch_size, batch_end);
-                    
-                    // Execute each DELETE individually within a transaction to track results
-                    PGresult* begin_res = PQexec(conn, "BEGIN");
-                    if (PQresultStatus(begin_res) == PGRES_COMMAND_OK) {
-                        PQclear(begin_res);
-                        
-                        for (size_t i = txn_start; i < txn_end; i++) {
-                            std::stringstream sql;
-                            sql << "DELETE FROM " << table_name << " WHERE id = " << i;
-                            
-                            PGresult* res = PQexec(conn, sql.str().c_str());
-                            if (PQresultStatus(res) == PGRES_COMMAND_OK) {
-                                // Check if any rows were actually deleted
-                                char* tuples = PQcmdTuples(res);
-                                if (tuples && std::atoi(tuples) > 0) {
-                                    size_t offset = i - batch_start;
-                                    std::lock_guard<std::mutex> lock(delete_success_mutex);
-                                    delete_success[offset] = true;
-                                }
-                            }
-                            PQclear(res);
-                        }
-                        
-                        PGresult* commit_res = PQexec(conn, "COMMIT");
-                        PQclear(commit_res);
-                    } else {
-                        PQclear(begin_res);
-                    }
-                }
-            } else {
-                // Original behavior: each operation is independent (dynamic scheduling)
-                #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
-                for (size_t i = batch_start; i < batch_end; i++) {
-                    PGconn* conn = ThreadLocalConnection::get();
-                    if (!conn) continue;
-
-                    // Check for crash simulation
-                    if (should_crash(step_num)) {
-                        #pragma omp critical
-                        {
-                            if (simulate_crash) {
-                                kill_postgres_master();
-                                simulate_crash = false;  // Prevent multiple kills
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Single DELETE
-                    std::stringstream sql;
-                    sql << "DELETE FROM " << table_name << " WHERE id = " << i;
-
-                    PGresult* res = PQexec(conn, sql.str().c_str());
-                    
-                    // Check if delete succeeded and actually deleted a row
-                    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
-                        char* tuples = PQcmdTuples(res);
-                        if (tuples && std::atoi(tuples) > 0) {
-                            size_t offset = i - batch_start;
-                            std::lock_guard<std::mutex> lock(delete_success_mutex);
-                            delete_success[offset] = true;
-                        }
-                    }
-                    
-                    PQclear(res);
-                }
-            }
-            
-            // After batch completion, serially update active_indices and count results
-            for (size_t i = batch_start; i < batch_end; i++) {
-                size_t offset = i - batch_start;
-                if (delete_success[offset]) {
-                    active_indices.erase(i);
-                    successful_deletes++;
-                } else {
-                    failed_deletes++;
-                }
-            }
-        }
-
-        // Record active range
-        active_ranges.emplace_back("delete", start, end);
-
-        double elapsed = timer.elapsed_seconds();
-        double throughput = successful_deletes / elapsed;
-        double throughput_per_thread = throughput / num_threads;
-
-        std::cout << "Delete completed in " << elapsed << "s: "
-                  << successful_deletes << " successful, " << failed_deletes << " failed"
-                  << "\n  Throughput: " << std::fixed << std::setprecision(0)
-                  << throughput << " vec/s (total), "
-                  << throughput_per_thread << " vec/s/thread" << std::endl;
-
-        // Record statistics
-        DetailedStats::OperationStats op_stats;
-        op_stats.name = step_name;
-        op_stats.type = "delete";
-        op_stats.time = elapsed;
-        op_stats.successful = successful_deletes;
-        op_stats.failed = failed_deletes;
-        op_stats.active_count = active_indices.size();
-        op_stats.start_idx = start;
-        op_stats.end_idx = end;
-        op_stats.num_threads = num_threads;
-        op_stats.throughput_per_thread = throughput_per_thread;
-
-        stats.operations.push_back(op_stats);
-        updateCategoryStats(stats.delete_stats, op_stats);
-
-        return {
-            {"successful", (double)successful_deletes},
-            {"failed", (double)failed_deletes},
-            {"time", elapsed}
-        };
-    }
-
-    // ========================================================================
-    // Parallel search - consistent with hnswlib version logic
-    // ========================================================================
-    std::map<std::string, double> parallel_search(float* dataset, float* queries,
-                                                  size_t num_queries, size_t k,
-                                                  int num_threads, size_t step_num,
-                                                  const std::string& runbook_name,
-                                                  const std::string& step_name,
-                                                  bool skip_recall = false) {
-        Timer timer;
-
-        std::vector<std::vector<int>> gt;
-        if (!skip_recall) {
-            // Load GT file (must exist - should be pre-computed using compute_ground_truth.cpp)
-            std::string gt_filename = get_gt_filename(runbook_name, step_num, active_ranges);
-            std::string gt_filepath = gt_dir + "/" + gt_filename;
-
-            std::ifstream check(gt_filepath, std::ios::binary);
-            if (!check.good()) {
-                throw std::runtime_error("Ground truth file not found: " + gt_filepath + 
-                                       "\nPlease run compute_ground_truth.cpp first to generate all GT files.");
-            }
-            check.close();
-            std::cout << "Loading ground truth from " << gt_filepath << std::endl;
-            gt = load_gt_npy(gt_filepath, num_queries, k);
-            if (gt.empty() || gt.size() != num_queries) {
-                throw std::runtime_error("Failed to load ground truth from " + gt_filepath);
-            }
-        }
-
-        std::cout << "Starting parallel search: " << num_queries
-                  << " queries, k=" << k << ", threads=" << num_threads;
-        if (skip_recall) {
-            std::cout << " (recall computation skipped)";
-        }
-        std::cout << std::endl;
-
-        size_t total_correct = 0;
-        size_t total_total = 0;
-
-        // Fine-grained parallel search
-        #pragma omp parallel for num_threads(num_threads) reduction(+:total_correct,total_total) schedule(dynamic, 1)
-        for (size_t q = 0; q < num_queries; q++) {
-            PGconn* conn = ThreadLocalConnection::get();
-            if (!conn) continue;
-
-            // Check for crash simulation
-            if (should_crash(step_num)) {
-                #pragma omp critical
-                {
-                    if (simulate_crash) {
-                        kill_postgres_master();
-                        simulate_crash = false;  // Prevent multiple kills
-                    }
-                }
-                continue;
-            }
-
-            // Set search parameters
-            std::stringstream set_sql;
-            set_sql << "SET hnsw.ef_search = " << hnsw_ef_search;
-            PGresult* set_res = PQexec(conn, set_sql.str().c_str());
-            PQclear(set_res);
-
-            // Build search SQL
-            std::stringstream sql;
-            sql << "SELECT id FROM " << table_name
-                << " ORDER BY embedding <-> " << vector_to_sql(queries + q * dim, dim)
-                << " LIMIT " << k;
-
-            PGresult* res = PQexec(conn, sql.str().c_str());
-            
-            if (PQresultStatus(res) == PGRES_TUPLES_OK && !skip_recall) {
-                int nrows = PQntuples(res);
-                
-                // Calculate recall
-                std::unordered_set<int> gt_set(gt[q].begin(), gt[q].end());
-                for (int i = 0; i < nrows; i++) {
-                    int id = std::stoi(PQgetvalue(res, i, 0));
-                    if (gt_set.find(id) != gt_set.end()) {
-                        total_correct++;
-                    }
-                    total_total++;
-                }
-            }
-            
-            PQclear(res);
-        }
-
-        double elapsed = timer.elapsed_seconds();
-        double recall = skip_recall ? 0.0 : (total_total > 0 ? (double)total_correct / (double)total_total : 0.0);
-        double qps = num_queries / elapsed;
-        double qps_per_thread = qps / num_threads;
-
-        std::cout << "Search completed in " << elapsed << "s";
-        if (!skip_recall) {
-            std::cout << ": Recall@" << k << " = " << std::fixed << std::setprecision(4) << recall;
-        }
-        std::cout << "\n  QPS: " << std::fixed << std::setprecision(0) << qps
-                  << " (total), " << qps_per_thread << " q/s/thread" << std::endl;
-
-        // Record statistics
-        DetailedStats::OperationStats op_stats;
-        op_stats.name = step_name;
-        op_stats.type = "search";
-        op_stats.time = elapsed;
-        op_stats.successful = num_queries;
-        op_stats.failed = 0;
-        op_stats.recall = recall;
-        op_stats.k = k;
-        op_stats.active_count = active_indices.size();
-        op_stats.num_threads = num_threads;
-        op_stats.throughput_per_thread = qps_per_thread;
-
-        stats.operations.push_back(op_stats);
-        updateCategoryStats(stats.search_stats, op_stats);
-
-        return {
-            {"recall", recall},
-            {"total_correct", (double)total_correct},
-            {"total_total", (double)total_total},
-            {"time", elapsed}
-        };
     }
 
     // Set crash simulation target (random step and operation)
@@ -1137,11 +517,111 @@ public:
                   << step_operations[selected_idx].second << " operations in this step)" << std::endl;
     }
 
-    // Execute runbook
+public:
+    PGVectorSlidingWindowTest(size_t dimension,
+                               const std::string& gt_directory,
+                               const std::string& db_host,
+                               const std::string& db_port,
+                               const std::string& db_name,
+                               const std::string& db_user,
+                               const std::string& db_password,
+                               int hnsw_m,
+                               int hnsw_ef_construction,
+                               int hnsw_ef_search,
+                               double qps,
+                               int threads,
+                               bool enable_crash_simulation = false,
+                               bool skip_recall = false)
+        : dim(dimension), table_name("vectors"), gt_dir(gt_directory),
+          hnsw_m(hnsw_m), hnsw_ef_construction(hnsw_ef_construction), 
+          hnsw_ef_search(hnsw_ef_search), target_qps(qps), num_threads(threads),
+          simulate_crash(enable_crash_simulation), db_host(db_host), 
+          db_port(db_port), skip_recall_computation(skip_recall) {
+        
+        // Initialize thread-local connection manager
+        ThreadLocalConnection::init(db_host, db_port, db_name, db_user, db_password);
+
+        // Ensure GT directory exists
+        std::string cmd = "mkdir -p " + gt_dir;
+        (void)system(cmd.c_str());
+    }
+
+    ~PGVectorSlidingWindowTest() {
+        ThreadLocalConnection::cleanup();
+    }
+
+    // Initialize database table
+    void setup(bool recreate_table = true) {
+        PGconn* conn = ThreadLocalConnection::get_main();
+        if (!conn) {
+            throw std::runtime_error("No database connection available");
+        }
+
+        std::cout << "Setting up database..." << std::endl;
+
+        // Create pgvector extension
+        PGresult* res = PQexec(conn, "CREATE EXTENSION IF NOT EXISTS vector");
+        PQclear(res);
+
+        if (recreate_table) {
+            // Drop old table
+            res = PQexec(conn, ("DROP TABLE IF EXISTS " + table_name).c_str());
+            PQclear(res);
+
+            // Create new table
+            std::stringstream create_sql;
+            create_sql << "CREATE TABLE " << table_name << " ("
+                       << "id BIGINT PRIMARY KEY, "
+                       << "embedding vector(" << dim << ")"
+                       << ")";
+            res = PQexec(conn, create_sql.str().c_str());
+            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+                throw std::runtime_error("Failed to create table: " + std::string(PQerrorMessage(conn)));
+            }
+            PQclear(res);
+
+            std::cout << "✔ Table created: " << table_name << std::endl;
+            std::cout << "✔ Database setup complete (index will be created after initial data load)" << std::endl;
+        } else {
+            std::cout << "✔ Using existing table: " << table_name << std::endl;
+        }
+    }
+
+    // Create HNSW index
+    void create_index() {
+        Timer timer;
+        PGconn* conn = ThreadLocalConnection::get_main();
+        if (!conn) {
+            throw std::runtime_error("No database connection available");
+        }
+
+        std::cout << "Creating HNSW index..." << std::endl;
+
+        PGresult* res = PQexec(conn, "SET maintenance_work_mem = '8GB'");
+        PQclear(res);
+
+        std::stringstream index_sql;
+        index_sql << "CREATE INDEX ON " << table_name 
+                  << " USING hnsw (embedding vector_l2_ops) WITH ("
+                  << "m = " << hnsw_m << ", "
+                  << "ef_construction = " << hnsw_ef_construction
+                  << ")";
+        
+        res = PQexec(conn, index_sql.str().c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            throw std::runtime_error("Failed to create index: " + std::string(PQerrorMessage(conn)));
+        }
+        PQclear(res);
+
+        double elapsed = timer.elapsed_seconds();
+        std::cout << "✔ HNSW index created in " << elapsed << "s" << std::endl;
+    }
+
+    // Execute runbook in mixed mode with QPS control
     void execute_runbook(const std::string& runbook_file, const std::string& dataset_name,
                          float* dataset, float* queries, size_t num_queries,
-                         int num_threads, size_t checkpoint_size,
-                         size_t start_step = 0, size_t end_step = 0, size_t build_index_before = 0,
+                         size_t start_step = 0, size_t end_step = 0, 
+                         size_t build_index_before = 0,
                          size_t mixed_mode_start = 0, size_t mixed_size = 0) {
         Timer overall_timer;
 
@@ -1165,7 +645,6 @@ public:
         bool in_mixed_mode = (mixed_mode_start > 0 && mixed_size > 0);
 
         // First pass: build active_ranges from the beginning (needed for correct GT filename hash)
-        // This ensures the hash matches compute_ground_truth.cpp which processes all steps
         if (start_step > 0) {
             size_t range_step_num = 0;
             for (auto it = operations.begin(); it != operations.end(); ++it) {
@@ -1175,7 +654,7 @@ public:
                 }
                 range_step_num++;
                 if (range_step_num >= start_step) {
-                    break;  // Stop when we reach start_step
+                    break;
                 }
                 auto step = it->second;
                 std::string op = step["operation"].as<std::string>();
@@ -1187,7 +666,7 @@ public:
             }
         }
 
-        // Collect all steps first for mixed mode processing
+        // Collect all steps
         struct StepInfo {
             size_t step_num;
             std::string step_key;
@@ -1213,7 +692,10 @@ public:
             all_steps.push_back({step_num, step_key, step, op});
         }
 
-        // Execute operations - sequential or mixed mode
+        // Initialize rate limiter
+        RateLimiter rate_limiter(target_qps);
+
+        // Execute operations - mixed mode only
         step_num = 0;
         for (size_t i = 0; i < all_steps.size(); i++) {
             const auto& step_info = all_steps[i];
@@ -1234,7 +716,7 @@ public:
                 for (size_t j = i; j < all_steps.size() && mixed_steps.size() < mixed_size; j++) {
                     if (all_steps[j].step_num >= mixed_mode_start) {
                         mixed_steps.push_back(all_steps[j]);
-                        i = j;  // Update outer loop index
+                        i = j;
                     } else {
                         break;
                     }
@@ -1243,12 +725,12 @@ public:
                 if (!mixed_steps.empty()) {
                     std::cout << "\n========================================" << std::endl;
                     std::cout << "MIXED MODE: Processing " << mixed_steps.size() 
-                              << " steps concurrently with " << num_threads << " threads" << std::endl;
+                              << " steps with " << num_threads << " threads, QPS=" << target_qps << " per thread" << std::endl;
                     std::cout << "========================================" << std::endl;
 
                     Timer mixed_timer;
                     
-                    // Structure to hold step information (no atomic members - they're stored separately)
+                    // Structure to hold step information
                     struct StepInfo {
                         std::string op;
                         size_t start;
@@ -1256,17 +738,15 @@ public:
                         size_t total_items;
                         size_t step_num;
                         std::string step_key;
-                        size_t k;  // For search operations
+                        size_t k;
                     };
                     
                     std::vector<StepInfo> step_infos;
-                    // Store atomic counters separately using unique_ptr (atomic is not copyable/movable)
-                    // We use unique_ptr to avoid vector reallocation issues
+                    // Use atomic counters for thread-safe operation tracking
                     std::vector<std::unique_ptr<std::atomic<size_t>>> step_next_items;
                     std::vector<size_t> step_successful_counts(mixed_steps.size(), 0);
                     std::vector<size_t> step_failed_counts(mixed_steps.size(), 0);
                     std::mutex counters_mutex;  // For protecting counter updates
-                    std::mutex stats_mutex;  // For protecting active_indices updates
                     
                     // Initialize step information
                     size_t total_operations = 0;
@@ -1290,14 +770,11 @@ public:
                             total_items = num_queries;
                             k = mixed_step.step["k"].as<size_t>(100);
                         } else {
-                            continue;  // Skip unknown operations
+                            continue;
                         }
                         
-                        // Add step info (copyable struct)
                         step_infos.push_back({op, start, end, total_items, step_num, step_key, k});
-                        // Add atomic counter separately using unique_ptr
                         step_next_items.push_back(std::make_unique<std::atomic<size_t>>(0));
-                        
                         total_operations += total_items;
                     }
                     
@@ -1316,8 +793,7 @@ public:
                     }
                     std::cout << "  Total operations: " << total_operations << std::endl;
                     
-                    // Generate array: each element is a step index (0 to mixed_size-1)
-                    // Count of step index i equals the number of operations in step i
+                    // Generate array: each element is a step index
                     std::vector<size_t> step_index_array;
                     step_index_array.reserve(total_operations);
                     for (size_t step_idx = 0; step_idx < step_infos.size(); step_idx++) {
@@ -1333,25 +809,34 @@ public:
                     
                     std::cout << "  Generated shuffled work array of size " << step_index_array.size() << std::endl;
                     
-                    // Process the step_index_array in parallel
-                    // Each thread processes elements from the array and executes the corresponding operation
+                    // Process the step_index_array in parallel with rate limiting per thread
                     #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 100)
                     for (size_t array_idx = 0; array_idx < step_index_array.size(); array_idx++) {
+                        // Thread-local rate limiter (each thread maintains its own QPS)
+                        thread_local RateLimiter* rate_limiter = nullptr;
+                        if (rate_limiter == nullptr) {
+                            rate_limiter = new RateLimiter(target_qps);
+                        }
+                        
+                        // Get thread-local connection
+                        PGconn* conn = ThreadLocalConnection::get();
+                        if (!conn) {
+                            continue;
+                        }
+                        
                         size_t step_idx = step_index_array[array_idx];
                         StepInfo& step_info = step_infos[step_idx];
                         
-                        // Atomically get the next operation index within this step (maintains order)
+                        // Atomically get the next operation index within this step
                         size_t item_idx = step_next_items[step_idx]->fetch_add(1, std::memory_order_relaxed);
                         
-                        // Safety check (should never happen if array is correctly generated)
+                        // Safety check
                         if (item_idx >= step_info.total_items) {
                             continue;
                         }
                         
-                        PGconn* conn = ThreadLocalConnection::get();
-                        if (!conn) {
-                            std::lock_guard<std::mutex> lock(counters_mutex);
-                            step_failed_counts[step_idx]++;
+                        // Check if we should stop (check atomic flag)
+                        if (should_stop.load(std::memory_order_relaxed)) {
                             continue;
                         }
                         
@@ -1362,12 +847,31 @@ public:
                                 if (simulate_crash) {
                                     kill_postgres_master();
                                     simulate_crash = false;  // Prevent multiple kills
+                                    should_stop.store(true, std::memory_order_relaxed);
+                                    std::cout << "\n[CRASH SIMULATION] Stopping execution after crash" << std::endl;
                                 }
                             }
                             continue;
                         }
                         
+                        // Check if we should stop after crash check
+                        if (should_stop.load(std::memory_order_relaxed)) {
+                            continue;
+                        }
+                        
+                        // Rate limiting: wait if needed to maintain QPS (per thread)
+                        rate_limiter->wait_if_needed();
+                        
+                        // Check connection status before operation
+                        if (PQstatus(conn) != CONNECTION_OK) {
+                            std::cerr << "\n[ERROR] Database connection lost. Stopping execution." << std::endl;
+                            std::cerr << "[ERROR] Connection error: " << PQerrorMessage(conn) << std::endl;
+                            should_stop.store(true, std::memory_order_relaxed);
+                            continue;
+                        }
+                        
                         // Execute the operation
+                        bool operation_failed = false;
                         if (step_info.op == "insert") {
                             size_t vec_idx = step_info.start + item_idx;
                             std::stringstream sql;
@@ -1375,13 +879,14 @@ public:
                                 << vec_idx << "," << vector_to_sql(dataset + vec_idx * dim, dim)
                                 << ") ON CONFLICT (id) DO NOTHING";
                             PGresult* res = PQexec(conn, sql.str().c_str());
-                            {
+                            if (PQresultStatus(res) == PGRES_COMMAND_OK) {
                                 std::lock_guard<std::mutex> lock(counters_mutex);
-                                if (PQresultStatus(res) == PGRES_COMMAND_OK) {
-                                    step_successful_counts[step_idx]++;
-                                } else {
-                                    step_failed_counts[step_idx]++;
-                                }
+                                step_successful_counts[step_idx]++;
+                            } else {
+                                std::lock_guard<std::mutex> lock(counters_mutex);
+                                step_failed_counts[step_idx]++;
+                                operation_failed = true;
+                                std::cerr << "\n[ERROR] Insert operation failed: " << PQerrorMessage(conn) << std::endl;
                             }
                             PQclear(res);
                         }
@@ -1390,13 +895,19 @@ public:
                             std::stringstream sql;
                             sql << "DELETE FROM " << table_name << " WHERE id = " << vec_idx;
                             PGresult* res = PQexec(conn, sql.str().c_str());
-                            {
+                            if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+                                char* tuples = PQcmdTuples(res);
                                 std::lock_guard<std::mutex> lock(counters_mutex);
-                                if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+                                if (tuples && std::atoi(tuples) > 0) {
                                     step_successful_counts[step_idx]++;
                                 } else {
                                     step_failed_counts[step_idx]++;
                                 }
+                            } else {
+                                std::lock_guard<std::mutex> lock(counters_mutex);
+                                step_failed_counts[step_idx]++;
+                                operation_failed = true;
+                                std::cerr << "\n[ERROR] Delete operation failed: " << PQerrorMessage(conn) << std::endl;
                             }
                             PQclear(res);
                         }
@@ -1414,34 +925,53 @@ public:
                                     << " ORDER BY embedding <-> " << vector_to_sql(queries + item_idx * dim, dim)
                                     << " LIMIT " << step_info.k;
                                 PGresult* res = PQexec(conn, sql.str().c_str());
-                                {
+                                if (PQresultStatus(res) == PGRES_TUPLES_OK) {
                                     std::lock_guard<std::mutex> lock(counters_mutex);
-                                    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
-                                        step_successful_counts[step_idx]++;
-                                    } else {
-                                        step_failed_counts[step_idx]++;
-                                    }
+                                    step_successful_counts[step_idx]++;
+                                } else {
+                                    std::lock_guard<std::mutex> lock(counters_mutex);
+                                    step_failed_counts[step_idx]++;
+                                    operation_failed = true;
+                                    std::cerr << "\n[ERROR] Search operation failed: " << PQerrorMessage(conn) << std::endl;
                                 }
                                 PQclear(res);
                             }
                         }
+                        
+                        // If operation failed, set stop flag
+                        if (operation_failed) {
+                            should_stop.store(true, std::memory_order_relaxed);
+                            std::cerr << "[ERROR] Stopping execution after first failure." << std::endl;
+                            continue;
+                        }
+                        
+                        // Check connection status after operation
+                        if (PQstatus(conn) != CONNECTION_OK) {
+                            std::cerr << "\n[ERROR] Database connection lost during operation. Stopping execution." << std::endl;
+                            std::cerr << "[ERROR] Connection error: " << PQerrorMessage(conn) << std::endl;
+                            should_stop.store(true, std::memory_order_relaxed);
+                            continue;
+                        }
+                    }
+                    
+                    // Check if we stopped early
+                    if (should_stop.load(std::memory_order_relaxed)) {
+                        std::cout << "\n[WARNING] Execution stopped early due to crash or failure." << std::endl;
+                        std::cout << "[WARNING] Statistics below reflect partial execution." << std::endl;
                     }
                     
                     // Final update of active_indices and active_ranges
-                    {
-                        std::lock_guard<std::mutex> lock(stats_mutex);
-                        for (const auto& step_info : step_infos) {
-                            if (step_info.op == "insert") {
-                                for (size_t i = step_info.start; i < step_info.end; i++) {
-                                    active_indices.insert(i);
-                                }
-                                active_ranges.emplace_back("insert", step_info.start, step_info.end);
-                            } else if (step_info.op == "delete") {
-                                for (size_t i = step_info.start; i < step_info.end; i++) {
-                                    active_indices.erase(i);
-                                }
-                                active_ranges.emplace_back("delete", step_info.start, step_info.end);
+                    for (const auto& step_info : step_infos) {
+                        if (step_info.op == "insert") {
+                            for (size_t i = step_info.start; i < step_info.end; i++) {
+                                active_indices.insert(i);
                             }
+                            active_ranges.emplace_back("insert", step_info.start, step_info.end);
+                        } else if (step_info.op == "delete") {
+                            for (size_t i = step_info.start; i < step_info.end; i++) {
+                                active_indices.erase(i);
+                            }
+                            active_ranges.emplace_back("delete", step_info.start, step_info.end);
                         }
                     }
                     
@@ -1453,6 +983,7 @@ public:
                         size_t successful = step_successful_counts[step_idx];
                         size_t failed = step_failed_counts[step_idx];
                         double throughput = successful / mixed_elapsed;
+                        double actual_qps = (target_qps > 0) ? target_qps : throughput;
                         
                         std::cout << "  [Mixed] Step " << step_info.step_num << " - " 
                                   << step_info.step_key << " (" << step_info.op << "): "
@@ -1469,8 +1000,7 @@ public:
                         op_stats.active_count = active_indices.size();
                         op_stats.start_idx = step_info.start;
                         op_stats.end_idx = step_info.end;
-                        op_stats.num_threads = num_threads;
-                        op_stats.throughput_per_thread = throughput / num_threads;
+                        op_stats.actual_qps = actual_qps;
                         if (step_info.op == "search") {
                             op_stats.recall = 0.0;  // Skip recall in mixed mode
                             op_stats.k = step_info.k;
@@ -1490,36 +1020,10 @@ public:
                               << mixed_elapsed << "s" << std::endl;
                 }
             } else {
-                // Sequential mode (original behavior)
                 std::cout << "\n========================================" << std::endl;
                 std::cout << "Step " << step_num << " - " << step_info.step_key << ": " << step_info.op << std::endl;
                 std::cout << "========================================" << std::endl;
-
-                std::map<std::string, double> result;
-
-                if (step_info.op == "insert") {
-                    size_t start = step_info.step["start"].as<size_t>(0);
-                    size_t end = step_info.step["end"].as<size_t>(0);
-                    result = parallel_insert(dataset, start, end, num_threads, checkpoint_size, step_info.step_key, step_num);
-                }
-                else if (step_info.op == "delete") {
-                    size_t start = step_info.step["start"].as<size_t>(0);
-                    size_t end = step_info.step["end"].as<size_t>(0);
-                    result = parallel_delete(start, end, num_threads, checkpoint_size, step_info.step_key, step_num);
-                }
-                else if (step_info.op == "search") {
-                    if (queries != nullptr) {
-                        size_t k = step_info.step["k"].as<size_t>(100);
-                        result = parallel_search(dataset, queries, num_queries, k,
-                                                 num_threads, step_num, runbook_name, step_info.step_key, skip_recall_computation);
-                    } else {
-                        std::cout << "Skipping search - no queries available" << std::endl;
-                        result = { {"time", 0.0} };
-                    }
-                }
-
-                std::cout << "✔ Step " << step_info.step_key << " completed in "
-                          << result["time"] << " seconds" << std::endl;
+                std::cout << "Note: This script only supports mixed mode. Skipping sequential step." << std::endl;
             }
         }
 
@@ -1529,7 +1033,7 @@ public:
 
     void print_summary() {
         std::cout << "\n╔══════════════════════════════════════════════════════════════════════════════╗" << std::endl;
-        std::cout << "║                      PGVECTOR SLIDING WINDOW TEST SUMMARY                    ║" << std::endl;
+        std::cout << "║              PGVECTOR SLIDING WINDOW TEST SUMMARY (Multi-threaded)           ║" << std::endl;
         std::cout << "╚══════════════════════════════════════════════════════════════════════════════╝" << std::endl;
 
         std::cout << "\n┌───────────────────────── OVERALL STATISTICS ────────────────────────────────┐" << std::endl;
@@ -1539,40 +1043,18 @@ public:
         std::cout << "│   - Inserts: " << stats.insert_stats.count << std::endl;
         std::cout << "│   - Deletes: " << stats.delete_stats.count << std::endl;
         std::cout << "│   - Searches: " << stats.search_stats.count << std::endl;
-        std::cout << "│ Max Threads Used: " << stats.max_threads_used << std::endl;
+        std::cout << "│ Threads: " << num_threads << std::endl;
+        std::cout << "│ Target QPS per thread: " << (target_qps > 0 ? std::to_string(target_qps) : "unlimited") << std::endl;
+        std::cout << "│ Total Target QPS: " << (target_qps > 0 ? std::to_string(target_qps * num_threads) : "unlimited") << std::endl;
         std::cout << "└──────────────────────────────────────────────────────────────────────────────┘" << std::endl;
 
-        std::cout << "\n┌───────────────────────── PERFORMANCE SUMMARY ───────────────────────────────┐" << std::endl;
-        std::cout << "│ Peak INSERT Throughput: " << std::fixed << std::setprecision(0) 
-                  << stats.peak_insert_throughput << " vec/s" << std::endl;
-        std::cout << "│   Per-thread: " << stats.peak_insert_throughput_per_thread << " vec/s/thread" << std::endl;
-        std::cout << "│ Peak DELETE Throughput: " << stats.peak_delete_throughput << " vec/s" << std::endl;
-        std::cout << "│   Per-thread: " << stats.peak_delete_throughput_per_thread << " vec/s/thread" << std::endl;
-        std::cout << "│ Peak SEARCH QPS: " << stats.peak_search_qps << " q/s" << std::endl;
-        std::cout << "│   Per-thread: " << stats.peak_search_qps_per_thread << " q/s/thread" << std::endl;
-
-        if (!stats.search_stats.recall_values.empty()) {
-            double avg_recall = 0;
-            for (double r : stats.search_stats.recall_values) avg_recall += r;
-            avg_recall /= stats.search_stats.recall_values.size();
-            
-            std::cout << "│" << std::endl;
-            std::cout << "│ RECALL Statistics:" << std::endl;
-            std::cout << "│   Average: " << std::fixed << std::setprecision(4) << avg_recall << std::endl;
-            std::cout << "│   Min: " << stats.search_stats.min_recall << std::endl;
-            std::cout << "│   Max: " << stats.search_stats.max_recall << std::endl;
-        }
-        std::cout << "└──────────────────────────────────────────────────────────────────────────────┘" << std::endl;
-
-        // Detailed operation log
         std::cout << "\n┌───────────────────────── DETAILED OPERATION LOG ────────────────────────────┐" << std::endl;
         std::cout << "│ " << std::left 
                   << std::setw(12) << "Step" 
                   << std::setw(8) << "Type"
                   << std::setw(10) << "Time(s)"
                   << std::setw(10) << "Success"
-                  << std::setw(8) << "Threads"
-                  << std::setw(12) << "TP/Thread"
+                  << std::setw(12) << "Actual QPS"
                   << std::setw(10) << "Recall" << " │" << std::endl;
         std::cout << "│ " << std::string(68, '-') << " │" << std::endl;
         
@@ -1582,8 +1064,7 @@ public:
                       << std::setw(8) << op.type.substr(0, 7)
                       << std::setw(10) << std::fixed << std::setprecision(2) << op.time
                       << std::setw(10) << op.successful
-                      << std::setw(8) << op.num_threads
-                      << std::setw(12) << std::fixed << std::setprecision(0) << op.throughput_per_thread;
+                      << std::setw(12) << std::fixed << std::setprecision(0) << op.actual_qps;
             
             if (op.type == "search" && op.recall > 0) {
                 std::cout << std::setw(10) << std::fixed << std::setprecision(4) << op.recall;
@@ -1605,21 +1086,21 @@ public:
 // Main function
 // ===============================
 void print_usage(const char* prog_name) {
-    std::cerr << "Usage: " << prog_name << " <num_threads> [options]" << std::endl;
+    std::cerr << "Usage: " << prog_name << " [options]" << std::endl;
     std::cerr << "\nRequired arguments:" << std::endl;
-    std::cerr << "  <num_threads>              Number of threads for parallel operations" << std::endl;
+    std::cerr << "  --num-threads <n>            Number of threads for parallel operations" << std::endl;
+    std::cerr << "  --qps <qps>                  Target QPS (queries per second) per thread for rate limiting" << std::endl;
+    std::cerr << "  --dataset <path>            Path to dataset .fvecs file" << std::endl;
+    std::cerr << "  --queries <path>             Path to queries .fvecs file" << std::endl;
+    std::cerr << "  --runbook <path>            Path to runbook YAML file" << std::endl;
+    std::cerr << "  --dataset-name <name>       Dataset name in runbook" << std::endl;
+    std::cerr << "  --mixed-mode-start <num>    Start step for mixed mode (1-based)" << std::endl;
+    std::cerr << "  --mixed-size <size>         Number of steps per group in mixed mode" << std::endl;
     std::cerr << "\nOptional arguments:" << std::endl;
-    std::cerr << "  --checkpoint-size <size>    Checkpoint size for batching (default: 1000)" << std::endl;
-    std::cerr << "  --dataset <path>            Path to dataset .fvecs file (required)" << std::endl;
-    std::cerr << "  --queries <path>             Path to queries .fvecs file (required)" << std::endl;
-    std::cerr << "  --runbook <path>            Path to runbook YAML file (required)" << std::endl;
-    std::cerr << "  --dataset-name <name>        Dataset name in runbook (required)" << std::endl;
     std::cerr << "  --gt-dir <path>             Ground truth directory (default: ./ground_truth)" << std::endl;
     std::cerr << "  --start-step <num>          First step to process (1-based, default: process all)" << std::endl;
     std::cerr << "  --end-step <num>            Last step to process (1-based, default: process all)" << std::endl;
     std::cerr << "  --build-index-before <num>  Create index before this step (1-based, default: auto)" << std::endl;
-    std::cerr << "  --mixed-mode-start <num>    Start step for mixed mode (1-based, default: disabled)" << std::endl;
-    std::cerr << "  --mixed-size <size>         Number of steps per group in mixed mode (default: 0, disabled)" << std::endl;
     std::cerr << "  --db-host <host>            PostgreSQL host (default: localhost)" << std::endl;
     std::cerr << "  --db-port <port>            PostgreSQL port (default: 5432)" << std::endl;
     std::cerr << "  --db-name <name>            PostgreSQL database name (default: vector_benchmark)" << std::endl;
@@ -1630,8 +1111,6 @@ void print_usage(const char* prog_name) {
     std::cerr << "  --hnsw-ef-search <ef>        HNSW ef_search parameter (default: 200)" << std::endl;
     std::cerr << "  --simulate-crash            Enable crash simulation (kills PostgreSQL at random step/operation)" << std::endl;
     std::cerr << "  --skip-recall               Skip recall computation for search operations (default: false)" << std::endl;
-    std::cerr << "  --transaction-batch-size <n> Group n operations per transaction (default: 0, disabled)" << std::endl;
-    std::cerr << "                               Only applies when mixed mode is NOT enabled" << std::endl;
 }
 
 int main(int argc, char** argv) {
@@ -1641,8 +1120,8 @@ int main(int argc, char** argv) {
     }
 
     Config config;
-    int num_threads = std::atoi(argv[1]);
-    size_t checkpoint_size = 1000;
+    int num_threads = 1;
+    double target_qps = 0.0;
     size_t start_step = 0;
     size_t end_step = 0;
     size_t build_index_before = 0;
@@ -1650,13 +1129,14 @@ int main(int argc, char** argv) {
     size_t mixed_size = 0;
     bool simulate_crash = false;
     bool skip_recall = false;
-    size_t transaction_batch_size = 0;
 
     // Parse command line arguments
-    for (int i = 2; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--checkpoint-size" && i + 1 < argc) {
-            checkpoint_size = (size_t)std::atoi(argv[++i]);
+        if (arg == "--num-threads" && i + 1 < argc) {
+            num_threads = std::atoi(argv[++i]);
+        } else if (arg == "--qps" && i + 1 < argc) {
+            target_qps = std::atof(argv[++i]);
         } else if (arg == "--dataset" && i + 1 < argc) {
             config.DATASET_PATH = argv[++i];
         } else if (arg == "--queries" && i + 1 < argc) {
@@ -1697,8 +1177,6 @@ int main(int argc, char** argv) {
             simulate_crash = true;
         } else if (arg == "--skip-recall") {
             skip_recall = true;
-        } else if (arg == "--transaction-batch-size" && i + 1 < argc) {
-            transaction_batch_size = (size_t)std::atoi(argv[++i]);
         } else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             print_usage(argv[0]);
@@ -1707,9 +1185,24 @@ int main(int argc, char** argv) {
     }
 
     // Validate required arguments
+    if (num_threads <= 0) {
+        std::cerr << "Error: --num-threads is required and must be > 0" << std::endl;
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (target_qps <= 0) {
+        std::cerr << "Error: --qps is required and must be > 0" << std::endl;
+        print_usage(argv[0]);
+        return 1;
+    }
     if (config.DATASET_PATH.empty() || config.QUERY_PATH.empty() || 
         config.RUNBOOK_PATH.empty() || config.DATASET_NAME.empty()) {
         std::cerr << "Error: --dataset, --queries, --runbook, and --dataset-name are required" << std::endl;
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (mixed_mode_start == 0 || mixed_size == 0) {
+        std::cerr << "Error: --mixed-mode-start and --mixed-size are required" << std::endl;
         print_usage(argv[0]);
         return 1;
     }
@@ -1718,27 +1211,22 @@ int main(int argc, char** argv) {
         config.GT_DIR = "./ground_truth";
     }
 
-    // Validate: transaction batching only works when mixed mode is NOT enabled
-    if (transaction_batch_size > 0 && mixed_mode_start > 0 && mixed_size > 0) {
-        std::cerr << "Error: --transaction-batch-size cannot be used with mixed mode" << std::endl;
-        std::cerr << "Transaction batching is only available when mixed mode is disabled" << std::endl;
-        return 1;
-    }
-
     // Set OpenMP thread count
     omp_set_num_threads(num_threads);
 
     std::cout << "========================================" << std::endl;
     std::cout << "PGVECTOR HNSW SLIDING WINDOW TEST (C++)" << std::endl;
+    std::cout << "Multi-threaded with QPS control" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Configuration:" << std::endl;
     std::cout << "  Threads: " << num_threads << std::endl;
+    std::cout << "  Target QPS per thread: " << target_qps << std::endl;
+    std::cout << "  Total target QPS: " << (target_qps * num_threads) << std::endl;
     std::cout << "  Dataset: " << config.DATASET_PATH << std::endl;
     std::cout << "  Queries: " << config.QUERY_PATH << std::endl;
     std::cout << "  Runbook: " << config.RUNBOOK_PATH << std::endl;
     std::cout << "  Dataset name: " << config.DATASET_NAME << std::endl;
     std::cout << "  GT directory: " << config.GT_DIR << std::endl;
-    std::cout << "  Checkpoint size: " << checkpoint_size << std::endl;
     if (start_step > 0) {
         std::cout << "  Start step: " << start_step << std::endl;
     }
@@ -1748,20 +1236,8 @@ int main(int argc, char** argv) {
     if (build_index_before > 0) {
         std::cout << "  Build index before step: " << build_index_before << std::endl;
     }
-    if (mixed_mode_start > 0 && mixed_size > 0) {
-        std::cout << "  Mixed mode: enabled (start at step " << mixed_mode_start 
-                  << ", mixed size: " << mixed_size << ")" << std::endl;
-    }
-    if (simulate_crash) {
-        std::cout << "  Crash simulation: ENABLED (will kill PostgreSQL at random step/operation)" << std::endl;
-    }
-    if (skip_recall) {
-        std::cout << "  Skip recall computation: ENABLED" << std::endl;
-    }
-    if (transaction_batch_size > 0) {
-        std::cout << "  Transaction batching: enabled (" << transaction_batch_size 
-                  << " operations per transaction)" << std::endl;
-    }
+    std::cout << "  Mixed mode: enabled (start at step " << mixed_mode_start 
+              << ", mixed size: " << mixed_size << ")" << std::endl;
     std::cout << "  DB Host: " << config.DB_HOST << std::endl;
     std::cout << "  DB Port: " << config.DB_PORT << std::endl;
     std::cout << "  DB Name: " << config.DB_NAME << std::endl;
@@ -1769,6 +1245,12 @@ int main(int argc, char** argv) {
     std::cout << "  HNSW M: " << config.HNSW_M << std::endl;
     std::cout << "  HNSW ef_construction: " << config.HNSW_EF_CONSTRUCTION << std::endl;
     std::cout << "  HNSW ef_search: " << config.HNSW_EF_SEARCH << std::endl;
+    if (simulate_crash) {
+        std::cout << "  Crash simulation: ENABLED (will kill PostgreSQL at random step/operation)" << std::endl;
+    }
+    if (skip_recall) {
+        std::cout << "  Skip recall computation: ENABLED" << std::endl;
+    }
     std::cout << "========================================\n" << std::endl;
 
     try {
@@ -1804,17 +1286,15 @@ int main(int argc, char** argv) {
             config.HNSW_M,
             config.HNSW_EF_CONSTRUCTION,
             config.HNSW_EF_SEARCH,
+            target_qps,
+            num_threads,
             simulate_crash,
-            0,  // crash_step (will be set by set_crash_target)
-            0,  // crash_operation (will be set by set_crash_target)
-            skip_recall,
-            transaction_batch_size
+            skip_recall
         );
 
         // Execute test
         test.execute_runbook(config.RUNBOOK_PATH, config.DATASET_NAME,
                              dataset.data(), queries.data(), num_queries,
-                             num_threads, checkpoint_size,
                              start_step, end_step, build_index_before,
                              mixed_mode_start, mixed_size);
 
@@ -1830,76 +1310,16 @@ int main(int argc, char** argv) {
     return 0;
 }
 
+// ./pgvector_test_2 --num-threads 16 --qps 50 --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs \
+// --queries /ssd_root/dataset/turing10m/msturing-query.fvecs --runbook msturing-10M_slidingwindow_1M_runbook.yaml \
+// --dataset-name msturing-10M --gt-dir /ssd_root/liu4127/msturing_runbook_gt \
+// --db-host localhost --db-port 5434 --db-name postgres --db-user liu4127 --db-password "" \
+// --hnsw-m 16 --hnsw-ef-construction 40 --hnsw-ef-search 200 \
+// --start-step 21  --end-step 21 --mixed-mode-start 21  --mixed-size 3 --skip-recall
 
-// ./pgvector_test 1 \
-// --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs \
-// --queries /ssd_root/dataset/turing10m/msturing-query.fvecs \
-// --runbook msturing-10M_slidingwindow_runbook.yaml \
-// --dataset-name msturing-10M \
-// --checkpoint-size 1000 \
-// --gt-dir /ssd_root/liu4127/msturing_runbook_gt \
-// --db-host localhost \
-// --db-port 5434 \
-// --db-name postgres \
-// --db-user liu4127 \
-// --db-password "" \
-// --hnsw-m 16 \
-// --hnsw-ef-construction 40 \
-// --hnsw-ef-search 200 \
-// --start-step 101  --end-step 400  --build-index-before 101 \
-// --mixed-mode-start 101  --mixed-size 3
-
-
-// test recovery
-// ./pgvector_test 1 \
-// --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs \
-// --queries /ssd_root/dataset/turing10m/msturing-query.fvecs \
-// --runbook msturing-10M_slidingwindow_runbook.yaml \
-// --dataset-name msturing-10M \
-// --checkpoint-size 1000 \
-// --gt-dir /ssd_root/liu4127/msturing_runbook_gt \
-// --db-host localhost \
-// --db-port 5434 \
-// --db-name postgres \
-// --db-user liu4127 \
-// --db-password "" \
-// --hnsw-m 16 \
-// --hnsw-ef-construction 40 \
-// --hnsw-ef-search 200 \
-// --start-step 101  --end-step 400  \
-// --mixed-mode-start 101  --mixed-size 3  --simulate-crash
-
-// ./pgvector_test 1 \
-// --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs \
-// --queries /ssd_root/dataset/turing10m/msturing-query.fvecs \
-// --runbook msturing-10M_slidingwindow_runbook.yaml \
-// --dataset-name msturing-10M \
-// --checkpoint-size 1000 \
-// --gt-dir /ssd_root/liu4127/msturing_runbook_gt \
-// --db-host localhost \
-// --db-port 5434 \
-// --db-name postgres \
-// --db-user liu4127 \
-// --db-password "" \
-// --hnsw-m 16 \
-// --hnsw-ef-construction 40 \
-// --hnsw-ef-search 200 \
-// --start-step 101  --end-step 101
-
-
-// ./pgvector_test 1 \
-// --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs \
-// --queries /ssd_root/dataset/turing10m/msturing-query.fvecs \
-// --runbook msturing-10M_slidingwindow_runbook.yaml \
-// --dataset-name msturing-10M \
-// --checkpoint-size 1000 \
-// --gt-dir /ssd_root/liu4127/msturing_runbook_gt \
-// --db-host localhost \
-// --db-port 5434 \
-// --db-name postgres \
-// --db-user liu4127 \
-// --db-password "" \
-// --hnsw-m 16 \
-// --hnsw-ef-construction 40 \
-// --hnsw-ef-search 200 \
-// --start-step 101  --end-step 101  --build-index-before 101
+// ./pgvector_test_2 --num-threads 16 --qps 50 --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs \
+// --queries /ssd_root/dataset/turing10m/msturing-query.fvecs --runbook msturing-10M_slidingwindow_1M_runbook.yaml \
+// --dataset-name msturing-10M --gt-dir /ssd_root/liu4127/msturing_runbook_gt \
+// --db-host localhost --db-port 5434 --db-name postgres --db-user liu4127 --db-password "" \
+// --hnsw-m 16 --hnsw-ef-construction 40 --hnsw-ef-search 200 \
+// --start-step 21  --end-step 60  --mixed-mode-start 21  --mixed-size 3  --simulate-crash
