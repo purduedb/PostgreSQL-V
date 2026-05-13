@@ -4,6 +4,7 @@
 #include "postgres.h"
 #include "access/genam.h"
 #include "storage/lwlock.h"
+#include "storage/condition_variable.h"
 
 #include "utils.h"
 #include <sys/stat.h>
@@ -22,6 +23,15 @@ typedef enum IndexType
 // Set this to 1 to enable DiskANN, 0 to use HNSW
 #ifndef IS_DISK_BASED
 #define IS_DISK_BASED 0
+#endif
+
+// Set this to 1 to enable 2-phase mmap cold-start on IndexLoadTaskType:
+//   phase 1 = mmap-load all segments quickly → signal backend immediately;
+//   phase 2 = background upgrade each segment to full in-memory.
+// Set to 0 to skip mmap and fully load all segments before signaling.
+// The on-disk format is mmap-compatible regardless of this flag.
+#ifndef ENABLE_MMAP_COLDSTART
+#define ENABLE_MMAP_COLDSTART 1
 #endif
 
 // FIXME: find a better way to manage memtables' memory
@@ -155,7 +165,11 @@ typedef LSMIndexData * LSMIndex;
 
 typedef struct LSMIndexBufferSlot
 {
-    pg_atomic_uint32 valid;   /* atomic flag: 0 = free, 1 = registered/loaded, 2 = loading */
+    pg_atomic_uint32 valid;      /* 0=free, 1=loaded, 2=load-in-progress */
+    ConditionVariable load_cv;   /* backends sleep here; worker broadcasts on done/fail */
+    pg_atomic_uint32 load_error; /* 0=ok, 1=failed; set before broadcast */
+    Oid request_db_oid;          /* database OID written by the claiming backend */
+    Oid request_db_userid;       /* role OID written by the claiming backend */
     LSMIndexData lsmIndex;
 }   LSMIndexBufferSlot;
 
@@ -167,7 +181,16 @@ typedef struct LSMIndexBuffer
 
 extern LSMIndexBuffer *SharedLSMIndexBuffer;
 
+/* Shared coordinator so backends can signal the IndexLoadWorker */
+typedef struct IndexLoadCoordinator
+{
+    int32 worker_pgprocno; /* pgprocno of the load worker; -1 = not running */
+} IndexLoadCoordinator;
+
+extern IndexLoadCoordinator *SharedIndexLoadCoordinator;
+
 void lsm_index_buffer_shmem_initialize();
+void load_lsm_index_internal(Oid index_relid, uint32_t slot_idx);
 void build_lsm_index(IndexType type, Relation index, void *vector_index, int64_t *tids, uint32_t dim, uint32_t elem_size, uint64_t count);
 void insert_lsm_index(Relation index, const void *vector, const int64_t tid);
 LSMIndex get_lsm_index(Relation index);
@@ -221,7 +244,7 @@ bool read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId en
 					  SegmentId *out_start_sid, SegmentId *out_end_sid, uint32_t *valid_rows, IndexType *index_type);
 uint32_t find_latest_segment_version(Oid indexRelId, SegmentId start_sid, SegmentId end_sid);
 uint32_t find_latest_bitmap_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version);
-void load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, IndexType index_type, void **index);
+void load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, IndexType index_type, void **index, bool use_mmap);
 bool read_bitmap_delete_count(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t *delete_count_out);
 void load_bitmap_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint8_t **bitmap, bool pg_alloc, uint32_t *delete_count_out);
 void write_bitmap_file_with_subversion(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, uint32_t subversion, const uint8_t *bitmap, Size bitmap_size, uint32_t delete_count);

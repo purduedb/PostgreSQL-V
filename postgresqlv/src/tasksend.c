@@ -1,30 +1,27 @@
 #include "tasksend.h"
 #include "utils/elog.h"
 
+/* Timeout per WaitLatch iteration while waiting for the worker (milliseconds). */
+#define WAIT_LATCH_TIMEOUT_MS 1000L
 
 static void
-notify_and_return()
+notify_worker(void)
 {
     PGPROC *worker = &ProcGlobal->allProcs[ring_buffer_shmem->worker_pgprocno];
     SetLatch(&worker->procLatch);
 }
 
-static void
-wait_for_latch()
-{
-    int rc = WaitLatch(MyLatch,
-                       WL_LATCH_SET | WL_POSTMASTER_DEATH,
-                       0, /* no timeout */
-                       0  /* no wait-event reporting */);
-    ResetLatch(MyLatch);
-}
-
 void
 vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int topk, int efs_nprobe, LSMSnapshot lsm_snapshot)
 {
-    if(ring_buffer_shmem == NULL)
+    int slot;
+    TaskSlot *task_slot;
+    VectorSearchTask task;
+    float *vec;
+
+    if (ring_buffer_shmem == NULL)
         ereport(ERROR, (errmsg("vector search shmem not initialized")));
-    
+
     LWLockAcquire(ring_buffer_shmem->lock, LW_EXCLUSIVE);
     if (ring_buffer_shmem->count == ring_buffer_shmem->ring_size)
     {
@@ -32,197 +29,206 @@ vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int top
         elog(ERROR, "vector search ring buffer full");
         return;
     }
-    
-    int slot = get_ring_buffer_slot();
-    TaskSlot *task_slot = vs_task_at(slot);
+
+    slot = get_ring_buffer_slot();
+    // elog(DEBUG1, "[vector_search_send] enqueued search: index=%u dim=%d topk=%d slot=%d",
+    //      index_oid, dim, topk, slot);
+    task_slot = vs_task_at(slot);
     task_slot->type = VectorSearchTaskType;
-    // we do not use handle to send vector search task
     task_slot->dsm_size = 0;
     task_slot->handle = 0;
 
-    // TODO: can we release the lock before filling the task?
-    // fill the task
-    VectorSearchTask task = vs_search_task_at(slot);
+    task = vs_search_task_at(slot);
     task->index_relid = index_oid;
     task->backend_pgprocno = MyProc->pgprocno;
     task->vector_dim = dim;
     task->topk = topk;
     task->efs_nprobe = efs_nprobe;
     task->snapshot = lsm_snapshot;
-    float *vec = vs_search_task_vector_at(task);
+
+    vec = vs_search_task_vector_at(task);
     memcpy(vec, query, sizeof(float) * (Size)task->vector_dim);
 
     LWLockRelease(ring_buffer_shmem->lock);
 
-    // notify the worker and return without blocking
-    notify_and_return();
+    notify_worker();
 }
 
 VectorSearchResult
 vector_search_get_result(void)
 {
-    wait_for_latch();
+    int rc;
 
-    VectorSearchResult result = vs_search_result_at(MyProc->pgprocno);
-    return result;
+    for (;;)
+    {
+        rc = WaitLatch(MyLatch,
+                       WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                       WAIT_LATCH_TIMEOUT_MS,
+                       0);
+        ResetLatch(MyLatch);
+
+        if (rc & WL_POSTMASTER_DEATH)
+            ereport(ERROR, (errmsg("[vector_search_get_result] postmaster died")));
+
+        if (rc & WL_LATCH_SET)
+        {
+            // elog(DEBUG1, "[vector_search_get_result] result received");
+            break;
+        }
+        /* WL_TIMEOUT: keep waiting. */
+    }
+
+    return vs_search_result_at(MyProc->pgprocno);
 }
 
-// TODO: do we need to protect `lsm_index_idx`? replace lsm_index_idx with the relation Oid?
-void
-index_build_blocking(Oid indexRelId, int lsm_index_idx)
+/*
+ * Enqueue a DSM-backed maintenance task and wait for the worker to complete
+ * it.  A kill -9 on the worker triggers a full cluster restart, so all
+ * backends die via WL_POSTMASTER_DEATH before any retry is needed.
+ */
+static void
+submit_and_wait_maintenance(VectorTaskType task_type, dsm_handle task_hdl,
+                             Size task_seg_size, const char *caller_name)
 {
-    elog(DEBUG1, "enter index_build_blocking with lsm_index_idx = %d", lsm_index_idx);
-    if(ring_buffer_shmem == NULL)
-        elog(ERROR, "[index_build_blocking] vector search shmem not initialized");
+    int slot;
+    TaskSlot *task_slot;
+    PGPROC *worker;
+    int rc;
 
-    // create IndexBuildTask
-    Size task_seg_size = sizeof(IndexBuildTaskData);
-    dsm_segment *task_seg = dsm_create(task_seg_size, 0);
-    if (task_seg == NULL)
-        elog(ERROR, "[index_build_blocking] Failed to alocate dynamic shared memory segment");
-    IndexBuildTask task = (IndexBuildTask) dsm_segment_address(task_seg);
-    dsm_handle task_hdl = dsm_segment_handle(task_seg);
+    ResetLatch(MyLatch);
 
-    // fill IndexBuildTask
-    task->backend_pgprocno = MyProc->pgprocno;
-    task->index_relid = indexRelId;
-    task->lsm_idx = lsm_index_idx;
-    
     LWLockAcquire(ring_buffer_shmem->lock, LW_EXCLUSIVE);
+
     if (ring_buffer_shmem->count == ring_buffer_shmem->ring_size)
     {
         LWLockRelease(ring_buffer_shmem->lock);
-        elog(ERROR, "[index_build_blocking] vector search ring buffer full");
-        dsm_detach(task_seg);
-        return;
+        elog(ERROR, "[%s] vector search ring buffer full", caller_name);
     }
 
-    int slot = get_ring_buffer_slot();
-    TaskSlot *task_slot = vs_task_at(slot);
-    task_slot->type = IndexBuildTaskType;
+    slot = get_ring_buffer_slot();
+    elog(DEBUG1, "[%s] submitting maintenance task: slot=%d", caller_name, slot);
+    task_slot = vs_task_at(slot);
+    task_slot->type = task_type;
     task_slot->dsm_size = task_seg_size;
     task_slot->handle = task_hdl;
 
-    // Notify worker before releasing lock to prevent race condition
-    PGPROC *worker = &ProcGlobal->allProcs[ring_buffer_shmem->worker_pgprocno];
-    ResetLatch(MyLatch);
+    worker = &ProcGlobal->allProcs[ring_buffer_shmem->worker_pgprocno];
     SetLatch(&worker->procLatch);
 
     LWLockRelease(ring_buffer_shmem->lock);
-    // elog(DEBUG1, "[index_build_blocking] slot = %d", slot);
 
-    // Now wait for completion
-    int rc = WaitLatch(MyLatch,
-                       WL_LATCH_SET | WL_POSTMASTER_DEATH,
-                       0, /* no timeout */
-                       0  /* no wait-event reporting */);
-    ResetLatch(MyLatch);
-    dsm_detach(task_seg);
-    elog(DEBUG1, "[index_build_blocking] IndexBuildTaskType task completed and DSM segment detached");
+    for (;;)
+    {
+        rc = WaitLatch(MyLatch,
+                       WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                       WAIT_LATCH_TIMEOUT_MS,
+                       0);
+        ResetLatch(MyLatch);
+
+        if (rc & WL_POSTMASTER_DEATH)
+            ereport(ERROR,
+                    (errmsg("[%s] postmaster died while waiting for worker",
+                            caller_name)));
+
+        if (rc & WL_LATCH_SET)
+        {
+            elog(DEBUG1, "[%s] maintenance task completed", caller_name);
+            break;
+        }
+        /* WL_TIMEOUT: keep waiting. */
+    }
 }
 
 void
-segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type, SegmentId start_sid, SegmentId end_sid)
+index_build_blocking(Oid indexRelId, int lsm_index_idx)
 {
-    if(ring_buffer_shmem == NULL)
+    Size task_seg_size = sizeof(IndexBuildTaskData);
+    dsm_segment *task_seg;
+    IndexBuildTask task;
+
+    elog(DEBUG1, "enter index_build_blocking with lsm_index_idx = %d", lsm_index_idx);
+    if (ring_buffer_shmem == NULL)
+        elog(ERROR, "[index_build_blocking] vector search shmem not initialized");
+
+    task_seg = dsm_create(task_seg_size, 0);
+    if (task_seg == NULL)
+        elog(ERROR, "[index_build_blocking] Failed to allocate dynamic shared memory segment");
+
+    task = (IndexBuildTask) dsm_segment_address(task_seg);
+    task->backend_pgprocno = MyProc->pgprocno;
+    task->index_relid = indexRelId;
+    task->lsm_idx = lsm_index_idx;
+
+    submit_and_wait_maintenance(IndexBuildTaskType, dsm_segment_handle(task_seg),
+                                task_seg_size, "index_build_blocking");
+
+    dsm_detach(task_seg);
+    elog(DEBUG1, "[index_build_blocking] IndexBuildTask completed");
+}
+
+int
+segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type,
+                         SegmentId start_sid, SegmentId end_sid,
+                         uint32_t expected_version)
+{
+    Size task_seg_size = sizeof(SegmentUpdateTaskData);
+    dsm_segment *task_seg;
+    SegmentUpdateTask task;
+    int result;
+
+    if (ring_buffer_shmem == NULL)
         ereport(ERROR, (errmsg("[segment_update_blocking] vector search shmem not initialized")));
 
-    // create SegmentUpdateTask
-    Size task_seg_size = sizeof(SegmentUpdateTaskData);
-    dsm_segment *task_seg = dsm_create(task_seg_size, 0);
+    task_seg = dsm_create(task_seg_size, 0);
     if (task_seg == NULL)
-        elog(ERROR, "[segment_update_blocking] Failed to alocate dynamic shared memory segment");
-    SegmentUpdateTask task = (SegmentUpdateTask) dsm_segment_address(task_seg);
-    dsm_handle task_hdl = dsm_segment_handle(task_seg);
+        elog(ERROR, "[segment_update_blocking] Failed to allocate DSM segment");
 
-    // fill SegmentUpdateTask
+    task = (SegmentUpdateTask) dsm_segment_address(task_seg);
     task->backend_pgprocno = MyProc->pgprocno;
     task->index_relid = index_relid;
     task->lsm_idx = lsm_index_idx;
     task->operation_type = operation_type;
     task->start_sid = start_sid;
     task->end_sid = end_sid;
+    task->expected_version = expected_version;
 
-    LWLockAcquire(ring_buffer_shmem->lock, LW_EXCLUSIVE);
-    if (ring_buffer_shmem->count == ring_buffer_shmem->ring_size)
-    {
-        LWLockRelease(ring_buffer_shmem->lock);
-        elog(ERROR, "[segment_update_blocking] vector search ring buffer full");
-        dsm_detach(task_seg);
-        return;
-    }
+    /* Clear maint_status before submitting so a stale value cannot be misread */
+    vs_search_result_at(MyProc->pgprocno)->maint_status = 0;
 
-    int slot = get_ring_buffer_slot();
-    TaskSlot *task_slot = vs_task_at(slot);
-    task_slot->type = SegmentUpdateTaskType;
-    task_slot->dsm_size = task_seg_size;
-    task_slot->handle = task_hdl;
+    submit_and_wait_maintenance(SegmentUpdateTaskType, dsm_segment_handle(task_seg),
+                                task_seg_size, "segment_update_blocking");
 
-    // Notify worker before releasing lock to prevent race condition
-    PGPROC *worker = &ProcGlobal->allProcs[ring_buffer_shmem->worker_pgprocno];
-    ResetLatch(MyLatch);
-    SetLatch(&worker->procLatch);
+    result = vs_search_result_at(MyProc->pgprocno)->maint_status;
 
-    LWLockRelease(ring_buffer_shmem->lock);
-
-    // Now wait for completion
-    int rc = WaitLatch(MyLatch,
-                       WL_LATCH_SET | WL_POSTMASTER_DEATH,
-                       0, /* no timeout */
-                       0  /* no wait-event reporting */);
-    ResetLatch(MyLatch);
     dsm_detach(task_seg);
-    elog(DEBUG1, "[segment_update_blocking] SegmentUpdate task completed and DSM segment detached");
+    elog(DEBUG1, "[segment_update_blocking] completed, result=%d", result);
+    return result;
 }
 
 void
 index_load_blocking(Oid index_relid, int lsm_index_idx)
 {
-    elog(DEBUG1, "enter index_load_blocking with index_relid = %u, lsm_index_idx = %d", index_relid, lsm_index_idx);
-    if(ring_buffer_shmem == NULL)
+    Size task_seg_size = sizeof(IndexLoadTaskData);
+    dsm_segment *task_seg;
+    IndexLoadTask task;
+
+    elog(DEBUG1, "enter index_load_blocking with index_relid = %u, lsm_index_idx = %d",
+         index_relid, lsm_index_idx);
+    if (ring_buffer_shmem == NULL)
         elog(ERROR, "[index_load_blocking] vector search shmem not initialized");
 
-    // create IndexLoadTask
-    Size task_seg_size = sizeof(IndexLoadTaskData);
-    dsm_segment *task_seg = dsm_create(task_seg_size, 0);
+    task_seg = dsm_create(task_seg_size, 0);
     if (task_seg == NULL)
         elog(ERROR, "[index_load_blocking] Failed to allocate dynamic shared memory segment");
-    IndexLoadTask task = (IndexLoadTask) dsm_segment_address(task_seg);
-    dsm_handle task_hdl = dsm_segment_handle(task_seg);
 
-    // fill IndexLoadTask
+    task = (IndexLoadTask) dsm_segment_address(task_seg);
     task->backend_pgprocno = MyProc->pgprocno;
     task->index_relid = index_relid;
     task->lsm_idx = lsm_index_idx;
-    
-    LWLockAcquire(ring_buffer_shmem->lock, LW_EXCLUSIVE);
-    if (ring_buffer_shmem->count == ring_buffer_shmem->ring_size)
-    {
-        LWLockRelease(ring_buffer_shmem->lock);
-        elog(ERROR, "[index_load_blocking] vector search ring buffer full");
-        dsm_detach(task_seg);
-        return;
-    }
 
-    int slot = get_ring_buffer_slot();
-    TaskSlot *task_slot = vs_task_at(slot);
-    task_slot->type = IndexLoadTaskType;
-    task_slot->dsm_size = task_seg_size;
-    task_slot->handle = task_hdl;
+    submit_and_wait_maintenance(IndexLoadTaskType, dsm_segment_handle(task_seg),
+                                task_seg_size, "index_load_blocking");
 
-    // Notify worker before releasing lock to prevent race condition
-    PGPROC *worker = &ProcGlobal->allProcs[ring_buffer_shmem->worker_pgprocno];
-    ResetLatch(MyLatch);
-    SetLatch(&worker->procLatch);
-
-    LWLockRelease(ring_buffer_shmem->lock);
-
-    // Now wait for completion
-    int rc = WaitLatch(MyLatch,
-                       WL_LATCH_SET | WL_POSTMASTER_DEATH,
-                       0, /* no timeout */
-                       0  /* no wait-event reporting */);
-    ResetLatch(MyLatch);
     dsm_detach(task_seg);
-    elog(DEBUG1, "[index_load_blocking] IndexLoad task completed and DSM segment detached");
+    elog(DEBUG1, "[index_load_blocking] IndexLoad task completed");
 }

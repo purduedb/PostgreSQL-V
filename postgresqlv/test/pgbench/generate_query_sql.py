@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script to read vector query files (.bvecs/.fvecs) and generate a SQL file
+Script to read vector query files (.bvecs/.fvecs/.fbin) and generate a SQL file
 containing all queries as SQL statements.
 """
 
@@ -41,6 +41,19 @@ def read_fvecs(file_path, num_vectors=None):
             if num_vectors and len(vectors) >= num_vectors:
                 break
     return np.vstack(vectors)
+
+
+def read_fbin(file_path, num_vectors=None):
+    """Read .fbin file (float vectors with header: n, d as int32, then n*d float32)"""
+    with open(file_path, "rb") as f:
+        header = np.fromfile(f, dtype=np.int32, count=2)
+        if len(header) < 2:
+            raise ValueError("Invalid fbin file: header too short")
+        n, d = header
+        count = n if num_vectors is None else min(num_vectors, n)
+        data = np.fromfile(f, dtype=np.float32, count=count * d)
+        vectors = data.reshape(count, d)
+    return vectors
 
 
 def vector_to_postgres_format(vector, is_byte_vector=False):
@@ -105,7 +118,7 @@ def generate_sql_file(vectors, output_file, tablename="bigann_vectors", top_k=10
             # Use string literal format for PostgreSQL vector
             sql = f"""SELECT id
 FROM {tablename}
-ORDER BY vec <-> '{vec_str}'::vector
+ORDER BY embedding <-> '{vec_str}'::vector
 LIMIT {top_k};
 """
             f.write(f"-- Query {i + 1}\n")
@@ -119,10 +132,10 @@ LIMIT {top_k};
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate SQL file from vector query file (.bvecs/.fvecs)"
+        description="Generate SQL file from vector query file (.bvecs/.fvecs/.fbin)"
     )
     parser.add_argument("--input", required=True, 
-                       help="Path to input .bvecs or .fvecs file")
+                       help="Path to input .bvecs, .fvecs, or .fbin file")
     parser.add_argument("--output", required=True,
                        help="Path to output SQL file")
     parser.add_argument("--tablename", default="bigann_vectors",
@@ -133,7 +146,7 @@ def main():
                        help="Number of queries to process (default: all)")
     parser.add_argument("--no-transaction", action="store_true",
                        help="Don't wrap queries in BEGIN/COMMIT transaction")
-    parser.add_argument("--format", choices=["auto", "bvecs", "fvecs"], default="auto",
+    parser.add_argument("--format", choices=["auto", "bvecs", "fvecs", "fbin"], default="auto",
                        help="File format (default: auto-detect from extension)")
     parser.add_argument("--efs-nprobe", type=int, default=None,
                        help="Set hnsw.ef_search or ivfflat.probes to this value at the beginning of transaction")
@@ -153,6 +166,8 @@ def main():
             file_format = "bvecs"
         elif args.input.endswith(".fvecs"):
             file_format = "fvecs"
+        elif args.input.endswith(".fbin"):
+            file_format = "fbin"
         else:
             print(f"Error: Cannot auto-detect format from file extension. Use --format to specify.")
             sys.exit(1)
@@ -164,8 +179,10 @@ def main():
     try:
         if file_format == "bvecs":
             vectors = read_bvecs(args.input, args.num_queries)
-        else:  # fvecs
+        elif file_format == "fvecs":
             vectors = read_fvecs(args.input, args.num_queries)
+        else:  # fbin
+            vectors = read_fbin(args.input, args.num_queries)
         
         print(f"Loaded {len(vectors)} vectors of dimension {vectors.shape[1]}")
     except Exception as e:
@@ -197,6 +214,9 @@ if __name__ == "__main__":
 # Generate SQL from .fvecs file
 # python generate_query_sql.py --input /ssd_root/dataset/sift/sift_query.fvecs --output sift_queries.sql \
 #     --tablename bigann_vectors --num-queries 10000 --efs-nprobe 400 --index-type hnsw --top-k 100
+# Generate SQL from .fbin file
+# python generate_query_sql.py --input /ssd_root/dataset/deep/deep1B_queries.fbin --output deep_queries.sql \
+#     --tablename bigann_vectors --num-queries 10000 --efs-nprobe 400 --index-type hnsw --top-k 100
 
 # Generate SQL without transaction wrapper
-    # --no-transaction
+#     --no-transaction

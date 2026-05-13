@@ -421,7 +421,8 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	// Build DiskANN index from disk file
 	// Use default parameters (can be made configurable later)
 	double pq_code_budget_gb = 1.2;  // Auto-calculate
-	double build_dram_budget_gb = 60.0;  // Default DiskANN build_dram_budget_gb
+	// double pq_code_budget_gb = 6.0;  // Auto-calculate
+	double build_dram_budget_gb = 100.0;  // Default DiskANN build_dram_budget_gb
 	
 	// // Auto-calculate pq_code_budget_gb: 0.125 * raw data size
 	// // Estimate: num_tids * dim * sizeof(float) * 0.125 / (1024^3)

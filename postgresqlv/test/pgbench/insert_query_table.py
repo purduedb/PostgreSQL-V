@@ -45,6 +45,19 @@ def read_fvecs(file_path, num_vectors=None):
     return np.vstack(vectors)
 
 
+def read_fbin(file_path, num_vectors=None):
+    """Read .fbin file (float vectors with header: n, d as int32, then n*d float32)"""
+    with open(file_path, "rb") as f:
+        header = np.fromfile(f, dtype=np.int32, count=2)
+        if len(header) < 2:
+            raise ValueError("Invalid fbin file: header too short")
+        n, d = header
+        count = n if num_vectors is None else min(num_vectors, n)
+        data = np.fromfile(f, dtype=np.float32, count=count * d)
+        vectors = data.reshape(count, d)
+    return vectors
+
+
 def create_query_table(conn, dim, tablename="sift_queries"):
     """Create a query table with id and v columns"""
     with conn.cursor() as cur:
@@ -85,10 +98,10 @@ def main():
         description="Create query table and insert query vectors from file"
     )
     parser.add_argument("--file", required=True,
-                       help="Path to query .bvecs or .fvecs file")
+                       help="Path to query .bvecs, .fvecs, or .fbin file")
     parser.add_argument("--num", type=int, default=None,
                        help="Number of query vectors to insert (default: all)")
-    parser.add_argument("--format", choices=["auto", "bvecs", "fvecs"], default="auto",
+    parser.add_argument("--format", choices=["auto", "bvecs", "fvecs", "fbin"], default="auto",
                        help="File format (default: auto-detect from extension)")
     parser.add_argument("--host", default="localhost",
                        help="Database host (default: localhost)")
@@ -111,6 +124,8 @@ def main():
             file_format = "bvecs"
         elif args.file.endswith(".fvecs"):
             file_format = "fvecs"
+        elif args.file.endswith(".fbin"):
+            file_format = "fbin"
         else:
             print(f"Error: Cannot auto-detect format from file extension. Use --format to specify.")
             sys.exit(1)
@@ -122,8 +137,10 @@ def main():
     try:
         if file_format == "bvecs":
             vectors = read_bvecs(args.file, args.num)
-        else:  # fvecs
+        elif file_format == "fvecs":
             vectors = read_fvecs(args.file, args.num)
+        else:  # fbin
+            vectors = read_fbin(args.file, args.num)
         
         print(f"Loaded {len(vectors)} query vectors of dimension {vectors.shape[1]}")
     except Exception as e:

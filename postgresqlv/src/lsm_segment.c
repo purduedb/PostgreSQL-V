@@ -1,5 +1,6 @@
 #include "lsm_segment.h"
 #include "vectorindeximpl.hpp"
+#include "vector_index_worker.h"
 
 static FlushedSegmentPool segment_pool[INDEX_BUF_SIZE];
 
@@ -11,18 +12,47 @@ FlushedSegmentPool *get_flushed_segment_pool(int idx)
 // ------------------------ flushed segment ------------------------
 void initialize_segment_pool(FlushedSegmentPool *pool)
 {
+    pool->seg_lock = (pthread_rwlock_t) PTHREAD_RWLOCK_INITIALIZER;
     pool->flushed_segment_count = 0;
-    pool->head_idx = -1;
-    pool->tail_idx = -1;
+    pool->head_idx = (uint32_t)-1;
+    pool->tail_idx = (uint32_t)-1;
     pool->insert_idx = 0;
-    for(int i = 0; i < MAX_SEGMENTS_COUNT; ++i)
+
+    pg_atomic_init_u32(&pool->flat_count, 0);
+    pg_atomic_init_u32(&pool->memtable_capacity_le_count, 0);
+    pg_atomic_init_u32(&pool->small_segment_le_count, 0);
+
+    for (int i = 0; i < MAX_SEGMENTS_COUNT; i++)
     {
         pool->flushed_segments[i].in_used = false;
-        pool->flushed_segments[i].next_idx = -1;
-        pool->flushed_segments[i].prev_idx = -1;
+        pool->flushed_segments[i].next_idx = (uint32_t)-1;
+        pool->flushed_segments[i].prev_idx = (uint32_t)-1;
         atomic_store(&pool->flushed_segments[i].ref_count, 0);
+        atomic_store(&pool->flushed_segments[i].load_state, (int)SEG_NOT_LOADED);
+
+        pool->flushed_segments[i].delete_count = 0;
+        pool->flushed_segments[i].is_compacting = false;
+        pool->flushed_segments[i].version = 0;
+        pthread_mutex_init(&pool->flushed_segments[i].per_seg_mutex, NULL);
     }
 }
+/* Update pool-level aggregate statistics atomics.
+ * delta must be +1 (segment added) or -1 (segment removed).
+ * For delta = -1, pass (uint32_t)(-1) which wraps correctly via unsigned arithmetic.
+ * Caller must ensure counters do not underflow below 0.
+ */
+static void
+update_pool_stats(FlushedSegmentPool *pool, IndexType index_type, uint32_t vec_count, int delta)
+{
+    uint32_t d = (uint32_t)delta;  /* -1 becomes UINT32_MAX; unsigned add wraps correctly */
+    if (index_type == FLAT)
+        pg_atomic_fetch_add_u32(&pool->flat_count, d);
+    if (vec_count <= MEMTABLE_MAX_CAPACITY)
+        pg_atomic_fetch_add_u32(&pool->memtable_capacity_le_count, d);
+    if (vec_count <= THRESHOLD_SMALL_SEGMENT_SIZE)
+        pg_atomic_fetch_add_u32(&pool->small_segment_le_count, d);
+}
+
 // need to acquire the lock first
 uint32_t
 reserve_flushed_segment(FlushedSegmentPool *pool)
@@ -65,6 +95,11 @@ register_flushed_segment(FlushedSegmentPool *pool, uint32_t idx)
     
     ++pool->flushed_segment_count;
 
+    update_pool_stats(pool,
+                      pool->flushed_segments[idx].index_type,
+                      pool->flushed_segments[idx].vec_count,
+                      +1);
+
     fprintf(stderr, "register_flushed_segment successfully added to list, idx = %d\n", idx);
 }
 
@@ -87,7 +122,13 @@ void
 cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
 {
     FlushedSegment segment = &pool->flushed_segments[segment_idx];
-        
+
+    /* Decrement pool statistics before clearing the fields */
+    update_pool_stats(pool,
+                      segment->index_type,
+                      (uint32_t)segment->vec_count,
+                      -1);
+
     // Free the index, bitmap, and map
     if (segment->index_ptr != NULL)
     {
@@ -113,7 +154,11 @@ cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
     
     // Update segment count
     --pool->flushed_segment_count;
-    
+
+    /* Reset per-segment mutex for potential reuse */
+    pthread_mutex_destroy(&pool->flushed_segments[segment_idx].per_seg_mutex);
+    pthread_mutex_init(&pool->flushed_segments[segment_idx].per_seg_mutex, NULL);
+
     atomic_store(&segment->ref_count, 0);
     
     // Update insert_idx to allow reuse of this slot in reserve_flushed_segment
@@ -330,35 +375,74 @@ load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool)
     for (int i = 0; i < file_count; i++)
     {
         uint32_t seg_idx = reserve_flushed_segment(pool);
-        if (seg_idx == -1)
+        if (seg_idx == (uint32_t)-1)
         {
             fprintf(stderr, "no free flushed segment slot\n");
+            continue;
         }
 
         FlushedSegment segment = &pool->flushed_segments[seg_idx];
         // Use version from SegmentFileInfo to avoid recalculating it
-        load_and_set_segment(index_oid, seg_idx, segment, files[i].start_sid, files[i].end_sid, files[i].version);
-        
+        load_and_set_segment(index_oid, seg_idx, segment, files[i].start_sid, files[i].end_sid, files[i].version, false);
+
         register_flushed_segment(pool, seg_idx);
     }
 
     fprintf(stderr, "[load_all_segments_from_disk] Loaded %d segments, tail_idx = %d\n", file_count, pool->tail_idx);
 }
 
+// Mmap-backed variant: loads each segment via mmap so the worker can become
+// searchable immediately after a restart, before the full in-memory upgrade.
+void
+load_all_segments_from_disk_mmap(Oid index_oid, FlushedSegmentPool *pool)
+{
+    SegmentFileInfo files[MAX_SEGMENTS_COUNT];
+    int file_count = scan_segment_metadata_files(index_oid, files, MAX_SEGMENTS_COUNT);
+
+    if (file_count == 0)
+    {
+        fprintf(stderr, "[load_all_segments_from_disk_mmap] No segment metadata files found for index %u\n", index_oid);
+        return;
+    }
+
+    fprintf(stderr, "[load_all_segments_from_disk_mmap] Found %d segment metadata files\n", file_count);
+
+    for (int i = 0; i < file_count; i++)
+    {
+        uint32_t seg_idx = reserve_flushed_segment(pool);
+        if (seg_idx == (uint32_t)-1)
+        {
+            fprintf(stderr, "[load_all_segments_from_disk_mmap] no free flushed segment slot\n");
+            continue;
+        }
+
+        FlushedSegment segment = &pool->flushed_segments[seg_idx];
+        load_and_set_segment(index_oid, seg_idx, segment, files[i].start_sid, files[i].end_sid, files[i].version, true);
+
+        register_flushed_segment(pool, seg_idx);
+    }
+
+    fprintf(stderr, "[load_all_segments_from_disk_mmap] Loaded %d segments (mmap), tail_idx = %d\n", file_count, pool->tail_idx);
+}
+
 // handled by vector index worker (for index build)
-void 
-load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid, uint32_t version)
+void
+load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid, uint32_t version, bool use_mmap)
 {
     SegmentId start_sid_disk, end_sid_disk;
     uint32_t valid_rows;
     IndexType seg_index_type;
-    
+
+    // TODO: for debugging
+    fprintf(stderr, "[load_and_set_segment] loading segment %u-%u slot=%u (mmap=%d)\n",
+            start_sid, end_sid, segment_idx, (int)use_mmap);
+
     // If version is UINT32_MAX, find latest version once to avoid multiple directory scans
     if (version == UINT32_MAX)
     {
         version = find_latest_segment_version(indexRelId, start_sid, end_sid);
     }
-    
+
     if (read_lsm_segment_metadata(indexRelId, start_sid, end_sid, version,
                              &start_sid_disk, &end_sid_disk, &valid_rows, &seg_index_type))
     {
@@ -367,15 +451,21 @@ load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segmen
         segment->vec_count = valid_rows;
         segment->index_type = seg_index_type;
 
-        load_index_file(indexRelId, start_sid, end_sid, version, seg_index_type, &segment->index_ptr);
+        load_index_file(indexRelId, start_sid, end_sid, version, seg_index_type, &segment->index_ptr, use_mmap);
         uint32_t delete_count;
         load_bitmap_file(indexRelId, start_sid, end_sid, version, &segment->bitmap_ptr, false, &delete_count);
         load_mapping_file(indexRelId, start_sid, end_sid, version, &segment->map_ptr, false);
 
         segment->in_used = true;
-        fprintf(stderr, "[load_segment_from_disk] loaded segment %u-%u v%u with %u vectors\n", start_sid, end_sid, version, valid_rows);
+        segment->delete_count = delete_count;  /* already computed by load_bitmap_file */
+        segment->version = version;
+        segment->is_compacting = false;
+        atomic_store(&segment->load_state,
+                     use_mmap ? (int)SEG_MMAP_LOADED : (int)SEG_FULLY_LOADED);
+        fprintf(stderr, "[load_segment_from_disk] loaded segment %u-%u v%u with %u vectors (mmap=%d)\n",
+                start_sid, end_sid, version, valid_rows, (int)use_mmap);
     }
-    else 
+    else
     {
         fprintf(stderr, "[load_segment_from_disk] Failed to read segment metadata for segment %u-%u v%u\n", start_sid, end_sid, version);
     }

@@ -8,10 +8,17 @@
 #endif
 #include <pthread.h>
 
+typedef enum SegmentLoadState
+{
+    SEG_NOT_LOADED  = 0,
+    SEG_MMAP_LOADED = 1,  // index loaded via mmap; upgrade to full in-memory pending
+    SEG_FULLY_LOADED = 2  // index fully resident in memory
+} SegmentLoadState;
+
 typedef struct FlushedSegmentData
 {
     bool in_used;
-    
+
     SegmentId segment_id_start;
     SegmentId segment_id_end;
     Size vec_count;
@@ -22,12 +29,21 @@ typedef struct FlushedSegmentData
     IndexType index_type;
     void *index_ptr;
     uint8_t *bitmap_ptr;
-    
+
     uint32_t next_idx;
     uint32_t prev_idx;  // Previous node in the linked list
-    
+
     // Reference counting for safe segment deletion during merging
     atomic_int ref_count;
+
+    // Load state: SEG_NOT_LOADED, SEG_MMAP_LOADED, or SEG_FULLY_LOADED
+    atomic_int load_state;
+
+    /* merge metadata (formerly in SharedSegmentArray) */
+    uint32_t delete_count;         /* # deleted vectors; updated under seg_lock write */
+    bool is_compacting;            /* claimed by a merge thread; set/cleared under seg_lock write */
+    uint32_t version;              /* current on-disk version; used by SEGMENT_UPDATE_VACUUM */
+    pthread_mutex_t per_seg_mutex; /* vacuum-merge bitmap coordination */
 } FlushedSegmentData;
 typedef FlushedSegmentData * FlushedSegment;
 
@@ -39,6 +55,11 @@ typedef struct FlushedSegmentPool
     uint32_t head_idx;
     uint32_t tail_idx;
     uint32_t insert_idx;
+
+    /* aggregate statistics for merge scheduling fast-path */
+    pg_atomic_uint32 flat_count;
+    pg_atomic_uint32 memtable_capacity_le_count;
+    pg_atomic_uint32 small_segment_le_count;
 } FlushedSegmentPool;
 
 // helper functions (segment)
@@ -53,7 +74,8 @@ void find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start
                                  uint32_t *seg_idx_0, uint32_t *seg_idx_1);
 void replace_flushed_segment(FlushedSegmentPool *pool, uint32_t old_seg_idx_0, uint32_t old_seg_idx_1, uint32_t new_seg_idx);
 // IO
-void load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool);                     
-void load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid, uint32_t version);
+void load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool);
+void load_all_segments_from_disk_mmap(Oid index_oid, FlushedSegmentPool *pool);
+void load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segment, SegmentId start_sid, SegmentId end_sid, uint32_t version, bool use_mmap);
 
 #endif

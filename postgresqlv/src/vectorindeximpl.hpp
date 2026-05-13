@@ -34,7 +34,7 @@ int DiskANNIndexBuildFromFile(void* diskannIndexPtr, const char* data_path, cons
 
 // ivfflat
 int IvfflatTrain(VectorArray samples, int lists, void** ivfIndexPtr);
-int IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors);
+int IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors, int nlist);
 
 // index build (general)
 void IndexBuild(IndexType type, ConcurrentMemTable mt, uint32_t valid_rows, void** indexPtr, int M, int efConstruction, int lists);
@@ -47,11 +47,11 @@ topKVector* VectorIndexSearch(IndexType type, void *index_ptr, uint8_t *bitmap_p
 int IndexFree(void* indexPtr);
 // void IndexDeserialize(void* index_string, void *indexPtr, void *confPtr);
 // void IndexDeserializeAndSave(void* bin, IndexType index_type, int idx0, int idx1);
-void IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr);
+void IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr, bool use_mmap);
 // void IndexSerializeAndFlush(void *indexPtr, Size *seg_size, const char* filename, dsm_segment **ret_seg);
 // void IndexSerialize(void *indexPtr, Size *seg_size, dsm_segment **ret_seg, void **ret_bin_set);
 void IndexSerialize(void *indexPtr, void **ret_bin_set);
-void IndexBinarySetFlush(const char* filename, void *ret_bin_set);
+void IndexBinarySetFlush(const char* filename, void *ret_bin_set, IndexType index_type);
 Size BitmapSetLoadAndSave(const char* path, int idx0, int idx1, uint32_t count);
 
 // brute force search

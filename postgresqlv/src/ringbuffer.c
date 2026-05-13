@@ -57,6 +57,7 @@ vs_search_task_at(int idx)
 VectorSearchResult
 vs_search_result_at(int pgprocno)
 {
+    Assert(pgprocno >= 0 && pgprocno < MaxBackends);
     return (VectorSearchResultData *)((char *)vector_search_result_pool + (Size)pgprocno * ring_buffer_shmem->search_result_stride);
 }
 

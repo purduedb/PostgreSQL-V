@@ -6,6 +6,7 @@
 \set qid random(1, 10000)
 
 SET hnsw.ef_search = 100;
+SET ivfflat.probes = 2;
 
 -- Run similarity search using scalar subquery in ORDER BY
 -- This allows the planner to use the vector index efficiently

@@ -733,7 +733,7 @@ flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep)
     if (prep->index_bin != NULL) // if the index type is Diskann, the index is already written to disk during building
     {
         GetLSMIndexFilePathWithVersion(file_path, sizeof(file_path), indexRelId, prep->start_sid, prep->end_sid, new_version);
-        IndexBinarySetFlush(file_path, prep->index_bin);
+        IndexBinarySetFlush(file_path, prep->index_bin, prep->index_type);
     }
 
     // bitmap file - write with new version (include delete_count)
@@ -874,8 +874,8 @@ load_mapping_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32
     *mapping = (int64_t *) read_segment_file(path, pg_alloc, NULL);
 }
 
-void 
-load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, IndexType index_type, void **index)
+void
+load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version, IndexType index_type, void **index, bool use_mmap)
 {
     // If version is UINT32_MAX, find latest version
     if (version == UINT32_MAX)
@@ -885,7 +885,7 @@ load_index_file(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t
 
     char path[MAXPGPATH];
     GetLSMIndexFilePathWithVersion(path, sizeof(path), indexRelId, start_sid, end_sid, version);
-    IndexLoadAndSave(path, index_type, index);
+    IndexLoadAndSave(path, index_type, index, use_mmap);
 }
 
 // Write offset file for a segment

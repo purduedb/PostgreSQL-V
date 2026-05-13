@@ -1,0 +1,203 @@
+msturing-10M:
+  1:
+    operation: search
+  2:
+    operation: search
+  3:
+    end: 50000
+    operation: delete
+    start: 0
+  4:
+    end: 50000
+    operation: insert
+    start: 0
+  5:
+    operation: search
+  6:
+    end: 100000
+    operation: delete
+    start: 50000
+  7:
+    end: 100000
+    operation: insert
+    start: 50000
+  8:
+    operation: search
+  9:
+    end: 150000
+    operation: delete
+    start: 100000
+  10:
+    end: 150000
+    operation: insert
+    start: 100000
+  11:
+    operation: search
+  12:
+    end: 200000
+    operation: delete
+    start: 150000
+  13:
+    end: 200000
+    operation: insert
+    start: 150000
+  14:
+    operation: search
+  15:
+    end: 250000
+    operation: delete
+    start: 200000
+  16:
+    end: 250000
+    operation: insert
+    start: 200000
+  17:
+    operation: search
+  18:
+    end: 300000
+    operation: delete
+    start: 250000
+  19:
+    end: 300000
+    operation: insert
+    start: 250000
+  20:
+    operation: search
+  21:
+    end: 350000
+    operation: delete
+    start: 300000
+  22:
+    end: 350000
+    operation: insert
+    start: 300000
+  23:
+    operation: search
+  24:
+    end: 400000
+    operation: delete
+    start: 350000
+  25:
+    end: 400000
+    operation: insert
+    start: 350000
+  26:
+    operation: search
+  27:
+    end: 450000
+    operation: delete
+    start: 400000
+  28:
+    end: 450000
+    operation: insert
+    start: 400000
+  29:
+    operation: search
+  30:
+    end: 500000
+    operation: delete
+    start: 450000
+  31:
+    end: 500000
+    operation: insert
+    start: 450000
+  32:
+    operation: search
+  33:
+    end: 550000
+    operation: delete
+    start: 500000
+  34:
+    end: 550000
+    operation: insert
+    start: 500000
+  35:
+    operation: search
+  36:
+    end: 600000
+    operation: delete
+    start: 550000
+  37:
+    end: 600000
+    operation: insert
+    start: 550000
+  38:
+    operation: search
+  39:
+    end: 650000
+    operation: delete
+    start: 600000
+  40:
+    end: 650000
+    operation: insert
+    start: 600000
+  41:
+    operation: search
+  42:
+    end: 700000
+    operation: delete
+    start: 650000
+  43:
+    end: 700000
+    operation: insert
+    start: 650000
+  44:
+    operation: search
+  45:
+    end: 750000
+    operation: delete
+    start: 700000
+  46:
+    end: 750000
+    operation: insert
+    start: 700000
+  47:
+    operation: search
+  48:
+    end: 800000
+    operation: delete
+    start: 750000
+  49:
+    end: 800000
+    operation: insert
+    start: 750000
+  50:
+    operation: search
+  51:
+    end: 850000
+    operation: delete
+    start: 800000
+  52:
+    end: 850000
+    operation: insert
+    start: 800000
+  53:
+    operation: search
+  54:
+    end: 900000
+    operation: delete
+    start: 850000
+  55:
+    end: 900000
+    operation: insert
+    start: 850000
+  56:
+    operation: search
+  57:
+    end: 950000
+    operation: delete
+    start: 900000
+  58:
+    end: 950000
+    operation: insert
+    start: 900000
+  59:
+    operation: search
+  60:
+    end: 1000000
+    operation: delete
+    start: 950000
+  61:
+    end: 1000000
+    operation: insert
+    start: 950000

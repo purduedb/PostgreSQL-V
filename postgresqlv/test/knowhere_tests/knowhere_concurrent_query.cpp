@@ -152,6 +152,35 @@ read_index(knowhere::Index<knowhere::IndexNode>& index, const std::string& filen
     index.Deserialize(binary_set, conf);
 }
 
+// Vector file format (auto-detected from extension, or overridden by --use-bvecs/--use-fbin)
+enum class VectorFileFormat { Fvecs, Bvecs, Fbin };
+
+static VectorFileFormat
+detect_vector_format(const std::string& filename) {
+    std::string ext;
+    size_t dot = filename.rfind('.');
+    if (dot != std::string::npos && dot + 1 < filename.size()) {
+        ext = filename.substr(dot + 1);
+        for (char& c : ext) {
+            if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+        }
+    }
+    if (ext == "fbin") return VectorFileFormat::Fbin;
+    if (ext == "bvecs") return VectorFileFormat::Bvecs;
+    if (ext == "fvecs") return VectorFileFormat::Fvecs;
+    return VectorFileFormat::Fvecs;  // default
+}
+
+static const char*
+format_extension(VectorFileFormat fmt) {
+    switch (fmt) {
+        case VectorFileFormat::Fbin: return ".fbin";
+        case VectorFileFormat::Bvecs: return ".bvecs";
+        case VectorFileFormat::Fvecs: return ".fvecs";
+    }
+    return ".fvecs";
+}
+
 // File format structures
 struct FvecsReader {
     std::ifstream file;
@@ -304,6 +333,71 @@ struct BvecsReader {
         }
         if (show_progress) {
             std::cout << "\n";
+        }
+    }
+};
+
+// fbin format: 8-byte header (n:int32, d:int32 little-endian), then n*d float32 contiguous
+struct FbinReader {
+    std::ifstream file;
+    int dim;
+    int64_t num_vectors;
+    int64_t data_offset;  // byte offset where vector data starts (after header)
+
+    FbinReader(const std::string& filename) : file(filename, std::ios::binary) {
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open file: " + filename);
+        }
+        int32_t n, d;
+        file.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
+        file.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
+        if (!file || n <= 0 || d <= 0) {
+            throw std::runtime_error("Invalid fbin header: n=" + std::to_string(n) + " d=" + std::to_string(d));
+        }
+        num_vectors = static_cast<int64_t>(n);
+        dim = d;
+        data_offset = 8;
+    }
+
+    std::vector<float> read_vector(int64_t index) {
+        int64_t offset = data_offset + index * static_cast<int64_t>(dim) * sizeof(float);
+        file.seekg(offset, std::ios::beg);
+        std::vector<float> vec(dim);
+        file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(float));
+        return vec;
+    }
+
+    void read_all_vectors(std::vector<std::vector<float>>& vectors, int64_t skip = 0, int64_t max_vectors = -1, bool show_progress = true) {
+        vectors.clear();
+        // max_vectors < 0: read all remaining; max_vectors >= 0: read up to max_vectors (0 means read none)
+        int64_t to_read = (max_vectors < 0)
+            ? (num_vectors - skip)
+            : std::min(max_vectors, num_vectors - skip);
+        if (to_read <= 0) return;
+
+        if (show_progress && skip > 0) {
+            std::cout << "Skipping " << skip << " vectors...";
+            std::cout.flush();
+        }
+        int64_t start_offset = data_offset + skip * static_cast<int64_t>(dim) * sizeof(float);
+        file.seekg(start_offset, std::ios::beg);
+
+        if (show_progress && skip > 0) {
+            std::cout << " done\n";
+        }
+        if (show_progress) {
+            std::cout << "Loading " << to_read << " vectors...";
+            std::cout.flush();
+        }
+
+        for (int64_t i = 0; i < to_read; i++) {
+            std::vector<float> vec(dim);
+            file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(float));
+            if (!file) break;
+            vectors.push_back(std::move(vec));
+        }
+        if (show_progress) {
+            std::cout << " " << vectors.size() << " loaded\n";
         }
     }
 };
@@ -549,15 +643,17 @@ int main(int argc, char* argv[]) {
     if (argc < 8) {
         std::cerr << "Usage: " << argv[0] << " <base_file> <query_file> <ground_truth_file> "
                   << "<index_type> <num_threads> <k> <ef_search/nprobe/search_list_size> [options]\n"
-                  << "  base_file: Path to .fvecs or .bvecs file for building index\n"
-                  << "  query_file: Path to .fvecs or .bvecs file for queries\n"
+                  << "  base_file: Path to .fvecs, .bvecs, or .fbin file for building index\n"
+                  << "  query_file: Path to .fvecs, .bvecs, or .fbin file for queries\n"
                   << "  ground_truth_file: Path to .ivecs file for ground truth\n"
                   << "  index_type: 'hnsw' or 'ivfflat'\n"
                   << "  num_threads: Number of concurrent query threads\n"
                   << "  k: Top-k for search\n"
                   << "  ef_search/nprobe: ef_search for HNSW, nprobe for IVFFLAT (single value or comma-separated list)\n"
                   << "Options:\n"
-                  << "  --use-bvecs: Use .bvecs format (default: .fvecs)\n"
+                  << "  Format is auto-detected from file extension (.fvecs, .bvecs, .fbin).\n"
+                  << "  --use-bvecs: Override to .bvecs format\n"
+                  << "  --use-fbin: Override to .fbin format\n"
                   << "  --M <value>: HNSW M parameter (default: 16)\n"
                   << "  --ef-construction <value>: HNSW ef_construction (default: 64)\n"
                   << "  --nlist <value>: IVFFLAT nlist parameter (default: 100)\n"
@@ -599,6 +695,9 @@ int main(int argc, char* argv[]) {
     }
     
     bool use_bvecs = false;
+    bool use_fbin = false;
+    VectorFileFormat base_format;
+    VectorFileFormat query_format;
     int M = 16;
     int ef_construction = 40;
     int nlist = 100;
@@ -616,6 +715,8 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--use-bvecs") {
             use_bvecs = true;
+        } else if (arg == "--use-fbin") {
+            use_fbin = true;
         } else if (arg == "--M" && i + 1 < argc) {
             M = std::stoi(argv[++i]);
         } else if (arg == "--ef-construction" && i + 1 < argc) {
@@ -647,6 +748,18 @@ int main(int argc, char* argv[]) {
                 query_num = max_queries;
             }
         }
+    }
+    
+    // Auto-detect format from file extension (or use --use-bvecs/--use-fbin override)
+    if (use_fbin) {
+        base_format = VectorFileFormat::Fbin;
+        query_format = VectorFileFormat::Fbin;
+    } else if (use_bvecs) {
+        base_format = VectorFileFormat::Bvecs;
+        query_format = VectorFileFormat::Bvecs;
+    } else {
+        base_format = detect_vector_format(base_file);
+        query_format = detect_vector_format(query_file);
     }
     
     bool is_hnsw = (index_type == "hnsw");
@@ -682,7 +795,8 @@ int main(int argc, char* argv[]) {
         std::cout << "\n";
         std::cout << "nlist: " << nlist << "\n";
     }
-    std::cout << "File format: " << (use_bvecs ? ".bvecs" : ".fvecs") << "\n";
+    std::cout << "Base file format: " << format_extension(base_format) << "\n";
+    std::cout << "Query file format: " << format_extension(query_format) << "\n";
     if (base_skip > 0 || base_num > 0) {
         std::cout << "Base vectors: skip=" << base_skip;
         if (base_num > 0) {
@@ -718,7 +832,18 @@ int main(int argc, char* argv[]) {
         std::cout << "Step 1: Preparing to load base vectors...\n";
         
         try {
-            if (use_bvecs) {
+            if (base_format == VectorFileFormat::Fbin) {
+                FbinReader reader(base_file);
+                dim = reader.dim;
+                total_vectors_to_load = (base_num > 0) ? std::min(base_num, reader.num_vectors) : reader.num_vectors;
+                std::cout << "Dimension: " << dim << "\n";
+                std::cout << "Total vectors in file: " << reader.num_vectors << "\n";
+                std::cout << "Will load " << total_vectors_to_load << " vectors";
+                if (base_skip > 0) {
+                    std::cout << " (skipping first " << base_skip << ")";
+                }
+                std::cout << "\n";
+            } else if (base_format == VectorFileFormat::Bvecs) {
                 BvecsReader reader(base_file);
                 dim = reader.dim;
                 total_vectors_to_load = (base_num > 0) ? base_num : -1;  // -1 means read until EOF
@@ -845,7 +970,10 @@ int main(int argc, char* argv[]) {
             // Need to get dimension from base file first
             if (dim == 0) {
                 try {
-                    if (use_bvecs) {
+                    if (base_format == VectorFileFormat::Fbin) {
+                        FbinReader reader(base_file);
+                        dim = reader.dim;
+                    } else if (base_format == VectorFileFormat::Bvecs) {
                         BvecsReader reader(base_file);
                         dim = reader.dim;
                     } else {
@@ -916,8 +1044,11 @@ int main(int argc, char* argv[]) {
             // Open file readers
             std::unique_ptr<FvecsReader> fvecs_reader;
             std::unique_ptr<BvecsReader> bvecs_reader;
+            std::unique_ptr<FbinReader> fbin_reader;
             
-            if (use_bvecs) {
+            if (base_format == VectorFileFormat::Fbin) {
+                fbin_reader = std::make_unique<FbinReader>(base_file);
+            } else if (base_format == VectorFileFormat::Bvecs) {
                 bvecs_reader = std::make_unique<BvecsReader>(base_file);
             } else {
                 fvecs_reader = std::make_unique<FvecsReader>(base_file);
@@ -925,14 +1056,16 @@ int main(int argc, char* argv[]) {
             
             // For IVFFLAT, train first on a sample
             if (is_ivfflat) {
-                int64_t train_samples = std::min(static_cast<int64_t>(256) * static_cast<int64_t>(nlist), total_vectors_to_load);
+                int64_t train_samples = std::min(static_cast<int64_t>(50) * static_cast<int64_t>(nlist), total_vectors_to_load);
                 if (train_samples > 0) {
                 std::cout << "Training IVFFLAT index on " << train_samples << " samples...";
                 std::cout.flush();
                 
                 // Load training samples
                 std::vector<std::vector<float>> train_vectors;
-                if (use_bvecs) {
+                if (base_format == VectorFileFormat::Fbin) {
+                    fbin_reader->read_all_vectors(train_vectors, base_skip, train_samples, false);
+                } else if (base_format == VectorFileFormat::Bvecs) {
                     bvecs_reader->read_all_vectors(train_vectors, base_skip, train_samples, false);
                 } else {
                     fvecs_reader->read_all_vectors(train_vectors, base_skip, train_samples, false);
@@ -1007,7 +1140,9 @@ int main(int argc, char* argv[]) {
             
             // Load batch
             std::vector<std::vector<float>> batch_vectors;
-            if (use_bvecs) {
+            if (base_format == VectorFileFormat::Fbin) {
+                fbin_reader->read_all_vectors(batch_vectors, current_skip, current_batch_size, false);
+            } else if (base_format == VectorFileFormat::Bvecs) {
                 bvecs_reader->read_all_vectors(batch_vectors, current_skip, current_batch_size, false);
             } else {
                 fvecs_reader->read_all_vectors(batch_vectors, current_skip, current_batch_size, false);
@@ -1105,7 +1240,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "  1. The base file is empty or cannot be read\n";
                 std::cerr << "  2. --base-skip is too large (skipping all vectors)\n";
                 std::cerr << "  3. --base-num is 0 or negative\n";
-                std::cerr << "  4. File format mismatch (check --use-bvecs flag)\n";
+                std::cerr << "  4. File format mismatch (check --use-bvecs or --use-fbin flag)\n";
                 return 1;
             }
             
@@ -1142,7 +1277,7 @@ int main(int argc, char* argv[]) {
                 if (total_added == 0) {
                     std::cerr << "No vectors were loaded from the base file. Please check:\n";
                     std::cerr << "  - Base file path: " << base_file << "\n";
-                    std::cerr << "  - Base file format (--use-bvecs flag if needed)\n";
+                    std::cerr << "  - Base file format (--use-bvecs or --use-fbin if needed)\n";
                     std::cerr << "  - --base-skip and --base-num parameters\n";
                 } else if (index.Count() <= 0) {
                     std::cerr << "Vectors were loaded but index build failed. Please check:\n";
@@ -1172,7 +1307,13 @@ int main(int argc, char* argv[]) {
     std::vector<std::vector<float>> query_vectors;
     
     try {
-        if (use_bvecs) {
+        if (query_format == VectorFileFormat::Fbin) {
+            FbinReader reader(query_file);
+            if (query_skip > 0) {
+                std::cout << "Skipping first " << query_skip << " queries\n";
+            }
+            reader.read_all_vectors(query_vectors, query_skip, query_num);
+        } else if (query_format == VectorFileFormat::Bvecs) {
             BvecsReader reader(query_file);
             if (query_skip > 0) {
                 std::cout << "Skipping first " << query_skip << " queries\n";

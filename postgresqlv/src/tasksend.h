@@ -8,6 +8,8 @@ void vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, in
 VectorSearchResult vector_search_get_result(void);
 void index_build_blocking(Oid index_relid, int lsm_index_idx);
 void index_load_blocking(Oid index_relid, int lsm_index_idx);
-void segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type, SegmentId start_sid, SegmentId end_sid);
+int segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type,
+                             SegmentId start_sid, SegmentId end_sid,
+                             uint32_t expected_version);
 
 #endif

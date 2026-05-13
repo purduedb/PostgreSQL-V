@@ -34,7 +34,8 @@ typedef enum
     VectorSearchTaskType,
     IndexBuildTaskType,
     IndexLoadTaskType,
-    SegmentUpdateTaskType
+    SegmentUpdateTaskType,
+    InternalSegmentUpgradeTaskType  /* internal only — never enters the ring buffer */
 } VectorTaskType;
 
 // typedef union 
@@ -91,6 +92,7 @@ typedef struct {
     // the merged segment information
     SegmentId start_sid;
     SegmentId end_sid;
+    uint32_t expected_version;  /* used only by SEGMENT_UPDATE_VACUUM */
 } SegmentUpdateTaskData;
 typedef SegmentUpdateTaskData* SegmentUpdateTask;
 
@@ -113,6 +115,7 @@ typedef struct {
     volatile int status; // 0: empty, 1: done, 2: error
     volatile int result_count;
     Size result_size;
+    volatile int maint_status; /* maintenance result: 0=OK, 1=RETRY */
 } VectorSearchResultData;
 // followed by result data (may include both vids and distances)
 typedef VectorSearchResultData* VectorSearchResult;

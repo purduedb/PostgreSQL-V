@@ -71,10 +71,17 @@ struct Config {
     std::string DB_USER = "postgres";
     std::string DB_PASSWORD = "";
     
-    // pgvector HNSW index parameters
+    // Index type: "hnsw" or "ivfflat"
+    std::string INDEX_TYPE = "hnsw";
+
+    // pgvector HNSW index parameters (used when INDEX_TYPE == "hnsw")
     int HNSW_M = 48;
     int HNSW_EF_CONSTRUCTION = 400;
     int HNSW_EF_SEARCH = 200;
+
+    // pgvector IVFFlat index parameters (used when INDEX_TYPE == "ivfflat")
+    int IVFFLAT_LISTS = 100;
+    int IVFFLAT_PROBES = 10;
     
     // Dataset paths
     std::string DATASET_PATH;
@@ -85,6 +92,10 @@ struct Config {
     
     // Dimension will be auto-detected from dataset
     size_t DIMENSION = 0;
+
+    // Table and dataset offset
+    std::string TABLE_NAME = "vectors";
+    size_t DATASET_OFFSET = 0;
 };
 
 // ===================================================
@@ -165,6 +176,7 @@ namespace SIMDUtils {
 // ===================================================
 class DataLoader {
 public:
+    // Load .fvecs format: each vector is [int32 dim][float32 * dim]
     static std::vector<float> load_fvecs(const std::string& filename, size_t& num_vectors, size_t& dim) {
         std::ifstream file(filename, std::ios::binary);
         if (!file.is_open()) {
@@ -188,6 +200,48 @@ public:
 
         file.close();
         return data;
+    }
+
+    // Load .fbin format: 8-byte header (n:int32, d:int32 little-endian), then n*d float32 contiguous
+    static std::vector<float> load_fbin(const std::string& filename, size_t& num_vectors, size_t& dim) {
+        std::ifstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open file: " + filename);
+        }
+
+        int32_t n, d;
+        file.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
+        file.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
+        if (!file || n <= 0 || d <= 0) {
+            throw std::runtime_error("Invalid fbin header: n=" + std::to_string(n) + " d=" + std::to_string(d));
+        }
+        num_vectors = static_cast<size_t>(n);
+        dim = static_cast<size_t>(d);
+
+        std::vector<float> data(num_vectors * dim);
+        file.read(reinterpret_cast<char*>(data.data()), num_vectors * dim * sizeof(float));
+        if (!file || file.gcount() != static_cast<std::streamsize>(num_vectors * dim * sizeof(float))) {
+            throw std::runtime_error("Failed to read fbin data: file truncated or read error");
+        }
+
+        file.close();
+        return data;
+    }
+
+    // Load vector file, auto-detecting format from extension (.fvecs or .fbin)
+    static std::vector<float> load(const std::string& filename, size_t& num_vectors, size_t& dim) {
+        size_t ext_pos = filename.rfind('.');
+        if (ext_pos == std::string::npos) {
+            throw std::runtime_error("Cannot detect file format: no extension in " + filename);
+        }
+        std::string ext = filename.substr(ext_pos + 1);
+        if (ext == "fbin") {
+            return load_fbin(filename, num_vectors, dim);
+        } else if (ext == "fvecs") {
+            return load_fvecs(filename, num_vectors, dim);
+        } else {
+            throw std::runtime_error("Unsupported file format: ." + ext + " (use .fvecs or .fbin)");
+        }
     }
 };
 
@@ -288,10 +342,14 @@ private:
     size_t dim;
     std::string table_name;
     std::string gt_dir;
+    size_t dataset_offset;
     std::vector<std::tuple<std::string, size_t, size_t>> active_ranges;
+    std::string index_type;
     int hnsw_m;
     int hnsw_ef_construction;
     int hnsw_ef_search;
+    int ivfflat_lists;
+    int ivfflat_probes;
     
     // Crash simulation
     bool simulate_crash = false;
@@ -542,16 +600,24 @@ public:
                                const std::string& db_name,
                                const std::string& db_user,
                                const std::string& db_password,
+                               const std::string& index_type_param,
                                int hnsw_m,
                                int hnsw_ef_construction,
                                int hnsw_ef_search,
+                               int ivfflat_lists_param,
+                               int ivfflat_probes_param,
                                bool enable_crash_simulation = false,
                                size_t crash_step = 0,
                                size_t crash_operation = 0,
                                bool skip_recall = false,
-                               size_t txn_batch_size = 0)
-        : dim(dimension), table_name("vectors"), gt_dir(gt_directory),
+                               size_t txn_batch_size = 0,
+                               const std::string& table_name_param = "vectors",
+                               size_t dataset_offset_param = 0)
+        : dim(dimension), table_name(table_name_param), gt_dir(gt_directory),
+          dataset_offset(dataset_offset_param),
+          index_type(index_type_param),
           hnsw_m(hnsw_m), hnsw_ef_construction(hnsw_ef_construction), hnsw_ef_search(hnsw_ef_search),
+          ivfflat_lists(ivfflat_lists_param), ivfflat_probes(ivfflat_probes_param),
           simulate_crash(enable_crash_simulation), crash_target_step(crash_step),
           crash_target_operation(crash_operation), db_host(db_host), db_port(db_port),
           skip_recall_computation(skip_recall), transaction_batch_size(txn_batch_size) {
@@ -592,7 +658,7 @@ public:
             std::stringstream create_sql;
             create_sql << "CREATE TABLE " << table_name << " ("
                        << "id BIGINT PRIMARY KEY, "
-                       << "embedding vector(" << dim << ")"
+                       << "vec vector(" << dim << ")"
                        << ")";
             res = PQexec(conn, create_sql.str().c_str());
             if (PQresultStatus(res) != PGRES_COMMAND_OK) {
@@ -607,31 +673,42 @@ public:
         }
     }
 
-    // Create HNSW index
+    // Create index (HNSW or IVFFlat based on index_type)
     void create_index() {
         PGconn* conn = ThreadLocalConnection::get_main();
         Timer timer;
 
-        std::cout << "Creating HNSW index..." << std::endl;
-
         PGresult* res = PQexec(conn, "SET maintenance_work_mem = '8GB'");
         PQclear(res);
 
-        std::stringstream index_sql;
-        index_sql << "CREATE INDEX ON " << table_name 
-                  << " USING hnsw (embedding vector_l2_ops) WITH ("
-                  << "m = " << hnsw_m << ", "
-                  << "ef_construction = " << hnsw_ef_construction
-                  << ")";
-        
-        res = PQexec(conn, index_sql.str().c_str());
-        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-            throw std::runtime_error("Failed to create index: " + std::string(PQerrorMessage(conn)));
+        if (index_type == "ivfflat") {
+            std::cout << "Creating IVFFlat index..." << std::endl;
+            std::stringstream index_sql;
+            index_sql << "CREATE INDEX ON " << table_name
+                      << " USING ivfflat (vec vector_l2_ops) WITH (lists = " << ivfflat_lists << ")";
+            res = PQexec(conn, index_sql.str().c_str());
+            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+                throw std::runtime_error("Failed to create IVFFlat index: " + std::string(PQerrorMessage(conn)));
+            }
+            PQclear(res);
+            double elapsed = timer.elapsed_seconds();
+            std::cout << "✔ IVFFlat index created in " << elapsed << "s" << std::endl;
+        } else {
+            std::cout << "Creating HNSW index..." << std::endl;
+            std::stringstream index_sql;
+            index_sql << "CREATE INDEX ON " << table_name
+                      << " USING hnsw (vec vector_l2_ops) WITH ("
+                      << "m = " << hnsw_m << ", "
+                      << "ef_construction = " << hnsw_ef_construction
+                      << ")";
+            res = PQexec(conn, index_sql.str().c_str());
+            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+                throw std::runtime_error("Failed to create HNSW index: " + std::string(PQerrorMessage(conn)));
+            }
+            PQclear(res);
+            double elapsed = timer.elapsed_seconds();
+            std::cout << "✔ HNSW index created in " << elapsed << "s" << std::endl;
         }
-        PQclear(res);
-
-        double elapsed = timer.elapsed_seconds();
-        std::cout << "✔ HNSW index created in " << elapsed << "s" << std::endl;
     }
 
     // ========================================================================
@@ -686,9 +763,10 @@ public:
                         PQclear(begin_res);
                         
                         for (size_t i = txn_start; i < txn_end; i++) {
+                            size_t row_id = i + dataset_offset;
                             std::stringstream sql;
-                            sql << "INSERT INTO " << table_name << " (id, embedding) VALUES ("
-                                << i << "," << vector_to_sql(data + i * dim, dim)
+                            sql << "INSERT INTO " << table_name << " (id, vec) VALUES ("
+                                << row_id << "," << vector_to_sql(data + i * dim, dim)
                                 << ") ON CONFLICT (id) DO NOTHING";
                             
                             PGresult* res = PQexec(conn, sql.str().c_str());
@@ -731,9 +809,10 @@ public:
                     }
 
                     // Build single INSERT SQL
+                    size_t row_id = i + dataset_offset;
                     std::stringstream sql;
-                    sql << "INSERT INTO " << table_name << " (id, embedding) VALUES ("
-                        << i << "," << vector_to_sql(data + i * dim, dim)
+                    sql << "INSERT INTO " << table_name << " (id, vec) VALUES ("
+                        << row_id << "," << vector_to_sql(data + i * dim, dim)
                         << ") ON CONFLICT (id) DO NOTHING";
 
                     PGresult* res = PQexec(conn, sql.str().c_str());
@@ -841,8 +920,9 @@ public:
                         PQclear(begin_res);
                         
                         for (size_t i = txn_start; i < txn_end; i++) {
+                            size_t row_id = i + dataset_offset;
                             std::stringstream sql;
-                            sql << "DELETE FROM " << table_name << " WHERE id = " << i;
+                            sql << "DELETE FROM " << table_name << " WHERE id = " << row_id;
                             
                             PGresult* res = PQexec(conn, sql.str().c_str());
                             if (PQresultStatus(res) == PGRES_COMMAND_OK) {
@@ -883,8 +963,9 @@ public:
                     }
 
                     // Single DELETE
+                    size_t row_id = i + dataset_offset;
                     std::stringstream sql;
-                    sql << "DELETE FROM " << table_name << " WHERE id = " << i;
+                    sql << "DELETE FROM " << table_name << " WHERE id = " << row_id;
 
                     PGresult* res = PQexec(conn, sql.str().c_str());
                     
@@ -1008,16 +1089,20 @@ public:
                 continue;
             }
 
-            // Set search parameters
+            // Set search parameters (HNSW or IVFFlat)
             std::stringstream set_sql;
-            set_sql << "SET hnsw.ef_search = " << hnsw_ef_search;
+            if (index_type == "ivfflat") {
+                set_sql << "SET ivfflat.probes = " << ivfflat_probes;
+            } else {
+                set_sql << "SET hnsw.ef_search = " << hnsw_ef_search;
+            }
             PGresult* set_res = PQexec(conn, set_sql.str().c_str());
             PQclear(set_res);
 
             // Build search SQL
             std::stringstream sql;
             sql << "SELECT id FROM " << table_name
-                << " ORDER BY embedding <-> " << vector_to_sql(queries + q * dim, dim)
+                << " ORDER BY vec <-> " << vector_to_sql(queries + q * dim, dim)
                 << " LIMIT " << k;
 
             PGresult* res = PQexec(conn, sql.str().c_str());
@@ -1370,9 +1455,10 @@ public:
                         // Execute the operation
                         if (step_info.op == "insert") {
                             size_t vec_idx = step_info.start + item_idx;
+                            size_t row_id = vec_idx + dataset_offset;
                             std::stringstream sql;
-                            sql << "INSERT INTO " << table_name << " (id, embedding) VALUES ("
-                                << vec_idx << "," << vector_to_sql(dataset + vec_idx * dim, dim)
+                            sql << "INSERT INTO " << table_name << " (id, vec) VALUES ("
+                                << row_id << "," << vector_to_sql(dataset + vec_idx * dim, dim)
                                 << ") ON CONFLICT (id) DO NOTHING";
                             PGresult* res = PQexec(conn, sql.str().c_str());
                             {
@@ -1387,8 +1473,9 @@ public:
                         }
                         else if (step_info.op == "delete") {
                             size_t vec_idx = step_info.start + item_idx;
+                            size_t row_id = vec_idx + dataset_offset;
                             std::stringstream sql;
-                            sql << "DELETE FROM " << table_name << " WHERE id = " << vec_idx;
+                            sql << "DELETE FROM " << table_name << " WHERE id = " << row_id;
                             PGresult* res = PQexec(conn, sql.str().c_str());
                             {
                                 std::lock_guard<std::mutex> lock(counters_mutex);
@@ -1402,16 +1489,20 @@ public:
                         }
                         else if (step_info.op == "search") {
                             if (queries != nullptr) {
-                                // Set search parameters
+                                // Set search parameters (HNSW or IVFFlat)
                                 std::stringstream set_sql;
-                                set_sql << "SET hnsw.ef_search = " << hnsw_ef_search;
+                                if (index_type == "ivfflat") {
+                                    set_sql << "SET ivfflat.probes = " << ivfflat_probes;
+                                } else {
+                                    set_sql << "SET hnsw.ef_search = " << hnsw_ef_search;
+                                }
                                 PGresult* set_res = PQexec(conn, set_sql.str().c_str());
                                 PQclear(set_res);
                                 
                                 // Build search SQL
                                 std::stringstream sql;
                                 sql << "SELECT id FROM " << table_name
-                                    << " ORDER BY embedding <-> " << vector_to_sql(queries + item_idx * dim, dim)
+                                    << " ORDER BY vec <-> " << vector_to_sql(queries + item_idx * dim, dim)
                                     << " LIMIT " << step_info.k;
                                 PGresult* res = PQexec(conn, sql.str().c_str());
                                 {
@@ -1625,9 +1716,14 @@ void print_usage(const char* prog_name) {
     std::cerr << "  --db-name <name>            PostgreSQL database name (default: vector_benchmark)" << std::endl;
     std::cerr << "  --db-user <user>            PostgreSQL user (default: postgres)" << std::endl;
     std::cerr << "  --db-password <password>    PostgreSQL password (default: empty)" << std::endl;
-    std::cerr << "  --hnsw-m <m>                HNSW M parameter (default: 48)" << std::endl;
+    std::cerr << "  --index-type <type>         Index type: hnsw or ivfflat (default: hnsw)" << std::endl;
+    std::cerr << "  --hnsw-m <m>                HNSW M parameter (default: 48, used when index-type=hnsw)" << std::endl;
     std::cerr << "  --hnsw-ef-construction <ef> HNSW ef_construction parameter (default: 400)" << std::endl;
-    std::cerr << "  --hnsw-ef-search <ef>        HNSW ef_search parameter (default: 200)" << std::endl;
+    std::cerr << "  --hnsw-ef-search <ef>       HNSW ef_search parameter (default: 200)" << std::endl;
+    std::cerr << "  --ivfflat-lists <n>         IVFFlat lists parameter (default: 100, used when index-type=ivfflat)" << std::endl;
+    std::cerr << "  --ivfflat-probes <n>        IVFFlat probes parameter (default: 10)" << std::endl;
+    std::cerr << "  --table-name <name>         Table name (default: vectors)" << std::endl;
+    std::cerr << "  --dataset-offset <n>        Offset added to vec_idx for insert/delete (default: 0)" << std::endl;
     std::cerr << "  --simulate-crash            Enable crash simulation (kills PostgreSQL at random step/operation)" << std::endl;
     std::cerr << "  --skip-recall               Skip recall computation for search operations (default: false)" << std::endl;
     std::cerr << "  --transaction-batch-size <n> Group n operations per transaction (default: 0, disabled)" << std::endl;
@@ -1687,12 +1783,26 @@ int main(int argc, char** argv) {
             config.DB_USER = argv[++i];
         } else if (arg == "--db-password" && i + 1 < argc) {
             config.DB_PASSWORD = argv[++i];
+        } else if (arg == "--index-type" && i + 1 < argc) {
+            config.INDEX_TYPE = argv[++i];
+            if (config.INDEX_TYPE != "hnsw" && config.INDEX_TYPE != "ivfflat") {
+                std::cerr << "Error: --index-type must be 'hnsw' or 'ivfflat'" << std::endl;
+                return 1;
+            }
         } else if (arg == "--hnsw-m" && i + 1 < argc) {
             config.HNSW_M = std::atoi(argv[++i]);
         } else if (arg == "--hnsw-ef-construction" && i + 1 < argc) {
             config.HNSW_EF_CONSTRUCTION = std::atoi(argv[++i]);
         } else if (arg == "--hnsw-ef-search" && i + 1 < argc) {
             config.HNSW_EF_SEARCH = std::atoi(argv[++i]);
+        } else if (arg == "--ivfflat-lists" && i + 1 < argc) {
+            config.IVFFLAT_LISTS = std::atoi(argv[++i]);
+        } else if (arg == "--ivfflat-probes" && i + 1 < argc) {
+            config.IVFFLAT_PROBES = std::atoi(argv[++i]);
+        } else if (arg == "--table-name" && i + 1 < argc) {
+            config.TABLE_NAME = argv[++i];
+        } else if (arg == "--dataset-offset" && i + 1 < argc) {
+            config.DATASET_OFFSET = (size_t)std::atoll(argv[++i]);
         } else if (arg == "--simulate-crash") {
             simulate_crash = true;
         } else if (arg == "--skip-recall") {
@@ -1729,7 +1839,7 @@ int main(int argc, char** argv) {
     omp_set_num_threads(num_threads);
 
     std::cout << "========================================" << std::endl;
-    std::cout << "PGVECTOR HNSW SLIDING WINDOW TEST (C++)" << std::endl;
+    std::cout << "PGVECTOR SLIDING WINDOW TEST (C++) [" << config.INDEX_TYPE << "]" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Configuration:" << std::endl;
     std::cout << "  Threads: " << num_threads << std::endl;
@@ -1762,26 +1872,36 @@ int main(int argc, char** argv) {
         std::cout << "  Transaction batching: enabled (" << transaction_batch_size 
                   << " operations per transaction)" << std::endl;
     }
+    std::cout << "  Table name: " << config.TABLE_NAME << std::endl;
+    if (config.DATASET_OFFSET > 0) {
+        std::cout << "  Dataset offset: " << config.DATASET_OFFSET << std::endl;
+    }
     std::cout << "  DB Host: " << config.DB_HOST << std::endl;
     std::cout << "  DB Port: " << config.DB_PORT << std::endl;
     std::cout << "  DB Name: " << config.DB_NAME << std::endl;
     std::cout << "  DB User: " << config.DB_USER << std::endl;
-    std::cout << "  HNSW M: " << config.HNSW_M << std::endl;
-    std::cout << "  HNSW ef_construction: " << config.HNSW_EF_CONSTRUCTION << std::endl;
-    std::cout << "  HNSW ef_search: " << config.HNSW_EF_SEARCH << std::endl;
+    std::cout << "  Index type: " << config.INDEX_TYPE << std::endl;
+    if (config.INDEX_TYPE == "ivfflat") {
+        std::cout << "  IVFFlat lists: " << config.IVFFLAT_LISTS << std::endl;
+        std::cout << "  IVFFlat probes: " << config.IVFFLAT_PROBES << std::endl;
+    } else {
+        std::cout << "  HNSW M: " << config.HNSW_M << std::endl;
+        std::cout << "  HNSW ef_construction: " << config.HNSW_EF_CONSTRUCTION << std::endl;
+        std::cout << "  HNSW ef_search: " << config.HNSW_EF_SEARCH << std::endl;
+    }
     std::cout << "========================================\n" << std::endl;
 
     try {
         // Load dataset
         std::cout << "Loading dataset..." << std::endl;
         size_t num_vectors, data_dim;
-        auto dataset = DataLoader::load_fvecs(config.DATASET_PATH, num_vectors, data_dim);
+        auto dataset = DataLoader::load(config.DATASET_PATH, num_vectors, data_dim);
         std::cout << "✔ Dataset loaded: " << num_vectors << " vectors, dim=" << data_dim << std::endl;
 
         // Load queries
         std::cout << "Loading queries..." << std::endl;
         size_t num_queries, query_dim;
-        auto queries = DataLoader::load_fvecs(config.QUERY_PATH, num_queries, query_dim);
+        auto queries = DataLoader::load(config.QUERY_PATH, num_queries, query_dim);
         std::cout << "✔ Queries loaded: " << num_queries << " queries, dim=" << query_dim << std::endl;
 
         // Auto-detect dimension and validate
@@ -1801,14 +1921,19 @@ int main(int argc, char** argv) {
             config.DB_NAME,
             config.DB_USER,
             config.DB_PASSWORD,
+            config.INDEX_TYPE,
             config.HNSW_M,
             config.HNSW_EF_CONSTRUCTION,
             config.HNSW_EF_SEARCH,
+            config.IVFFLAT_LISTS,
+            config.IVFFLAT_PROBES,
             simulate_crash,
             0,  // crash_step (will be set by set_crash_target)
             0,  // crash_operation (will be set by set_crash_target)
             skip_recall,
-            transaction_batch_size
+            transaction_batch_size,
+            config.TABLE_NAME,
+            config.DATASET_OFFSET
         );
 
         // Execute test
@@ -1903,3 +2028,10 @@ int main(int argc, char** argv) {
 // --hnsw-ef-construction 40 \
 // --hnsw-ef-search 200 \
 // --start-step 101  --end-step 101  --build-index-before 101
+//
+// IVFFlat example:
+// ./pgvector_test 1 \
+// --dataset <path> --queries <path> --runbook <path> --dataset-name <name> \
+// --index-type ivfflat --ivfflat-lists 100 --ivfflat-probes 10 \
+// --checkpoint-size 1000 --gt-dir ./ground_truth \
+// --db-host localhost --db-port 5432 --db-name vector_benchmark --db-user postgres

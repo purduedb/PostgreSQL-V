@@ -25,7 +25,7 @@
 
 #include "vector_index_worker.h"
 #include "lsmindex.h"
-#include "lsm_merge_worker.h"
+#include "index_load_worker.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -58,9 +58,6 @@ shmem_startup(void)
 	ring_buffer_init();
 	vector_index_worker_init();
 	lsm_index_buffer_shmem_initialize();
-	
-	// initialize merge worker manager
-	initialize_merge_worker_manager();
 }
 
 /*
@@ -83,15 +80,6 @@ _PG_init(void)
 	RequestNamedLWLockTranche(LSM_SEGMENT_LWTRANCHE, INDEX_BUF_SIZE);
 	LWLockRegisterTranche(LSM_SEGMENT_LWTRANCHE_ID, LSM_SEGMENT_LWTRANCHE);
 	
-	// reserve LWLock tranche for merge worker manager (need multiple locks for segment arrays)
-	RequestNamedLWLockTranche("LSM Merge Worker", INDEX_BUF_SIZE + 1); // +1 for main manager lock
-	LWLockRegisterTranche(1003, "LSM Merge Worker");
-	
-	// reserve LWLock tranche for merge segment bitmap locks
-	// Need INDEX_BUF_SIZE * MAX_SEGMENTS_COUNT locks (one per segment per index buffer slot)
-	RequestNamedLWLockTranche(LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE, INDEX_BUF_SIZE * MAX_SEGMENTS_COUNT);
-	LWLockRegisterTranche(LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE_ID, LSM_MERGE_SEGMENT_BITMAP_LWTRANCHE);
-	
 	// reserve LWLock tranche for memtable vacuum locks
 	// Need MEMTABLE_BUF_SIZE locks (one per memtable slot)
 	RequestNamedLWLockTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE, MEMTABLE_BUF_SIZE);
@@ -112,9 +100,8 @@ _PG_init(void)
 	// TODO: confirm the size of the shared memory structure
 	// initialize a shared memory structure
 	RequestAddinShmemSpace(4000000000L); // 2GB
-	
-	// reserve shared memory for merge worker manager
-	RequestAddinShmemSpace(sizeof(MergeWorkerManager));
+	RequestAddinShmemSpace(MAXALIGN(sizeof(IndexLoadCoordinator)));
+
 	prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = shmem_startup;
 	
@@ -148,24 +135,21 @@ _PG_init(void)
 	RegisterBackgroundWorker(&lsm_index_worker);
 	elog(DEBUG1, "[_PG_init]register lsm index worker finished");
 
-	// initialize and register multiple lsm merge workers
-	elog(DEBUG1, "[_PG_init]register lsm merge workers");
-	for (int i = 0; i < MERGE_WORKERS_COUNT; i++)
-	{
-		BackgroundWorker lsm_merge_worker;
-		memset(&lsm_merge_worker, 0, sizeof(BackgroundWorker));
-		lsm_merge_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
-		lsm_merge_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-		lsm_merge_worker.bgw_restart_time = 1;
-		snprintf(lsm_merge_worker.bgw_name, BGW_MAXLEN, "LSMMergeWorker%d", i); // unique name per worker
-		snprintf(lsm_merge_worker.bgw_library_name, BGW_MAXLEN, "vector.so"); // no .so
-		snprintf(lsm_merge_worker.bgw_function_name, BGW_MAXLEN, "lsm_merge_worker_main"); // entry function
-		lsm_merge_worker.bgw_main_arg = (Datum) i; // Worker ID (0, 1, 2, ...)
-		lsm_merge_worker.bgw_notify_pid = 0;
-		RegisterBackgroundWorker(&lsm_merge_worker);
-		elog(DEBUG1, "[_PG_init]registered lsm merge worker %d", i);
-	}
-	elog(DEBUG1, "[_PG_init]register lsm merge workers finished (total: %d)", MERGE_WORKERS_COUNT);
+	elog(DEBUG1, "[_PG_init] register index load worker");
+	BackgroundWorker index_load_worker;
+	memset(&index_load_worker, 0, sizeof(BackgroundWorker));
+	index_load_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+	                              BGWORKER_BACKEND_DATABASE_CONNECTION;
+	index_load_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	index_load_worker.bgw_restart_time = 1;
+	snprintf(index_load_worker.bgw_name, BGW_MAXLEN, "IndexLoadWorker");
+	snprintf(index_load_worker.bgw_library_name, BGW_MAXLEN, "vector.so");
+	snprintf(index_load_worker.bgw_function_name, BGW_MAXLEN, "index_load_worker_main");
+	index_load_worker.bgw_main_arg = (Datum) 0;
+	index_load_worker.bgw_notify_pid = 0;
+	RegisterBackgroundWorker(&index_load_worker);
+	elog(DEBUG1, "[_PG_init] register index load worker finished");
+
 }
 
 /*

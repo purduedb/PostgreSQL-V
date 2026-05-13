@@ -118,6 +118,11 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 	if (so->first)
 	{
+		// TODO: for evaluation
+		// Timing instrumentation - measure total function execution time
+		instr_time start_time;
+		INSTR_TIME_SET_CURRENT(start_time);
+
 		Datum		value;
 
 		/* Count index scan for stats */
@@ -154,6 +159,46 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		so->topkTuples = search_lsm_index(scan->indexRelation, query_vector->x, top_k, hnsw_ef_search);
 		so->topkTuplesIdx = 0;	
 		so->first = false;
+
+		// TODO: for evaluation
+		// Timing instrumentation - calculate and log execution time
+		instr_time end_time;
+		INSTR_TIME_SET_CURRENT(end_time);
+		INSTR_TIME_SUBTRACT(end_time, start_time);
+		
+		// Thread-local arrays to store last 10000 execution times (per thread)
+		static __thread long execution_times[10000];
+		static __thread int call_count = 0;
+		static __thread int array_index = 0;
+		const int interval = 10000;
+		
+		// Convert to microseconds
+		long duration_us = (long)(INSTR_TIME_GET_MICROSEC(end_time));
+		
+		// Store current execution time
+		execution_times[array_index] = duration_us;
+		array_index = (array_index + 1) % interval;
+		call_count++;
+		
+		// Log statistics every 10000 calls
+		if (call_count % interval == 0) {
+			long total_time = 0;
+			long min_time = LONG_MAX;
+			long max_time = 0;
+			
+			// Calculate stats for the last 10000 calls
+			for (int i = 0; i < interval; i++) {
+				total_time += execution_times[i];
+				if (execution_times[i] < min_time) min_time = execution_times[i];
+				if (execution_times[i] > max_time) max_time = execution_times[i];
+			}
+			
+			double avg_time = (double)total_time / (double)interval;
+			fprintf(stderr, "[search_lsm_index] Stats for last %d calls - Avg: %.2fμs, Min: %ldμs, Max: %ldμs\n", 
+				interval, avg_time, min_time, max_time);
+		}
+		// TODO: for evaluation (end here)
+
 	}
 
 	// return the next tuple from the results of hnsw search

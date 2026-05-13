@@ -11,8 +11,6 @@
 #include "lsmbackground.h"
 #include "vectorindeximpl.hpp"
 #include "tasksend.h"
-#include "lsm_merge_worker.h"
-
 // FIXME: the order to flush? check all lsm index? Or scan buffer? Or use message to wake?
 
 // claim the head sealed memtable for flushing(guarantee concurrency between background workers), but do not remove it yet
@@ -209,7 +207,8 @@ lsm_flush_one_pending(LSMIndex lsm, int slot_idx, bool wait)
     flush_segment_to_disk(lsm->indexRelId, &prep);
 
     // step 4. notify the vector index worker to load the segment from disk
-    segment_update_blocking(slot_idx, lsm->indexRelId, SEGMENT_UPDATE_REGULAR, prep.start_sid, prep.end_sid);
+    (void) segment_update_blocking(slot_idx, lsm->indexRelId, SEGMENT_UPDATE_REGULAR,
+                                   prep.start_sid, prep.end_sid, 0);
 
     // step 4.5. track flushed but not released memtable
     // Use lock in flush path (less frequent), but write count atomically for lock-free reads
@@ -233,9 +232,6 @@ lsm_flush_one_pending(LSMIndex lsm, int slot_idx, bool wait)
 
     // step 6. free the memtable slot
     release_memtable_slot(mt_idx);
-    
-    // step 7. update the segment array
-    add_to_segment_array(slot_idx, lsm->indexRelId, prep.start_sid, prep.end_sid, prep.valid_rows, prep.index_type, prep.delete_count);
     
     // release vacuum lock
     LWLockRelease(&mt->vacuum_lock);

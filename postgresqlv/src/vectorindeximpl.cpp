@@ -395,7 +395,7 @@ IvfflatTrain(VectorArray samples, int lists, void** ivfIndexPtr)
 }
 
 extern "C" int
-IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors)
+IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors, int nlist)
 {
     elog(DEBUG1, "enter IvfflatIndexCreate, vector_num = %d", vectors->length);
 
@@ -416,6 +416,7 @@ IvfflatIndexCreate(void* ivfIndexPtr, VectorArray vectors)
     conf[knowhere::meta::ROWS] = nb;
     conf[knowhere::meta::DIM] = dim;
     conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    conf[knowhere::indexparam::NLIST] = nlist;
 
     if (index->Count() == 0)
     {
@@ -550,7 +551,7 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // conduct search
-    knowhere::ThreadPool::ScopedSearchOmpSetter setter(8);  // Set OMP 
+    // knowhere::ThreadPool::ScopedSearchOmpSetter setter(8);  // Set OMP 
     auto res = index->Search(dataset, conf, bitset_view);
     
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -571,9 +572,9 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     // TODO: for evaluation
     // Timing instrumentation - calculate and log execution time
     
-    // Thread-local arrays to store last 10000 execution times (per thread)
-    int interval = 10000;
-    thread_local static long execution_times[10000];
+    // Thread-local arrays to store last 1000 execution times (per thread)
+    int interval = 1000;
+    thread_local static long execution_times[1000];
     thread_local static int call_count = 0;
     thread_local static int array_index = 0;
     
@@ -582,7 +583,7 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     array_index = (array_index + 1) % interval;
     call_count++;
     
-    // Log statistics every 10000 calls
+    // Log statistics every 1000 calls
     if (call_count % interval == 0) {
         long total_time = 0;
         long min_time = LONG_MAX;
@@ -610,7 +611,6 @@ VectorIndexSearch(IndexType type, void *index_ptr, uint8_t *bitmap_ptr, uint32_t
     // fprintf(stderr, "enter VectorIndexSearch, type = %d, index_ptr = %p, bitmap_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, index_ptr, bitmap_ptr, count, query_vector, k, efs_nprobe);
 
     knowhere::BitsetView bitset_view(bitmap_ptr, count);
-    // knowhere::BitsetView bitset_view(nullptr);
     return VectorIndexSearchImpl(type, index_ptr, bitset_view, count, query_vector, k, efs_nprobe);
 }
 
@@ -787,12 +787,43 @@ IndexSerialize(void *indexPtr, void **ret_bin_set)
     *ret_bin_set = static_cast<void*>(bins);
 }
 
-// the index binary set will be free in this function
+// Maps IndexType to the Knowhere BinarySet key that holds the raw Faiss index bytes.
+// DeserializeFromFile calls faiss::read_index(filename) directly and expects just
+// those raw bytes — not the multi-key envelope written by write_binary_set.
+static const char*
+get_primary_key_name(IndexType index_type)
+{
+    switch (index_type) {
+        case FLAT:    return knowhere::IndexEnum::INDEX_FAISS_IDMAP;
+        case IVFFLAT: return knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
+        case HNSW:    return knowhere::IndexEnum::INDEX_HNSW;
+        default:      return nullptr;
+    }
+}
+
+// The index binary set will be freed in this function.
+// For FLAT/IVFFLAT/HNSW, write only the raw Faiss bytes (primary key payload) so
+// that DeserializeFromFile — which supports enable_mmap — can read the file directly.
 extern "C" void
-IndexBinarySetFlush(const char* filename, void *ret_bin_set)
+IndexBinarySetFlush(const char* filename, void *ret_bin_set, IndexType index_type)
 {
     knowhere::BinarySet *binary_set = static_cast<knowhere::BinarySet*>(ret_bin_set);
-    write_binary_set(*binary_set, filename);
+    const char* key_name = get_primary_key_name(index_type);
+    if (key_name != nullptr) {
+        auto bin = binary_set->GetByName(key_name);
+        if (bin == nullptr) {
+            elog(ERROR, "[IndexBinarySetFlush] BinarySet missing key '%s' for index type %d",
+                 key_name, (int)index_type);
+        }
+        // TODO: for debugging
+        fprintf(stderr, "[IndexBinarySetFlush] writing %zu bytes for key '%s' to %s\n",
+                bin->size, key_name, filename);
+        FileIOWriter writer(filename);
+        writer(bin->data.get(), bin->size);
+    } else {
+        // DISKANN manages its own disk files and should not reach this path
+        write_binary_set(*binary_set, filename);
+    }
     FreeBinarySet(ret_bin_set);
 }
 
@@ -832,20 +863,24 @@ IndexBinarySetFlush(const char* filename, void *ret_bin_set)
 //     IndexDeserialize(bin, knowhere_index[idx0][idx1], knowhere_json[idx0][idx1]);
 // }
 
-extern "C" void 
-IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
+extern "C" void
+IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr, bool use_mmap)
 {
-    fprintf(stderr, "[IndexLoadAndSave] enter IndexLoadAndSave, index_type = %d\n", index_type);
+    // TODO: for debugging
+    fprintf(stderr, "[IndexLoadAndSave] loading path=%s index_type=%d use_mmap=%d\n",
+            path, (int)index_type, (int)use_mmap);
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
-    
+
     knowhere::Json conf;
-    
+
     switch (index_type)
     {
         case FLAT:
         {
             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IDMAP, version).value();
-            read_index(kindex, path, conf);            
+            conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+            conf["enable_mmap"] = use_mmap;
+            kindex.DeserializeFromFile(path, conf);
             auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
             *indexPtr = static_cast<void*>(index);
             break;
@@ -853,7 +888,9 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
         case IVFFLAT:
         {
             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, version).value();
-            read_index(kindex, path, conf);
+            conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+            conf["enable_mmap"] = use_mmap;
+            kindex.DeserializeFromFile(path, conf);
             auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
             *indexPtr = static_cast<void*>(index);
             break;
@@ -861,7 +898,9 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
         case HNSW:
         {
             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
-            read_index(kindex, path, conf);
+            conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+            conf["enable_mmap"] = use_mmap;
+            kindex.DeserializeFromFile(path, conf);
             auto* index = new knowhere::Index<knowhere::IndexNode>(kindex);
             *indexPtr = static_cast<void*>(index);
             break;
@@ -879,7 +918,7 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
             conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
             conf[knowhere::meta::INDEX_PREFIX] = index_prefix;
             // TODO: make this configurable
-            conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 1.8f;
+            conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 5.0f;
             conf[knowhere::indexparam::BEAMWIDTH] = 8;
             
             // Configure AIO context count to avoid hitting system limits
@@ -914,6 +953,9 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr)
             break;
         }
     }
+    // TODO: for debugging
+    fprintf(stderr, "[IndexLoadAndSave] done loading path=%s index_type=%d use_mmap=%d\n",
+            path, (int)index_type, (int)use_mmap);
 }
 
 // ------------------ DiskANN disk file management ------------------
@@ -1012,8 +1054,8 @@ DiskANNCloseDataFile(void* file_handle)
 
 // ------------------ brute scan implementation ------------------
 
-// currently a native implementation
 extern "C" void
+// currently a native implementation
 ComputeMultipleDistances(const void *vectors, uint32_t vector_num, uint32_t dim,
                                const float *query_vector, 
                                float *distances)
@@ -1521,7 +1563,7 @@ ConcurrentVectorSearchOnSegments(
     int topk,
     int efs_nprobe,
     VectorSearchResult result,
-    PGPROC* client_proc,
+    PGPROC* client_proc,    
     FlushedSegmentPool* pool) {
     // Get the dedicated outer search executor (separate from Knowhere's internal pool)
     auto& exec = GetPgOuterSearchExecutor();

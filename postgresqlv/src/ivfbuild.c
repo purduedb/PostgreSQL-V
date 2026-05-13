@@ -190,7 +190,7 @@ AddVector(Datum *values, ItemPointer tid, IvfflatBuildState * buildstate)
 	// batch add vectors to the IVFFlat index
 	if (vectors->length == targvectors)
 	{
-		IvfflatIndexCreate(buildstate->ivfflatIndex, vectors);
+		IvfflatIndexCreate(buildstate->ivfflatIndex, vectors, buildstate->lists);
 		buildstate->lowest_vid += vectors->length;
 		vectors->length = 0;
 	}
@@ -414,7 +414,7 @@ ScanAllRows(IvfflatBuildState *buildstate)
 	// add the remaining vectors
 	if (buildstate->vectors->length > 0)
 	{
-		IvfflatIndexCreate(buildstate->ivfflatIndex, buildstate->vectors);	
+		IvfflatIndexCreate(buildstate->ivfflatIndex, buildstate->vectors, buildstate->lists);	
 		buildstate->lowest_vid += buildstate->vectors->length;
 		buildstate->vectors->length = 0;
 	}

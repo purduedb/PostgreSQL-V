@@ -62,6 +62,10 @@ struct Config {
     // Dimension will be auto-detected from dataset
     size_t DIMENSION = 0;
     
+    // Table and dataset offset
+    std::string TABLE_NAME = "turing10m";
+    size_t DATASET_OFFSET = 0;
+    
     // QPS rate limiting
     double TARGET_QPS = 0.0;  // 0 means no rate limiting
 };
@@ -115,6 +119,7 @@ public:
 // ===================================================
 class DataLoader {
 public:
+    // Load .fvecs format: each vector is [int32 dim][float32 * dim]
     static std::vector<float> load_fvecs(const std::string& filename, size_t& num_vectors, size_t& dim) {
         std::ifstream file(filename, std::ios::binary);
         if (!file.is_open()) {
@@ -138,6 +143,48 @@ public:
 
         file.close();
         return data;
+    }
+
+    // Load .fbin format: 8-byte header (n:int32, d:int32 little-endian), then n*d float32 contiguous
+    static std::vector<float> load_fbin(const std::string& filename, size_t& num_vectors, size_t& dim) {
+        std::ifstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open file: " + filename);
+        }
+
+        int32_t n, d;
+        file.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
+        file.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
+        if (!file || n <= 0 || d <= 0) {
+            throw std::runtime_error("Invalid fbin header: n=" + std::to_string(n) + " d=" + std::to_string(d));
+        }
+        num_vectors = static_cast<size_t>(n);
+        dim = static_cast<size_t>(d);
+
+        std::vector<float> data(num_vectors * dim);
+        file.read(reinterpret_cast<char*>(data.data()), num_vectors * dim * sizeof(float));
+        if (!file || file.gcount() != static_cast<std::streamsize>(num_vectors * dim * sizeof(float))) {
+            throw std::runtime_error("Failed to read fbin data: file truncated or read error");
+        }
+
+        file.close();
+        return data;
+    }
+
+    // Load vector file, auto-detecting format from extension (.fvecs or .fbin)
+    static std::vector<float> load(const std::string& filename, size_t& num_vectors, size_t& dim) {
+        size_t ext_pos = filename.rfind('.');
+        if (ext_pos == std::string::npos) {
+            throw std::runtime_error("Cannot detect file format: no extension in " + filename);
+        }
+        std::string ext = filename.substr(ext_pos + 1);
+        if (ext == "fbin") {
+            return load_fbin(filename, num_vectors, dim);
+        } else if (ext == "fvecs") {
+            return load_fvecs(filename, num_vectors, dim);
+        } else {
+            throw std::runtime_error("Unsupported file format: ." + ext + " (use .fvecs or .fbin)");
+        }
     }
 };
 
@@ -238,6 +285,7 @@ private:
     size_t dim;
     std::string table_name;
     std::string gt_dir;
+    size_t dataset_offset;
     std::vector<std::tuple<std::string, size_t, size_t>> active_ranges;
     int hnsw_m;
     int hnsw_ef_construction;
@@ -530,9 +578,12 @@ public:
                                int hnsw_ef_search,
                                double qps,
                                int threads,
+                               const std::string& table_name_arg = "turing10m",
+                               size_t dataset_offset_arg = 0,
                                bool enable_crash_simulation = false,
                                bool skip_recall = false)
-        : dim(dimension), table_name("vectors"), gt_dir(gt_directory),
+        : dim(dimension), table_name(table_name_arg), gt_dir(gt_directory),
+          dataset_offset(dataset_offset_arg),
           hnsw_m(hnsw_m), hnsw_ef_construction(hnsw_ef_construction), 
           hnsw_ef_search(hnsw_ef_search), target_qps(qps), num_threads(threads),
           simulate_crash(enable_crash_simulation), db_host(db_host), 
@@ -572,7 +623,7 @@ public:
             std::stringstream create_sql;
             create_sql << "CREATE TABLE " << table_name << " ("
                        << "id BIGINT PRIMARY KEY, "
-                       << "embedding vector(" << dim << ")"
+                       << "vec vector(" << dim << ")"
                        << ")";
             res = PQexec(conn, create_sql.str().c_str());
             if (PQresultStatus(res) != PGRES_COMMAND_OK) {
@@ -602,7 +653,7 @@ public:
 
         std::stringstream index_sql;
         index_sql << "CREATE INDEX ON " << table_name 
-                  << " USING hnsw (embedding vector_l2_ops) WITH ("
+                  << " USING hnsw (vec vector_l2_ops) WITH ("
                   << "m = " << hnsw_m << ", "
                   << "ef_construction = " << hnsw_ef_construction
                   << ")";
@@ -873,10 +924,11 @@ public:
                         // Execute the operation
                         bool operation_failed = false;
                         if (step_info.op == "insert") {
-                            size_t vec_idx = step_info.start + item_idx;
+                            size_t row_id = step_info.start + item_idx + dataset_offset;
+                            size_t dataset_index = step_info.start + item_idx;
                             std::stringstream sql;
-                            sql << "INSERT INTO " << table_name << " (id, embedding) VALUES ("
-                                << vec_idx << "," << vector_to_sql(dataset + vec_idx * dim, dim)
+                            sql << "INSERT INTO " << table_name << " (id, vec) VALUES ("
+                                << row_id << "," << vector_to_sql(dataset + dataset_index * dim, dim)
                                 << ") ON CONFLICT (id) DO NOTHING";
                             PGresult* res = PQexec(conn, sql.str().c_str());
                             if (PQresultStatus(res) == PGRES_COMMAND_OK) {
@@ -891,9 +943,9 @@ public:
                             PQclear(res);
                         }
                         else if (step_info.op == "delete") {
-                            size_t vec_idx = step_info.start + item_idx;
+                            size_t row_id = step_info.start + item_idx;
                             std::stringstream sql;
-                            sql << "DELETE FROM " << table_name << " WHERE id = " << vec_idx;
+                            sql << "DELETE FROM " << table_name << " WHERE id = " << row_id;
                             PGresult* res = PQexec(conn, sql.str().c_str());
                             if (PQresultStatus(res) == PGRES_COMMAND_OK) {
                                 char* tuples = PQcmdTuples(res);
@@ -922,7 +974,7 @@ public:
                                 // Build search SQL
                                 std::stringstream sql;
                                 sql << "SELECT id FROM " << table_name
-                                    << " ORDER BY embedding <-> " << vector_to_sql(queries + item_idx * dim, dim)
+                                    << " ORDER BY vec <-> " << vector_to_sql(queries + item_idx * dim, dim)
                                     << " LIMIT " << step_info.k;
                                 PGresult* res = PQexec(conn, sql.str().c_str());
                                 if (PQresultStatus(res) == PGRES_TUPLES_OK) {
@@ -1090,14 +1142,16 @@ void print_usage(const char* prog_name) {
     std::cerr << "\nRequired arguments:" << std::endl;
     std::cerr << "  --num-threads <n>            Number of threads for parallel operations" << std::endl;
     std::cerr << "  --qps <qps>                  Target QPS (queries per second) per thread for rate limiting" << std::endl;
-    std::cerr << "  --dataset <path>            Path to dataset .fvecs file" << std::endl;
-    std::cerr << "  --queries <path>             Path to queries .fvecs file" << std::endl;
+    std::cerr << "  --dataset <path>            Path to dataset (.fvecs or .fbin)" << std::endl;
+    std::cerr << "  --queries <path>             Path to queries (.fvecs or .fbin)" << std::endl;
     std::cerr << "  --runbook <path>            Path to runbook YAML file" << std::endl;
     std::cerr << "  --dataset-name <name>       Dataset name in runbook" << std::endl;
     std::cerr << "  --mixed-mode-start <num>    Start step for mixed mode (1-based)" << std::endl;
     std::cerr << "  --mixed-size <size>         Number of steps per group in mixed mode" << std::endl;
     std::cerr << "\nOptional arguments:" << std::endl;
     std::cerr << "  --gt-dir <path>             Ground truth directory (default: ./ground_truth)" << std::endl;
+    std::cerr << "  --table-name <name>         Table name (default: turing10m)" << std::endl;
+    std::cerr << "  --dataset-offset <n>        Offset added to vec_idx for insert/delete (default: 0)" << std::endl;
     std::cerr << "  --start-step <num>          First step to process (1-based, default: process all)" << std::endl;
     std::cerr << "  --end-step <num>            Last step to process (1-based, default: process all)" << std::endl;
     std::cerr << "  --build-index-before <num>  Create index before this step (1-based, default: auto)" << std::endl;
@@ -1147,6 +1201,10 @@ int main(int argc, char** argv) {
             config.DATASET_NAME = argv[++i];
         } else if (arg == "--gt-dir" && i + 1 < argc) {
             config.GT_DIR = argv[++i];
+        } else if (arg == "--table-name" && i + 1 < argc) {
+            config.TABLE_NAME = argv[++i];
+        } else if (arg == "--dataset-offset" && i + 1 < argc) {
+            config.DATASET_OFFSET = (size_t)std::atoll(argv[++i]);
         } else if (arg == "--start-step" && i + 1 < argc) {
             start_step = (size_t)std::atoi(argv[++i]);
         } else if (arg == "--end-step" && i + 1 < argc) {
@@ -1227,6 +1285,10 @@ int main(int argc, char** argv) {
     std::cout << "  Runbook: " << config.RUNBOOK_PATH << std::endl;
     std::cout << "  Dataset name: " << config.DATASET_NAME << std::endl;
     std::cout << "  GT directory: " << config.GT_DIR << std::endl;
+    std::cout << "  Table name: " << config.TABLE_NAME << std::endl;
+    if (config.DATASET_OFFSET > 0) {
+        std::cout << "  Dataset offset: " << config.DATASET_OFFSET << std::endl;
+    }
     if (start_step > 0) {
         std::cout << "  Start step: " << start_step << std::endl;
     }
@@ -1254,16 +1316,16 @@ int main(int argc, char** argv) {
     std::cout << "========================================\n" << std::endl;
 
     try {
-        // Load dataset
+        // Load dataset (auto-detect .fvecs or .fbin from extension)
         std::cout << "Loading dataset..." << std::endl;
         size_t num_vectors, data_dim;
-        auto dataset = DataLoader::load_fvecs(config.DATASET_PATH, num_vectors, data_dim);
+        auto dataset = DataLoader::load(config.DATASET_PATH, num_vectors, data_dim);
         std::cout << "✔ Dataset loaded: " << num_vectors << " vectors, dim=" << data_dim << std::endl;
 
-        // Load queries
+        // Load queries (auto-detect .fvecs or .fbin from extension)
         std::cout << "Loading queries..." << std::endl;
         size_t num_queries, query_dim;
-        auto queries = DataLoader::load_fvecs(config.QUERY_PATH, num_queries, query_dim);
+        auto queries = DataLoader::load(config.QUERY_PATH, num_queries, query_dim);
         std::cout << "✔ Queries loaded: " << num_queries << " queries, dim=" << query_dim << std::endl;
 
         // Auto-detect dimension and validate
@@ -1288,6 +1350,8 @@ int main(int argc, char** argv) {
             config.HNSW_EF_SEARCH,
             target_qps,
             num_threads,
+            config.TABLE_NAME,
+            config.DATASET_OFFSET,
             simulate_crash,
             skip_recall
         );
