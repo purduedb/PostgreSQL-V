@@ -1578,8 +1578,8 @@ vector_index_worker_main(Datum main_arg)
     // LWLockRegisterTranche(VECTOR_SEARCH_RING_TRANCHE_ID, VECTOR_SEARCH_RING_TRANCHE);
 
     LWLockAcquire(ring_buffer_shmem->lock, LW_EXCLUSIVE);
-    ring_buffer_shmem->worker_pgprocno = MyProc->pgprocno;
-    elog(DEBUG1, "[vector_index_worker] started, pgprocno=%d", MyProc->pgprocno);
+    ring_buffer_shmem->worker_pgprocno = MyProcNumber;
+    elog(DEBUG1, "[vector_index_worker] started, pgprocno=%d", MyProcNumber);
     LWLockRelease(ring_buffer_shmem->lock);
 
     ResetLatch(MyLatch);

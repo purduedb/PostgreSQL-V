@@ -4,6 +4,6 @@
 #include "postgres.h"
 
 void index_load_worker_init(void);
-void index_load_worker_main(Datum main_arg);
+PGDLLEXPORT void index_load_worker_main(Datum main_arg);
 
 #endif

@@ -20,7 +20,7 @@
 #endif
 
 void vector_index_worker_init(void);
-void vector_index_worker_main(Datum main_arg);
+PGDLLEXPORT void vector_index_worker_main(Datum main_arg);
 
 
 // typedef struct {

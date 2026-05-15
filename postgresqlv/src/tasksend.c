@@ -40,7 +40,7 @@ vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int top
 
     task = vs_search_task_at(slot);
     task->index_relid = index_oid;
-    task->backend_pgprocno = MyProc->pgprocno;
+    task->backend_pgprocno = MyProcNumber;
     task->vector_dim = dim;
     task->topk = topk;
     task->efs_nprobe = efs_nprobe;
@@ -78,7 +78,7 @@ vector_search_get_result(void)
         /* WL_TIMEOUT: keep waiting. */
     }
 
-    return vs_search_result_at(MyProc->pgprocno);
+    return vs_search_result_at(MyProcNumber);
 }
 
 /*
@@ -155,7 +155,7 @@ index_build_blocking(Oid indexRelId, int lsm_index_idx)
         elog(ERROR, "[index_build_blocking] Failed to allocate dynamic shared memory segment");
 
     task = (IndexBuildTask) dsm_segment_address(task_seg);
-    task->backend_pgprocno = MyProc->pgprocno;
+    task->backend_pgprocno = MyProcNumber;
     task->index_relid = indexRelId;
     task->lsm_idx = lsm_index_idx;
 
@@ -184,7 +184,7 @@ segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type,
         elog(ERROR, "[segment_update_blocking] Failed to allocate DSM segment");
 
     task = (SegmentUpdateTask) dsm_segment_address(task_seg);
-    task->backend_pgprocno = MyProc->pgprocno;
+    task->backend_pgprocno = MyProcNumber;
     task->index_relid = index_relid;
     task->lsm_idx = lsm_index_idx;
     task->operation_type = operation_type;
@@ -193,12 +193,12 @@ segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type,
     task->expected_version = expected_version;
 
     /* Clear maint_status before submitting so a stale value cannot be misread */
-    vs_search_result_at(MyProc->pgprocno)->maint_status = 0;
+    vs_search_result_at(MyProcNumber)->maint_status = 0;
 
     submit_and_wait_maintenance(SegmentUpdateTaskType, dsm_segment_handle(task_seg),
                                 task_seg_size, "segment_update_blocking");
 
-    result = vs_search_result_at(MyProc->pgprocno)->maint_status;
+    result = vs_search_result_at(MyProcNumber)->maint_status;
 
     dsm_detach(task_seg);
     elog(DEBUG1, "[segment_update_blocking] completed, result=%d", result);
@@ -222,7 +222,7 @@ index_load_blocking(Oid index_relid, int lsm_index_idx)
         elog(ERROR, "[index_load_blocking] Failed to allocate dynamic shared memory segment");
 
     task = (IndexLoadTask) dsm_segment_address(task_seg);
-    task->backend_pgprocno = MyProc->pgprocno;
+    task->backend_pgprocno = MyProcNumber;
     task->index_relid = index_relid;
     task->lsm_idx = lsm_index_idx;
 

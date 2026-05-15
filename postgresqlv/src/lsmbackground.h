@@ -3,6 +3,6 @@
 
 #include "postgres.h"
 
-void lsm_index_bgworker_main(Datum main_arg);
+PGDLLEXPORT void lsm_index_bgworker_main(Datum main_arg);
 
 #endif

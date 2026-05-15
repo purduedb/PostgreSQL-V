@@ -47,6 +47,9 @@ PG_MODULE_MAGIC;
 #endif
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
 
 static void
 shmem_startup(void)
@@ -61,6 +64,30 @@ shmem_startup(void)
 }
 
 /*
+ * PG15+ requires RequestAddinShmemSpace / RequestNamedLWLockTranche to be
+ * issued from a shmem_request_hook rather than directly from _PG_init.
+ */
+static void
+vector_shmem_request(void)
+{
+#if PG_VERSION_NUM >= 150000
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+#endif
+
+	RequestNamedLWLockTranche(VECTOR_SEARCH_RING_TRANCHE, 1);
+	RequestNamedLWLockTranche(LSM_MEMTABLE_LWTRANCHE, INDEX_BUF_SIZE);
+	RequestNamedLWLockTranche(LSM_SEGMENT_LWTRANCHE, INDEX_BUF_SIZE);
+	RequestNamedLWLockTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE, MEMTABLE_BUF_SIZE);
+	RequestNamedLWLockTranche(LSM_FLUSHED_RELEASE_LWTRANCHE, INDEX_BUF_SIZE);
+	RequestNamedLWLockTranche(LSM_INDEX_BUFFER_LWTRANCHE, 1);
+
+	RequestAddinShmemSpace(calculate_ring_buffer_shmem_size());
+	RequestAddinShmemSpace(4000000000L); // 2GB
+	RequestAddinShmemSpace(MAXALIGN(sizeof(IndexLoadCoordinator)));
+}
+
+/*
  * Initialize index options and variables
  */
 PGDLLEXPORT void _PG_init(void);
@@ -72,35 +99,20 @@ _PG_init(void)
 	HnswInit();
 	IvfflatInit();
 
-	// reserve LWLock tranche for vector search ring buffer
-	RequestNamedLWLockTranche(VECTOR_SEARCH_RING_TRANCHE, 1);
+	/* Per-backend tranche-id <-> name registration (must run in every backend). */
 	LWLockRegisterTranche(VECTOR_SEARCH_RING_TRANCHE_ID, VECTOR_SEARCH_RING_TRANCHE);
-	RequestNamedLWLockTranche(LSM_MEMTABLE_LWTRANCHE, INDEX_BUF_SIZE);
 	LWLockRegisterTranche(LSM_MEMTABLE_LWTRANCHE_ID, LSM_MEMTABLE_LWTRANCHE);
-	RequestNamedLWLockTranche(LSM_SEGMENT_LWTRANCHE, INDEX_BUF_SIZE);
 	LWLockRegisterTranche(LSM_SEGMENT_LWTRANCHE_ID, LSM_SEGMENT_LWTRANCHE);
-	
-	// reserve LWLock tranche for memtable vacuum locks
-	// Need MEMTABLE_BUF_SIZE locks (one per memtable slot)
-	RequestNamedLWLockTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE, MEMTABLE_BUF_SIZE);
 	LWLockRegisterTranche(LSM_MEMTABLE_VACUUM_LWTRANCHE_ID, LSM_MEMTABLE_VACUUM_LWTRANCHE);
-	
-	// reserve LWLock tranche for flushed release locks
-	// Need INDEX_BUF_SIZE locks (one per index slot)
-	RequestNamedLWLockTranche(LSM_FLUSHED_RELEASE_LWTRANCHE, INDEX_BUF_SIZE);
 	LWLockRegisterTranche(LSM_FLUSHED_RELEASE_LWTRANCHE_ID, LSM_FLUSHED_RELEASE_LWTRANCHE);
-	
-	// reserve LWLock tranche for LSM index buffer lock
-	RequestNamedLWLockTranche(LSM_INDEX_BUFFER_LWTRANCHE, 1);
 	LWLockRegisterTranche(LSM_INDEX_BUFFER_LWTRANCHE_ID, LSM_INDEX_BUFFER_LWTRANCHE);
 
-	// reserve shared memory for ring buffer
-	RequestAddinShmemSpace(calculate_ring_buffer_shmem_size());
-
-	// TODO: confirm the size of the shared memory structure
-	// initialize a shared memory structure
-	RequestAddinShmemSpace(4000000000L); // 2GB
-	RequestAddinShmemSpace(MAXALIGN(sizeof(IndexLoadCoordinator)));
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = vector_shmem_request;
+#else
+	vector_shmem_request();
+#endif
 
 	prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = shmem_startup;

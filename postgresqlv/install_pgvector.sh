@@ -5,7 +5,7 @@ set -e  # Exit immediately if a command exits with a non-zero status
 PGVECTOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # PostgreSQL build directory and pg_config
-PG_CONFIG="/home/$USER/postgresql/pg_build/bin/pg_config"
+PG_CONFIG="/home/$USER/postgresql/pg_build_17/bin/pg_config"
 
 # Make sure pg_config exists
 if [ ! -x "$PG_CONFIG" ]; then
@@ -16,7 +16,7 @@ fi
 echo "Building pgvector..."
 cd "$PGVECTOR_DIR"
 # make clean
-make
+make PG_CONFIG="$PG_CONFIG"
 
 echo "Installing pgvector extension..."
 

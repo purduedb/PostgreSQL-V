@@ -81,7 +81,7 @@ all: sql/$(EXTENSION)--$(EXTVERSION).sql
 sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql
 	cp $< $@
 
-PG_CONFIG = /home/liu4127/postgresql/pg_build/bin/pg_config
+PG_CONFIG ?= /home/liu4127/postgresql/pg_build_17/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 

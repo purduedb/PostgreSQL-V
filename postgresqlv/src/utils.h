@@ -2,6 +2,7 @@
 #define UTILS_H
 
 #include "postgres.h"
+#include "varatt.h"
 #include "storage/itemptr.h"
 #include "storage/dsm.h"
 

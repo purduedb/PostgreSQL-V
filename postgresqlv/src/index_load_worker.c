@@ -77,8 +77,8 @@ index_load_worker_main(Datum main_arg)
     BackgroundWorkerUnblockSignals();
 
     /* Publish our pgprocno so backends can wake us */
-    SharedIndexLoadCoordinator->worker_pgprocno = MyProc->pgprocno;
-    elog(LOG, "[IndexLoadWorker] started, pgprocno=%d", MyProc->pgprocno);
+    SharedIndexLoadCoordinator->worker_pgprocno = MyProcNumber;
+    elog(LOG, "[IndexLoadWorker] started, pgprocno=%d", MyProcNumber);
 
     /*
      * Crash recovery: if the previous worker crashed while loading,
