@@ -281,19 +281,43 @@ discard_reserved_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
 uint32_t
 find_segment_by_sids(FlushedSegmentPool *pool, SegmentId start_sid, SegmentId end_sid)
 {
-    // Iterate through all segments to find matching one
-    for (uint32_t idx = 0; idx < MAX_SEGMENTS_COUNT; idx++)
+    /*
+     * Walk the live linked list (head_idx -> next_idx ... -> tail_idx) ONLY.
+     *
+     * Earlier this function scanned the entire flushed_segments[] array,
+     * which made it return reserved-but-not-yet-linked slots from in-flight
+     * dpv_pool_adopt() Phase-2 reservations. That caused the buggy
+     * self-match in dpv_pool_adopt's Case A check (the function would find
+     * the slot the same caller had just reserved + loaded, then compare
+     * versions against itself, and STALE_DISCARD every adoption that
+     * didn't take a different case first — see test 120 history).
+     *
+     * Linked-list iteration here matches the semantics every caller wants
+     * ("is there an existing, registered segment with this exact range")
+     * and matches the idiom of the other find-helpers in this file and
+     * find_strictly_containing in segment_adoption.c. Reserved-but-unlinked
+     * slots are invisible by design — they represent in-flight work that
+     * has not yet been published into the pool.
+     *
+     * Caller must hold pool->seg_lock (rdlock is sufficient).
+     */
+    uint32_t idx = pool->head_idx;
+    while (idx != (uint32_t) -1)
     {
         FlushedSegment seg = &pool->flushed_segments[idx];
-        if (seg->in_used && 
-            seg->segment_id_start == start_sid && 
+
+        if (seg->in_used &&
+            seg->segment_id_start == start_sid &&
             seg->segment_id_end == end_sid)
         {
             fprintf(stderr, "[find_segment_by_ids] Found segment %u-%u at idx %u\n", start_sid, end_sid, idx);
             return idx;
         }
+        if (idx == pool->tail_idx)
+            break;
+        idx = seg->next_idx;
     }
-    
+
     fprintf(stderr, "[find_segment_by_ids] Segment %u-%u not found\n", start_sid, end_sid);
     return -1;
 }

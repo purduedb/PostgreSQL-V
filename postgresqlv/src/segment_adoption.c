@@ -250,16 +250,6 @@ dpv_pool_adopt(int lsm_idx, Oid indexRelId,
     uint32 new_slot = (uint32) -1;
     bool   new_slot_used = false;
 
-    /*
-     * Residual range R = [r_start, r_end] that pool segments must tile.
-     * r_empty = true means memtable_cover covers the full [start_sid, end_sid].
-     * R depends only on the input args (start_sid, end_sid, memtable_cover);
-     * it does NOT depend on pool state, so it can be computed before any lock.
-     */
-    SegmentId r_start = start_sid;
-    SegmentId r_end   = end_sid;
-    bool      r_empty = false;
-
     if (lsm_idx < 0 || lsm_idx >= INDEX_BUF_SIZE)
         return DPV_ADOPT_INDEX_UNLOADED;
     slot = &SharedLSMIndexBuffer->slots[lsm_idx];
@@ -270,69 +260,18 @@ dpv_pool_adopt(int lsm_idx, Oid indexRelId,
 
     pool = get_flushed_segment_pool(lsm_idx);
 
-    /* ------------------------------------------------------------------
-     * Compute residual R from memtable_cover (sorted ascending).
-     *
-     * We only handle the common cases where the cover forms a contiguous
-     * prefix, suffix, full span, or empty of [start_sid, end_sid].
-     * Non-contiguous coverage is rejected defensively.
-     * ------------------------------------------------------------------ */
-    if (memtable_cover_count > 0)
-    {
-        /* Walk down from end_sid to find how far the suffix is covered. */
-        SegmentId suffix_low = end_sid + 1;  /* start of covered suffix (exclusive if == end_sid+1) */
-        for (SegmentId s = end_sid; s >= start_sid && s != (SegmentId) -1; s--)
-        {
-            bool found = false;
-            for (int i = 0; i < memtable_cover_count; i++)
-            {
-                if (memtable_cover[i] == s) { found = true; break; }
-            }
-            if (!found) break;
-            suffix_low = s;
-            if (s == 0) break;
-        }
-
-        /* Walk up from start_sid to find how far the prefix is covered. */
-        SegmentId prefix_high = start_sid - 1; /* end of covered prefix (exclusive if == start_sid-1) */
-        for (SegmentId s = start_sid; s <= end_sid; s++)
-        {
-            bool found = false;
-            for (int i = 0; i < memtable_cover_count; i++)
-            {
-                if (memtable_cover[i] == s) { found = true; break; }
-            }
-            if (!found) break;
-            prefix_high = s;
-        }
-
-        bool full_cover   = (suffix_low == start_sid && prefix_high == end_sid);
-        bool clean_suffix = (suffix_low <= end_sid && prefix_high < start_sid);
-        bool clean_prefix = (suffix_low > end_sid && prefix_high >= start_sid);
-
-        if (full_cover)
-        {
-            r_empty = true;
-        }
-        else if (clean_suffix)
-        {
-            r_start = start_sid;
-            r_end   = suffix_low - 1;
-        }
-        else if (clean_prefix)
-        {
-            r_start = prefix_high + 1;
-            r_end   = end_sid;
-        }
-        else
-        {
-            /* Non-contiguous coverage — defensive STALE_DISCARD. */
-            elog(ERROR,
-                 "[dpv_pool_adopt] non-contiguous memtable cover for [%u,%u]; STALE_DISCARD",
-                 start_sid, end_sid);
-            return DPV_ADOPT_STALE_DISCARD;
-        }
-    }
+    /*
+     * The old code precomputed a residual range R = [start_sid, end_sid] \
+     * memtable_cover and required pool segments to exactly tile R. That
+     * structure broke on the standby when the same sid was represented
+     * by both a memtable AND a pool segment (e.g., recovery loaded a
+     * pre-existing pool segment for sid s while the corresponding
+     * memtable was still in memtable_idxs from earlier Register WAL
+     * replay). The Case D / Case E walk below now tiles the full
+     * [start_sid, end_sid] using both kinds of predecessor, so the
+     * residual computation is unnecessary — non-contiguous cover surfaces
+     * naturally as a tile_ok=false → STALE_DISCARD in the walk.
+     */
 
     /* ------------------------------------------------------------------
      * Brief lock: reserve a slot only.
@@ -438,39 +377,124 @@ dpv_pool_adopt(int lsm_idx, Oid indexRelId,
                 case_kind = 2;
             }
 
-            /* Case D: memtables cover full range. */
-            if (case_kind == 0 && r_empty)
-            {
-                case_kind = 3;
-                n_snaps = 0;
-            }
-
-            /* Case E: pool segments must exactly tile [r_start, r_end]. */
+            /*
+             * Unified Case D / Case E (Plan 3 Part B+ — fix for the
+             * "memtable cover overlaps a pre-existing pool segment" race):
+             *
+             * Tile [start_sid, end_sid] using BOTH memtable_cover AND any
+             * pool segments overlapping that range. The walk requires that
+             * every sid in [start_sid, end_sid] is covered by either:
+             *   (a) an entry in memtable_cover[], OR
+             *   (b) a pool segment that lies entirely within
+             *       [start_sid, end_sid] (and whose start matches the
+             *       current tile position so the tile is contiguous).
+             *
+             * Both kinds of predecessor get displaced by the new segment:
+             *   - cover memtables are released by the fetcher after
+             *     dpv_pool_adopt returns ADOPTED (existing mechanism);
+             *   - pool segments collected here go into snaps[] and are
+             *     replaced via replace_flushed_segments_n below.
+             *
+             * Why this replaces the old r_start/r_end residual walk:
+             *
+             * On the standby the invariant "each sid is rep'd by EITHER
+             * a memtable OR a pool segment, never both" doesn't hold:
+             * recovery can load a pool segment for sid s while the
+             * corresponding memtable is still in memtable_idxs (per
+             * spec §10 — Release WAL is a no-op for the shmem slot).
+             * The old residual walk assumed disjoint coverage and left
+             * the duplicate pool segment behind, producing a pool with
+             * overlapping segments after adoption. The unified walk
+             * always displaces both predecessor kinds in [start_sid,
+             * end_sid], so the new segment is the sole rep for that
+             * range — restoring the invariant after adoption commits.
+             *
+             * Edge equivalences with the old code:
+             *   - r_empty=true, no pool overlap → e_count=0, all sids
+             *     in cover → case_kind=3 (register only). Same as old D.
+             *   - cover empty, pool segments tile [start,end] → no gaps
+             *     to fill via cover → case_kind=4. Same as old E with
+             *     r=[start,end].
+             *   - Mixed (the bug case) → collect overlapping pool
+             *     segments, validate gaps via cover → case_kind=4 and
+             *     all duplicates get displaced. NEW behavior.
+             *
+             * Loop variable note: `r_start`/`r_end`/`r_empty` are still
+             * computed above as a defensive contiguity check on the
+             * cover (`elog(ERROR)` on non-contiguous cover); the walk
+             * itself ignores them.
+             */
             if (case_kind == 0)
             {
                 uint32    cur     = pool->head_idx;
-                SegmentId tile_lo = r_start;
+                SegmentId tile_lo = start_sid;
                 int       e_count = 0;
                 bool      tile_ok = true;
 
                 while (cur != (uint32) -1)
                 {
                     FlushedSegmentData *seg = &pool->flushed_segments[cur];
-                    if (seg->segment_id_end < r_start)
+
+                    /* Skip segments entirely before our range. */
+                    if (seg->segment_id_end < start_sid)
                     {
-                        cur = seg->next_idx;
-                        if (cur == pool->head_idx) break;
+                        uint32 next = seg->next_idx;
+                        cur = next;
+                        if (cur == pool->head_idx) break;  /* defensive */
                         continue;
                     }
-                    if (seg->segment_id_start > r_end)
+
+                    /* Stop when past our range. */
+                    if (seg->segment_id_start > end_sid)
                         break;
-                    if (seg->segment_id_start != tile_lo ||
-                        seg->segment_id_end   >  r_end   ||
-                        e_count               >= MAX_SEGMENTS_COUNT)
+
+                    /*
+                     * Segment extends past end_sid → can't safely displace
+                     * (would lose data outside our adoption range). This
+                     * is the same defensive STALE check the old walk had.
+                     */
+                    if (seg->segment_id_end > end_sid)
                     {
                         tile_ok = false;
                         break;
                     }
+
+                    /*
+                     * Gap before this segment: sids in [tile_lo,
+                     * seg->segment_id_start - 1] must all be in
+                     * memtable_cover (the new segment must displace
+                     * something for each sid).
+                     */
+                    {
+                        SegmentId s;
+                        for (s = tile_lo; s < seg->segment_id_start; s++)
+                        {
+                            bool in_cover = false;
+                            int  i;
+                            for (i = 0; i < memtable_cover_count; i++)
+                            {
+                                if (memtable_cover[i] == s)
+                                {
+                                    in_cover = true;
+                                    break;
+                                }
+                            }
+                            if (!in_cover)
+                            {
+                                tile_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!tile_ok)
+                        break;
+
+                    if (e_count >= MAX_SEGMENTS_COUNT)
+                    {
+                        tile_ok = false;
+                        break;
+                    }
+
                     snaps[e_count].seg_idx = cur;
                     snaps[e_count].start   = seg->segment_id_start;
                     snaps[e_count].end     = seg->segment_id_end;
@@ -480,10 +504,43 @@ dpv_pool_adopt(int lsm_idx, Oid indexRelId,
                     cur     = seg->next_idx;
                 }
 
-                if (!tile_ok || tile_lo != r_end + 1)
-                    case_kind = 2;
+                /* Trailing sids (tile_lo .. end_sid) must all be in cover. */
+                if (tile_ok)
+                {
+                    SegmentId s;
+                    for (s = tile_lo; s <= end_sid; s++)
+                    {
+                        bool in_cover = false;
+                        int  i;
+                        for (i = 0; i < memtable_cover_count; i++)
+                        {
+                            if (memtable_cover[i] == s)
+                            {
+                                in_cover = true;
+                                break;
+                            }
+                        }
+                        if (!in_cover)
+                        {
+                            tile_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (!tile_ok)
+                {
+                    case_kind = 2;   /* STALE */
+                }
+                else if (e_count == 0)
+                {
+                    /* No pool predecessors — equivalent to old Case D. */
+                    case_kind = 3;
+                    n_snaps   = 0;
+                }
                 else
                 {
+                    /* Pool predecessors present (possibly plus cover gaps). */
                     case_kind = 4;
                     n_snaps   = e_count;
                 }
