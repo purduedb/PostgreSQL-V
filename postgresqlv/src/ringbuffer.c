@@ -28,10 +28,16 @@ calculate_vector_search_task_pool_size()
 Size
 calculate_vector_search_result_pool_size()
 {
+    /*
+     * Sized for MaxBackends + NUM_AUXILIARY_PROCS so the startup process
+     * (an auxiliary proc) can submit synchronous maintenance tasks via
+     * segment_update_blocking during WAL redo. Aux procs have
+     * MyProcNumber in [MaxBackends, MaxBackends + NUM_AUXILIARY_PROCS).
+     */
     // id + distance
     Size result_stride = add_size(MAXALIGN(sizeof(VectorSearchResultData)), mul_size((Size)MAX_TOPK, sizeof(int64_t)));
     result_stride = add_size(result_stride, mul_size(MAX_TOPK, sizeof(float)));
-    Size size = mul_size(result_stride, (Size)MaxBackends);
+    Size size = mul_size(result_stride, (Size)(MaxBackends + NUM_AUXILIARY_PROCS));
     return size;
 }
 
@@ -57,7 +63,10 @@ vs_search_task_at(int idx)
 VectorSearchResult
 vs_search_result_at(int pgprocno)
 {
-    Assert(pgprocno >= 0 && pgprocno < MaxBackends);
+    /* Aux procs (e.g. startup) have pgprocno in [MaxBackends,
+     * MaxBackends + NUM_AUXILIARY_PROCS). The result pool is sized to
+     * cover them — see calculate_vector_search_result_pool_size. */
+    Assert(pgprocno >= 0 && pgprocno < MaxBackends + NUM_AUXILIARY_PROCS);
     return (VectorSearchResultData *)((char *)vector_search_result_pool + (Size)pgprocno * ring_buffer_shmem->search_result_stride);
 }
 
@@ -149,8 +158,8 @@ ring_buffer_init(void)
     if (!found)
     {
         memset(vector_search_result_pool, 0, total_size);
-        // initialize the result slots
-        for (int i = 0; i < MaxBackends; i++)
+        // initialize the result slots (cover aux procs too)
+        for (int i = 0; i < MaxBackends + NUM_AUXILIARY_PROCS; i++)
         {
             VectorSearchResultData *result = vs_search_result_at(i);
             result->status = 0;

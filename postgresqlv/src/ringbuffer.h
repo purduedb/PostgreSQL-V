@@ -82,17 +82,54 @@ typedef IndexBuildTaskData* IndexBuildTask;
 // - Index rebuild for flat segments (old_segment_idx_0 = segment_idx, old_segment_idx_1 = -1, operation_type = REBUILD_FLAT)
 // - Index rebuild for deletion ratio (old_segment_idx_0 = segment_idx, old_segment_idx_1 = -1, operation_type = REBUILD_DELETION)
 // - Segment merging (old_segment_idx_0 = source_seg_idx, old_segment_idx_1 = target_seg_idx, operation_type = MERGE)
+// - Segment adoption from standby fetcher (operation_type = ADOPT, start_sid/end_sid = new segment range, expected_version = new version)
 typedef struct {
     int backend_pgprocno;
     Oid index_relid;
     int lsm_idx;
 
-    int operation_type;     // 0=regular update, 1=rebuild_flat, 2=rebuild_deletion, 3=merge, 4=vacuum
+    int operation_type;     // 0=regular update, 1=rebuild_flat, 2=rebuild_deletion, 3=merge, 4=vacuum, 5=adopt
 
     // the merged segment information
     SegmentId start_sid;
     SegmentId end_sid;
-    uint32_t expected_version;  /* used only by SEGMENT_UPDATE_VACUUM */
+    uint32_t expected_version;  /* SEGMENT_UPDATE_VACUUM: expected version for retry check.
+                                  * SEGMENT_UPDATE_ADOPT:  new segment's version. */
+
+    /*
+     * Memtable cover for SEGMENT_UPDATE_ADOPT only. Other operation types
+     * MUST leave memtable_cover_count = 0 (the worker reads these only
+     * inside the ADOPT case).
+     *
+     * memtable_cover holds the sids of memtables in [start_sid, end_sid]
+     * that the fetcher will release after the worker returns. Sorted
+     * ascending. Bounded by MEMTABLE_NUM + 1 (sealed memtables + growing).
+     */
+    uint8     memtable_cover_count;
+    SegmentId memtable_cover[MEMTABLE_NUM + 1];
+
+    /*
+     * Deletion-tid set for SEGMENT_UPDATE_ADOPT only — Plan 3 Part B
+     * (memtable-predecessor union at adoption).
+     *
+     * For every memtable in memtable_cover, the fetcher walked its
+     * bitmap under mt_lock SHARED + vacuum_lock SHARED and recorded the
+     * int64-encoded tid of each set bit (the tombstone). At adoption
+     * time, dpv_pool_adopt translates each tid -> new_seg local_idx and
+     * sets the corresponding bit in the new segment's bitmap, so
+     * tombstones applied to a memtable on the standby (e.g. via a
+     * VacuumTombstones record whose redo took the memtable path) are not
+     * lost when adoption drops the memtable.
+     *
+     * The tids themselves live in the DSM segment AFTER this struct, at
+     * byte offset sizeof(SegmentUpdateTaskData). tasksend.c sizes the
+     * DSM to be (sizeof(SegmentUpdateTaskData) + deletion_tids_count *
+     * sizeof(int64_t)). 0 means "no tombstones in cover memtables" —
+     * common case, no extra DSM size.
+     *
+     * Other operation types MUST leave deletion_tids_count = 0.
+     */
+    uint32    deletion_tids_count;
 } SegmentUpdateTaskData;
 typedef SegmentUpdateTaskData* SegmentUpdateTask;
 
@@ -102,6 +139,7 @@ typedef SegmentUpdateTaskData* SegmentUpdateTask;
 #define SEGMENT_UPDATE_REBUILD_DELETION 2
 #define SEGMENT_UPDATE_MERGE 3
 #define SEGMENT_UPDATE_VACUUM 4
+#define SEGMENT_UPDATE_ADOPT 5
 
 // define the index load task structure
 typedef struct {

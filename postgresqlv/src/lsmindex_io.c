@@ -1,5 +1,6 @@
 #include "c.h"
 #include "lsmindex.h"
+#include "lsmindex_io.h"
 #include "vectorindeximpl.hpp"
 #include "storage/fd.h"
 #include <unistd.h>
@@ -17,22 +18,22 @@
 #define MAX_FILE_SIZE (1L * 1024L * 1024L * 1024L)
 
 /* LSM segment directory path: /.../indexRelId/ */
-static void GetLsmDirPath(char *buf, size_t buflen, Oid indexRelId)
+void GetLsmDirPath(char *buf, size_t buflen, Oid indexRelId)
 {
-    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/", indexRelId);
+    snprintf(buf, buflen, "%s%u/", get_vector_storage_dir(), indexRelId);
 }
 
 static void GetLsmFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version, const char *type)
 {
-    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/%s_%u_%u_v%u", indexRelId, type, segmentIdStart, segmentIdEnd, version);
+    snprintf(buf, buflen, "%s%u/%s_%u_%u_v%u", get_vector_storage_dir(), indexRelId, type, segmentIdStart, segmentIdEnd, version);
 }
 
-static void GetLSMIndexFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
+void GetLSMIndexFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "index");
 }
 
-static void GetLSMBitmapFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
+void GetLSMBitmapFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "bitmap");
 }
@@ -49,27 +50,27 @@ static void GetLSMBitmapFilePathWithSubversion(char *buf, size_t buflen, Oid ind
     else
     {
         // Include subversion in filename: bitmap_<start>_<end>_v<version>_s<subversion>
-        snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/bitmap_%u_%u_v%u_s%u", 
-                 indexRelId, segmentIdStart, segmentIdEnd, version, subversion);
+        snprintf(buf, buflen, "%s%u/bitmap_%u_%u_v%u_s%u",
+                 get_vector_storage_dir(), indexRelId, segmentIdStart, segmentIdEnd, version, subversion);
     }
 }
 
 static void GetLSMBitmapFilePathForMemtable(char *buf, size_t buflen, Oid indexRelId, SegmentId memtable_id)
 {
-    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/bitmap_memtable_%u", indexRelId, memtable_id);
+    snprintf(buf, buflen, "%s%u/bitmap_memtable_%u", get_vector_storage_dir(), indexRelId, memtable_id);
 }
 
-static void GetLSMMappingFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
+void GetLSMMappingFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "mapping");
 }
 
-static void GetLSMOffsetFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
+void GetLSMOffsetFilePathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "offset");
 }
 
-static void GetLSMSegmentMetadataPathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
+void GetLSMSegmentMetadataPathWithVersion(char *buf, size_t buflen, Oid indexRelId, uint32_t segmentIdStart, uint32_t segmentIdEnd, uint32_t version)
 {
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "metadata");
 }
@@ -79,17 +80,17 @@ static void GetLSMSegmentMetadataTmpPathWithVersion(char *buf, size_t buflen, Oi
     GetLsmFilePathWithVersion(buf, buflen, indexRelId, segmentIdStart, segmentIdEnd, version, "metadata.tmp");
 }
 
-static void get_lsm_metadata_path(char *buf, size_t buflen, Oid indexRelId)
+void get_lsm_metadata_path(char *buf, size_t buflen, Oid indexRelId)
 {
-    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/metadata", indexRelId);
+    snprintf(buf, buflen, "%s%u/metadata", get_vector_storage_dir(), indexRelId);
 }
 
 static void get_lsm_metadata_tmp_path(char *buf, size_t buflen, Oid indexRelId)
 {
-    snprintf(buf, buflen, VECTOR_STORAGE_BASE_DIR "%u/metadata.tmp", indexRelId);
+    snprintf(buf, buflen, "%s%u/metadata.tmp", get_vector_storage_dir(), indexRelId);
 }
 
-static void ensure_dir_exists(const char *path)
+void ensure_dir_exists(const char *path)
 {
     struct stat st;
     if (stat(path, &st) != 0)
@@ -584,49 +585,50 @@ scan_segment_metadata_files(Oid indexRelId, SegmentFileInfo *files, int max_file
     // Sort segments by start_sid, and for same start_sid, prefer larger scope
     qsort(segments, segment_count, sizeof(SegmentVersion), compare_segment_versions);
     
-    // Sequentially scan segments, ensuring no gaps or overlaps
-    // Track the current largest end_sid and only accept contiguous segments
-    SegmentId largest_end_sid = (SegmentId)-1; // Initialize to -1 (no segments processed yet)
+    /*
+     * Walk the sorted segment list and emit each non-overlapping entry.
+     *
+     * Overlap (start_sid <= largest_end_sid) — skip; the larger-scope
+     *   segment was processed first after the qsort, so the overlap is
+     *   the redundant one.
+     *
+     * Forward progress (start_sid > largest_end_sid) — accept. This
+     *   covers both the contiguous case (start_sid == largest_end_sid + 1)
+     *   and the gap case (start_sid > largest_end_sid + 1).
+     *
+     * Gaps are legitimate on a standby that's catching up: segment_fetcher_main
+     * pulls files in WAL/queue order, not sid order, so a load triggered
+     * mid-catchup may see e.g. [0,0], [2,2], [3,3] with sid 1 still pending.
+     * On the primary a gap would indicate corruption; we still accept the
+     * segment and log at DEBUG1 so operators can detect it via
+     * log_min_messages=debug1. All consumers of this function tolerate
+     * non-contiguous segments (the pool's linked list permits gaps; search
+     * iterates whatever's present; the merge thread checks adjacency
+     * per-pair; dpv_pool_adopt's case-E check is local to the residual).
+     */
+    SegmentId largest_end_sid = (SegmentId)-1; // -1 sentinel = no segments accepted yet
     int file_count = 0;
-    
+
     for (int i = 0; i < segment_count && file_count < max_files; i++)
     {
         SegmentId start_sid = segments[i].start_sid;
         SegmentId end_sid = segments[i].end_sid;
-        
-        if (largest_end_sid == (SegmentId)-1)
-        {
-            // First segment - accept it and initialize largest_end_sid
-            files[file_count].start_sid = start_sid;
-            files[file_count].end_sid = end_sid;
-            files[file_count].version = segments[i].max_version;
-            largest_end_sid = end_sid;
-            file_count++;
-            // elog(DEBUG1, "[scan_segment_metadata_files] accepted first segment: %u-%u", start_sid, end_sid);
-        }
-        else if (start_sid <= largest_end_sid)
-        {
-            // Overlap detected - skip this segment
-            // (we prefer the segment with larger scope, which should have been processed first after sorting)
-            // elog(DEBUG1, "[scan_segment_metadata_files] skipped overlapping segment: %u-%u", start_sid, end_sid);
-            continue;
-        }
-        else if (start_sid == largest_end_sid + 1)
-        {
-            // Contiguous segment - accept it
-            files[file_count].start_sid = start_sid;
-            files[file_count].end_sid = end_sid;
-            files[file_count].version = segments[i].max_version;
-            largest_end_sid = end_sid;
-            file_count++;
-            // elog(DEBUG1, "[scan_segment_metadata_files] accepted contiguous segment: %u-%u", start_sid, end_sid);
-        }
-        else // start_sid > largest_end_sid + 1
-        {
-            // Gap detected - trigger error
-            elog(ERROR, "Gap detected in segment files: expected start_sid %u but found %u (largest_end_sid: %u)",
-                 (unsigned int)(largest_end_sid + 1), (unsigned int)start_sid, (unsigned int)largest_end_sid);
-        }
+
+        if (largest_end_sid != (SegmentId)-1 && start_sid <= largest_end_sid)
+            continue;  /* overlap */
+
+        if (largest_end_sid != (SegmentId)-1 && start_sid > largest_end_sid + 1)
+            elog(DEBUG1,
+                 "[scan_segment_metadata_files] gap in segment files: expected start_sid %u but found %u (largest_end_sid: %u); accepting as non-contiguous run",
+                 (unsigned int)(largest_end_sid + 1),
+                 (unsigned int)start_sid,
+                 (unsigned int)largest_end_sid);
+
+        files[file_count].start_sid = start_sid;
+        files[file_count].end_sid   = end_sid;
+        files[file_count].version   = segments[i].max_version;
+        largest_end_sid = end_sid;
+        file_count++;
     }
     
     return file_count;

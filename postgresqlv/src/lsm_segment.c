@@ -33,6 +33,8 @@ void initialize_segment_pool(FlushedSegmentPool *pool)
         pool->flushed_segments[i].delete_count = 0;
         pool->flushed_segments[i].is_compacting = false;
         pool->flushed_segments[i].version = 0;
+        pool->flushed_segments[i].offsets       = NULL;
+        pool->flushed_segments[i].offsets_count = 0;
         pthread_mutex_init(&pool->flushed_segments[i].per_seg_mutex, NULL);
     }
 }
@@ -73,34 +75,77 @@ reserve_flushed_segment(FlushedSegmentPool *pool)
 
 void
 register_flushed_segment(FlushedSegmentPool *pool, uint32_t idx)
-{    
+{
+    FlushedSegment new_seg = &pool->flushed_segments[idx];
+    SegmentId new_start = new_seg->segment_id_start;
+
     // Initialize reference count for the new segment
-    atomic_store(&pool->flushed_segments[idx].ref_count, 1);
-    
-    // Link to the end of the list
-    uint32_t prev_tail = -1;
-    if(pool->tail_idx != -1) {
-        pool->flushed_segments[pool->tail_idx].next_idx = idx;
-        prev_tail = pool->tail_idx;
-    }
-    pool->flushed_segments[idx].prev_idx = prev_tail;
-    pool->flushed_segments[idx].next_idx = -1;
-    pool->tail_idx = idx;
-    
-    // Update head_idx if this is the first segment
-    if (pool->head_idx == -1)
+    atomic_store(&new_seg->ref_count, 1);
+
+    /*
+     * Insert into the linked list in ascending segment_id_start order.
+     *
+     * On the primary, segments are produced in sid order, so the new
+     * segment usually belongs at the tail; the walk-from-tail loop below
+     * exits on the first iteration (O(1)). On the standby, out-of-order
+     * arrivals via segment_fetcher_main can register a small-sid segment
+     * after a large-sid one — in that case the walk traverses backward
+     * until it finds the correct insertion point (O(N)).
+     *
+     * Sid-order is required by several consumers that traverse the list
+     * directly: scan_and_claim_merge_task_pool's adjacency scan,
+     * choose_adjacent_smaller_pool, find_two_adjacent_segments, the
+     * dpv_pool_adopt case-E tiling walk, and find_strictly_containing.
+     */
+    if (pool->head_idx == (uint32_t) -1)
     {
+        /* Empty list. */
+        new_seg->prev_idx = (uint32_t) -1;
+        new_seg->next_idx = (uint32_t) -1;
         pool->head_idx = idx;
+        pool->tail_idx = idx;
     }
-    
+    else
+    {
+        uint32_t cur = pool->tail_idx;
+        while (cur != (uint32_t) -1 &&
+               pool->flushed_segments[cur].segment_id_start > new_start)
+        {
+            cur = pool->flushed_segments[cur].prev_idx;
+        }
+
+        if (cur == (uint32_t) -1)
+        {
+            /* All existing segments have higher start_sid — insert at head. */
+            uint32_t old_head = pool->head_idx;
+            new_seg->prev_idx = (uint32_t) -1;
+            new_seg->next_idx = old_head;
+            pool->flushed_segments[old_head].prev_idx = idx;
+            pool->head_idx = idx;
+        }
+        else
+        {
+            /* Insert after `cur`. */
+            uint32_t after = pool->flushed_segments[cur].next_idx;
+            new_seg->prev_idx = cur;
+            new_seg->next_idx = after;
+            pool->flushed_segments[cur].next_idx = idx;
+            if (after != (uint32_t) -1)
+                pool->flushed_segments[after].prev_idx = idx;
+            else
+                pool->tail_idx = idx;  /* inserted at tail */
+        }
+    }
+
     ++pool->flushed_segment_count;
 
     update_pool_stats(pool,
-                      pool->flushed_segments[idx].index_type,
-                      pool->flushed_segments[idx].vec_count,
+                      new_seg->index_type,
+                      new_seg->vec_count,
                       +1);
 
-    fprintf(stderr, "register_flushed_segment successfully added to list, idx = %d\n", idx);
+    fprintf(stderr, "register_flushed_segment successfully added to list, idx = %d (start_sid=%u)\n",
+            idx, new_start);
 }
 
 // Reference counting functions for flushed segments
@@ -123,12 +168,6 @@ cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
 {
     FlushedSegment segment = &pool->flushed_segments[segment_idx];
 
-    /* Decrement pool statistics before clearing the fields */
-    update_pool_stats(pool,
-                      segment->index_type,
-                      (uint32_t)segment->vec_count,
-                      -1);
-
     // Free the index, bitmap, and map
     if (segment->index_ptr != NULL)
     {
@@ -145,6 +184,12 @@ cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
         free(segment->map_ptr);
         segment->map_ptr = NULL;
     }
+    if (segment->offsets != NULL)
+    {
+        free(segment->offsets);
+        segment->offsets = NULL;
+    }
+    segment->offsets_count = 0;
 
     // No need to unlink the segment in this function, the segment is already unlinked when the reference count reaches 0
     // Mark segment as unused
@@ -181,6 +226,53 @@ cleanup_flushed_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
     // This is safe because reserve_flushed_segment will eventually find freed slots
     
     fprintf(stderr, "[cleanup_flushed_segment] Segment idx = %d cleaned up and unlinked from list\n", segment_idx);
+}
+
+// Cleanup for a slot reserved + loaded but never linked into the list.
+// Frees the loaded buffers and clears in_used; does NOT touch list/stats/count.
+// Caller must hold the write lock on pool->seg_lock.
+void
+discard_reserved_segment(FlushedSegmentPool *pool, uint32_t segment_idx)
+{
+    FlushedSegment segment = &pool->flushed_segments[segment_idx];
+
+    if (segment->index_ptr != NULL)
+    {
+        IndexFree(segment->index_ptr);
+        segment->index_ptr = NULL;
+    }
+    if (segment->bitmap_ptr != NULL)
+    {
+        free(segment->bitmap_ptr);
+        segment->bitmap_ptr = NULL;
+    }
+    if (segment->map_ptr != NULL)
+    {
+        free(segment->map_ptr);
+        segment->map_ptr = NULL;
+    }
+    if (segment->offsets != NULL)
+    {
+        free(segment->offsets);
+        segment->offsets = NULL;
+    }
+    segment->offsets_count = 0;
+
+    segment->in_used = false;
+    segment->next_idx = -1;
+    segment->prev_idx = -1;
+    atomic_store(&segment->ref_count, 0);
+
+    /* Rewind insert_idx so the slot is preferred for reuse. We already
+     * hold the write lock here (caller's contract), so don't attempt a
+     * second try-acquire. */
+    if (segment_idx < pool->insert_idx)
+    {
+        pool->insert_idx = segment_idx;
+    }
+
+    fprintf(stderr, "[discard_reserved_segment] Segment idx = %u discarded (loaded buffers freed)\n",
+            segment_idx);
 }
 
 // Find a segment by its segment IDs
@@ -291,73 +383,120 @@ find_two_adjacent_segments(FlushedSegmentPool *pool, SegmentId target_start_sid,
     *seg_idx_1 = -1;
 }
 
-// Replace an old segment with a new segment atomically
-// Unlinks the old segment and links the new segment in its place
-// the order of the old segments is important
-// The caller must hold the write lock
+// Replace N old segments (contiguous in linked list, ascending sid order) with
+// one new segment. Caller must hold the write lock on pool->seg_lock.
 void
-replace_flushed_segment(FlushedSegmentPool *pool, uint32_t old_seg_idx_0, uint32_t old_seg_idx_1, uint32_t new_seg_idx)
+replace_flushed_segments_n(FlushedSegmentPool *pool,
+                            const uint32_t *old_seg_idxs, int old_count,
+                            uint32_t new_seg_idx)
 {
-    fprintf(stderr, "[replace_flushed_segment] Replacing old segment idx = %u with new segment idx = %u\n", 
-         old_seg_idx_0, new_seg_idx);
-    
-    // Get the old segment's position before unlinking
-    FlushedSegment old_seg_0 = &pool->flushed_segments[old_seg_idx_0];
-    FlushedSegment old_seg_1 = old_seg_idx_1 != -1 ? &pool->flushed_segments[old_seg_idx_1] : NULL;
-    FlushedSegment new_seg = &pool->flushed_segments[new_seg_idx];
-    uint32_t prev_idx = old_seg_0->prev_idx;
-    uint32_t next_idx = old_seg_idx_1 != -1 ? old_seg_1->next_idx : old_seg_0->next_idx;
+    FlushedSegment first_old;
+    FlushedSegment last_old;
+    FlushedSegment new_seg;
+    uint32_t prev_idx;
+    uint32_t next_idx;
 
-    // Decrement ref count of old segment
-    decrement_flushed_segment_ref_count(pool, old_seg_idx_0);
-    if(old_seg_idx_1 != -1) {
-        decrement_flushed_segment_ref_count(pool, old_seg_idx_1);
-    }
-    
-    // 1. Update the head and the tail if necessary
-    if (pool->head_idx == old_seg_idx_0)
+    if (old_count <= 0)
     {
-        // This was the head - update head_idx to new segment
+        fprintf(stderr, "[replace_flushed_segments_n] old_count=%d; nothing to replace\n", old_count);
+        return;
+    }
+
+    first_old = &pool->flushed_segments[old_seg_idxs[0]];
+    last_old  = &pool->flushed_segments[old_seg_idxs[old_count - 1]];
+    new_seg   = &pool->flushed_segments[new_seg_idx];
+    prev_idx  = first_old->prev_idx;
+    next_idx  = last_old->next_idx;
+
+    fprintf(stderr, "[replace_flushed_segments_n] Replacing %d old segments (first=%u, last=%u) with new segment idx=%u\n",
+            old_count, old_seg_idxs[0], old_seg_idxs[old_count - 1], new_seg_idx);
+
+    /*
+     * Logical-removal point: decrement pool stats for each old segment NOW,
+     * while they still hold their in_used metadata (index_type, vec_count).
+     * Stats track logical-list membership; the segments are about to leave
+     * the list. We do this BEFORE decrement_flushed_segment_ref_count so
+     * cleanup_flushed_segment (which fires when ref_count hits 0) doesn't
+     * need to know about stats anymore.
+     */
+    for (int i = 0; i < old_count; i++)
+    {
+        FlushedSegment old = &pool->flushed_segments[old_seg_idxs[i]];
+        update_pool_stats(pool, old->index_type, old->vec_count, -1);
+    }
+
+    /*
+     * Decrement ref counts on all old segments. If any drops to 0,
+     * cleanup_flushed_segment runs (it uses trywrlock for insert_idx, so
+     * safe even though we hold the write lock here).
+     */
+    for (int i = 0; i < old_count; i++)
+    {
+        decrement_flushed_segment_ref_count(pool, old_seg_idxs[i]);
+    }
+
+    /* Update head/tail if the replaced span included either end. */
+    if (pool->head_idx == old_seg_idxs[0])
+    {
         pool->head_idx = new_seg_idx;
     }
-    if ((old_seg_idx_1 == -1 && pool->tail_idx == old_seg_idx_0) || (old_seg_idx_1 != -1 && pool->tail_idx == old_seg_idx_1))
+    if (pool->tail_idx == old_seg_idxs[old_count - 1])
     {
-        // This was the tail - update tail_idx to new segment
         pool->tail_idx = new_seg_idx;
     }
-    
-    // 2. Set the prev and next of the new segment
+
+    /* Wire the new segment into the list in place of the old span. */
     new_seg->prev_idx = prev_idx;
     new_seg->next_idx = next_idx;
-    
-    // Update the previous segment's next_idx to point to new segment
-    if (prev_idx != -1)
+
+    if (prev_idx != (uint32_t) -1)
     {
         pool->flushed_segments[prev_idx].next_idx = new_seg_idx;
     }
-    
-    // Update the next segment's prev_idx to point to new segment
-    if (next_idx != -1)
+    if (next_idx != (uint32_t) -1)
     {
         pool->flushed_segments[next_idx].prev_idx = new_seg_idx;
     }
-    
-    // 3. Update the ref count of the new segment
+
     atomic_store(&new_seg->ref_count, 1);
 
-    // update the flushed_segment_count if necessary
-    if(old_seg_idx_1 != -1) {
-        --pool->flushed_segment_count;
-    }
-    
-    fprintf(stderr, "[replace_flushed_segment] Successfully replaced segment %u with segment %u\n", 
-         old_seg_idx_0, new_seg_idx);
+    /*
+     * Logical-insertion point: increment pool stats for the new segment
+     * now that it is wired into the list. Pairs with the -1 done above
+     * for each old segment.
+     */
+    update_pool_stats(pool, new_seg->index_type, new_seg->vec_count, +1);
+
+    /* Net change in segment count: removed old_count, added 1. */
+    pool->flushed_segment_count -= (old_count - 1);
+
+    fprintf(stderr, "[replace_flushed_segments_n] Successfully replaced %d old segments with segment %u\n",
+            old_count, new_seg_idx);
 }
 
 // -------------------------------- IO ----------------------------------
 
-// FIXME: concurrency issue
-void 
+/*
+ * load_all_segments_from_disk — populate the pool from the on-disk
+ * segment files for an index. Called from the IndexLoadTaskType handler
+ * (vector_index_worker.c) during slot LOADING_INDEX transition.
+ *
+ * Concurrency: the on-disk file set is NOT quiescent during this call.
+ *   - Primary: lsm_flush_one_pending can write a new segment while we
+ *     load; the file is missed here but picked up by the trailing
+ *     SEGMENT_UPDATE_REGULAR maintenance task (which waits via
+ *     wait_for_slot_queryable, then runs the dedup-protected register).
+ *   - Standby: segment_fetcher_main pulls files in arbitrary order. The
+ *     disk may have gaps in sid coverage — scan_segment_metadata_files
+ *     tolerates these and returns whatever's present.
+ *   - Merges/rebuilds: skipped by scan_and_claim_merge_task_pool for
+ *     non-queryable slots (see Task 10), so no concurrent pool mutation
+ *     races with this loader for the same slot.
+ *
+ * Missed-during-load segments converge via the corresponding maintenance
+ * task path after the slot reaches QUERYABLE.
+ */
+void
 load_all_segments_from_disk(Oid index_oid, FlushedSegmentPool *pool)
 {
     SegmentFileInfo files[MAX_SEGMENTS_COUNT];
@@ -455,6 +594,15 @@ load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segmen
         uint32_t delete_count;
         load_bitmap_file(indexRelId, start_sid, end_sid, version, &segment->bitmap_ptr, false, &delete_count);
         load_mapping_file(indexRelId, start_sid, end_sid, version, &segment->map_ptr, false);
+
+        /*
+         * Plan 3 refactor: cache the per-sid offset table on the segment.
+         * Used by vacuum redo (segment_vacuum_redo.c) and adoption union
+         * (segment_adoption.c) for the O(n) 2-pointer merge.
+         */
+        load_offset_file(indexRelId, start_sid, end_sid, version,
+                         &segment->offsets, false);
+        segment->offsets_count = (uint32_t) (end_sid - start_sid + 1);
 
         segment->in_used = true;
         segment->delete_count = delete_count;  /* already computed by load_bitmap_file */

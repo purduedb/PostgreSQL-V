@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "access/xlog.h"                  // For RecoveryInProgress()
 #include "fmgr.h"                         // For PG_MODULE_MAGIC
 #include "miscadmin.h"                    // For MyProcPid, MyDatabaseId, etc.
 #include "storage/ipc.h"                  // For on_proc_exit
@@ -28,12 +29,79 @@
 #include "lsmindex.h"
 #include "vectorindeximpl.hpp"
 #include "lsm_segment.h"
+#include "replication_gucs.h"
+#include "replication_rmgr.h"
+#include "segment_adoption.h"
 #include "catalog/index.h"
 #include <pthread.h>
 #include <stdatomic.h>
 
 static void *merge_worker_thread(void *arg);  /* implemented in Task 8 */
 static void signal_merge_pool(void);           /* forward declaration */
+
+/*
+ * slot_is_queryable — true iff the slot at lsm_idx is currently in
+ * LSM_SLOT_QUERYABLE. Used to gate maintenance task handlers so they
+ * no-op against slots that are recovered but not yet loaded.
+ */
+static inline bool
+slot_is_queryable(int lsm_idx)
+{
+    if (lsm_idx < 0 || lsm_idx >= INDEX_BUF_SIZE)
+        return false;
+    return pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid)
+           == (uint32) LSM_SLOT_QUERYABLE;
+}
+
+/*
+ * wait_for_slot_queryable — used by maintenance handlers to decide whether
+ * to process or skip a task targeting slot lsm_idx.
+ *
+ * Semantics:
+ *   - QUERYABLE     -> return true (process).
+ *   - LOADING_INDEX -> poll the slot state until it leaves LOADING_INDEX,
+ *                      then return true iff it ended at QUERYABLE
+ *                      (false if the load reverted to WRITABLE on error).
+ *   - anything else (FREE / RECOVERING / WRITABLE) -> return false (skip).
+ *
+ * IMPORTANT: this runs from a pthread inside vector_index_worker. We
+ * deliberately do NOT use PG's ConditionVariable here — it depends on
+ * MyLatch, which is process-wide and shared across pthreads. Concurrent
+ * waiters in different pthreads would race each other's wakeups
+ * (lost-wakeup hazard). Polling with pg_atomic_read_u32 + usleep is
+ * fully thread-safe.
+ *
+ * The poll interval is 1ms; a load typically completes in tens of ms to
+ * seconds, so the latency overhead is negligible relative to load cost.
+ */
+static bool
+wait_for_slot_queryable(int lsm_idx)
+{
+    LSMIndexBufferSlot *slot;
+    uint32 v;
+    int attempts = 0;
+    const int MAX_ATTEMPTS = 300000;  /* 300000 * 1ms = 5 minutes safety bound */
+
+    if (lsm_idx < 0 || lsm_idx >= INDEX_BUF_SIZE)
+        return false;
+
+    slot = &SharedLSMIndexBuffer->slots[lsm_idx];
+    for (;;)
+    {
+        v = pg_atomic_read_u32(&slot->valid);
+        if (v == (uint32) LSM_SLOT_QUERYABLE)
+            return true;
+        if (v != (uint32) LSM_SLOT_LOADING_INDEX)
+            return false;  /* FREE / RECOVERING / WRITABLE — skip */
+        usleep(1000);  /* 1 ms */
+        if (++attempts >= MAX_ATTEMPTS)
+        {
+            elog(WARNING, "[wait_for_slot_queryable] slot %d stuck in LOADING_INDEX after %d ms — aborting wait",
+                 lsm_idx, attempts);
+            return false;
+        }
+    }
+}
 
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
@@ -65,6 +133,16 @@ typedef struct MaintenanceTask {
         IndexLoadTaskData load_task;
         InternalUpgradeTaskData upgrade_task;
     } task_data;
+    /*
+     * Plan 3 refactor — per-sid grouped deletion payload from the fetcher.
+     * For SEGMENT_UPDATE_ADOPT tasks with a non-empty trailer,
+     * submit_maintenance_task parses the DSM trailer into groups[] (one
+     * entry per cover memtable) backed by a single flat groups_tids_buf.
+     * maintenance_worker_thread free()s both after task switch completes.
+     */
+    DpvVacuumGroup *groups;
+    int             n_groups;
+    int64_t        *groups_tids_buf;
     struct MaintenanceTask *next;
 } MaintenanceTask;
 
@@ -94,6 +172,32 @@ typedef struct MergeThreadPool {
 } MergeThreadPool;
 
 static MergeThreadPool *merge_pool = NULL;
+
+/*
+ * dpv_wal_emit_mutex — serializes Phase 4 WAL emits across pthread workers
+ * (merge_adjacent_segments_pool, rebuild_index_pool). PG's WAL primitives
+ * (XLogBeginInsert / XLogRegisterData / XLogInsert) use process-local static
+ * state that is not thread-safe.
+ *
+ * KNOWN FRAGILITY: if XLogInsert ever calls elog(ERROR) from inside the
+ * critical section, the mutex is left permanently locked and all subsequent
+ * merge/rebuild WAL emits in this process will deadlock. We do NOT use
+ * PG_TRY/PG_CATCH to mitigate because those macros also rely on a
+ * process-global sigjmp_buf chain (PG_exception_stack) that is not
+ * thread-local, and would introduce a worse (memory-corruption-class)
+ * hazard than the deadlock they would prevent.
+ *
+ * Mitigations:
+ *   - WAL emit failure during normal operation is exceptional; production
+ *     instances should detect the deadlock symptom in monitoring.
+ *   - The architecturally correct fix is to route emits through the main
+ *     vector_index_worker_main loop, which runs in a normal PG backend
+ *     context and can use PG_TRY safely. Deferred as a follow-on.
+ *   - Existing code in this file already calls other PG functions
+ *     (flush_segment_to_disk, etc.) from pthreads with the same hazard;
+ *     this mutex does not introduce a new one, just makes it concentrated.
+ */
+static pthread_mutex_t dpv_wal_emit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void submit_internal_task(VectorTaskType task_type, void *data, size_t data_size);
 
@@ -175,14 +279,46 @@ maintenance_worker_thread(void *arg)
                 {
                     case SEGMENT_UPDATE_REGULAR:
                     {
-                        FlushedSegmentPool *pool_seg = get_flushed_segment_pool(lsm_idx);
-                        
-                        pthread_rwlock_wrlock(&pool_seg->seg_lock);
-                        uint32_t seg_idx = reserve_flushed_segment(pool_seg);
+                        FlushedSegmentPool *pool_seg;
+                        uint32_t seg_idx;
+                        uint32_t existing_idx;
+
+                        if (!wait_for_slot_queryable(lsm_idx))
+                        {
+                            elog(DEBUG1, "[maintenance_worker] SEGMENT_UPDATE_REGULAR: skip — slot %d not queryable",
+                                 lsm_idx);
+                            vs_search_result_at(update_task->backend_pgprocno)->maint_status = 0;
+                            client = &ProcGlobal->allProcs[update_task->backend_pgprocno];
+                            break;
+                        }
+
+                        pool_seg = get_flushed_segment_pool(lsm_idx);
+
+                        /*
+                         * Dedup: if a concurrent IndexLoad (which we may have
+                         * just waited for) already scanned this segment file
+                         * off disk and registered it, skip the add to avoid
+                         * a duplicate pool entry.
+                         */
+                        pthread_rwlock_rdlock(&pool_seg->seg_lock);
+                        existing_idx = find_segment_by_sids(pool_seg,
+                                          update_task->start_sid, update_task->end_sid);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
-                        
+                        if (existing_idx != (uint32_t) -1)
+                        {
+                            elog(DEBUG1, "[maintenance_worker] SEGMENT_UPDATE_REGULAR: segment %u-%u already in pool (loaded by IndexLoad), skipping duplicate add",
+                                 update_task->start_sid, update_task->end_sid);
+                            vs_search_result_at(update_task->backend_pgprocno)->maint_status = 0;
+                            client = &ProcGlobal->allProcs[update_task->backend_pgprocno];
+                            break;
+                        }
+
+                        pthread_rwlock_wrlock(&pool_seg->seg_lock);
+                        seg_idx = reserve_flushed_segment(pool_seg);
+                        pthread_rwlock_unlock(&pool_seg->seg_lock);
+
                         load_and_set_segment(index_relid, seg_idx, &pool_seg->flushed_segments[seg_idx], update_task->start_sid, update_task->end_sid, LOAD_LATEST_VERSION, false);
-                        
+
                         pthread_rwlock_wrlock(&pool_seg->seg_lock);
                         register_flushed_segment(pool_seg, seg_idx);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
@@ -192,38 +328,82 @@ maintenance_worker_thread(void *arg)
 
                     case SEGMENT_UPDATE_VACUUM:
                     {
+                        FlushedSegmentPool *pool_seg;
+                        uint32_t seg_idx;
+                        FlushedSegmentData *seg;
+                        int retry;
+
                         fprintf(stderr, "[maintenance_worker] SEGMENT_UPDATE_VACUUM %d-%d expected_version=%u\n",
                                 update_task->start_sid, update_task->end_sid, update_task->expected_version);
 
-                        FlushedSegmentPool *pool_seg = get_flushed_segment_pool(lsm_idx);
+                        if (!wait_for_slot_queryable(lsm_idx))
+                        {
+                            elog(DEBUG1, "[maintenance_worker] SEGMENT_UPDATE_VACUUM: skip — slot %d not queryable",
+                                 lsm_idx);
+                            vs_search_result_at(update_task->backend_pgprocno)->maint_status = 0;
+                            client = &ProcGlobal->allProcs[update_task->backend_pgprocno];
+                            break;
+                        }
+
+                        pool_seg = get_flushed_segment_pool(lsm_idx);
 
                         /* Step 1: find segment by exact (start_sid, end_sid) under read lock */
                         pthread_rwlock_rdlock(&pool_seg->seg_lock);
-                        uint32_t seg_idx = find_segment_by_sids(pool_seg,
-                                               update_task->start_sid, update_task->end_sid);
+                        seg_idx = find_segment_by_sids(pool_seg,
+                                      update_task->start_sid, update_task->end_sid);
                         if (seg_idx != (uint32_t)-1)
                             atomic_fetch_add(&pool_seg->flushed_segments[seg_idx].ref_count, 1);
                         pthread_rwlock_unlock(&pool_seg->seg_lock);
 
                         if (seg_idx == (uint32_t)-1)
                         {
-                            /* Segment merged away → tell backend to retry with new segment */
+                            /* Segment merged away → tell caller to retry against the
+                             * new segment (the standby's vacuum-redo retry loop in
+                             * apply_to_disk_file_for_sid re-scans disk on RETRY). */
                             vs_search_result_at(update_task->backend_pgprocno)->maint_status = 1; /* RETRY */
                             client = &ProcGlobal->allProcs[update_task->backend_pgprocno];
                             break;
                         }
 
-                        FlushedSegmentData *seg = &pool_seg->flushed_segments[seg_idx];
+                        seg = &pool_seg->flushed_segments[seg_idx];
 
-                        /* Step 2: acquire per_seg_mutex, check version */
+                        /* Step 2: acquire per_seg_mutex, check version + still-in-pool */
                         pthread_mutex_lock(&seg->per_seg_mutex);
 
-                        int retry = 0;
+                        retry = 0;
                         if (seg->version != update_task->expected_version || !seg->in_used)
                         {
-                            retry = 1;  /* version changed (rebuild happened) or segment gone */
+                            retry = 1;  /* version changed or segment fully cleaned up */
                         }
                         else
+                        {
+                            /*
+                             * `in_used` alone is INSUFFICIENT to detect a concurrent
+                             * adoption: replace_flushed_segments_n only calls
+                             * decrement_flushed_segment_ref_count on the retired
+                             * slot, and cleanup_flushed_segment (which sets
+                             * in_used = false) runs only when ref_count drops to 0.
+                             * We bumped ref_count in Step 1, so a slot that was
+                             * replaced under us will still have in_used == true.
+                             *
+                             * Re-find under seg_lock SH to confirm we are still
+                             * the canonical pool entry for (start_sid, end_sid).
+                             * Lock-order safe: nobody holds seg_lock while
+                             * waiting on per_seg_mutex (adoption / merge /
+                             * rebuild all release seg_lock first), so
+                             * per_seg_mutex -> seg_lock SH cannot deadlock.
+                             */
+                            uint32_t live_idx;
+                            pthread_rwlock_rdlock(&pool_seg->seg_lock);
+                            live_idx = find_segment_by_sids(pool_seg,
+                                                             update_task->start_sid,
+                                                             update_task->end_sid);
+                            pthread_rwlock_unlock(&pool_seg->seg_lock);
+                            if (live_idx != seg_idx)
+                                retry = 1;
+                        }
+
+                        if (retry == 0)
                         {
                             /* Load latest bitmap subversion and OR into in-memory bitmap */
                             uint8_t *new_bitmap = NULL;
@@ -252,7 +432,55 @@ maintenance_worker_thread(void *arg)
                                 retry ? "RETRY" : "OK", update_task->start_sid, update_task->end_sid);
                         break;
                     }
-                    
+
+                    case SEGMENT_UPDATE_ADOPT:
+                    {
+                        DpvAdoptionOutcome adopt_result;
+
+                        fprintf(stderr,
+                                "[maintenance_worker] SEGMENT_UPDATE_ADOPT %d-%d v=%u\n",
+                                update_task->start_sid, update_task->end_sid,
+                                update_task->expected_version);
+
+                        if (!wait_for_slot_queryable(lsm_idx))
+                        {
+                            elog(DEBUG1, "[maintenance_worker] SEGMENT_UPDATE_ADOPT: skip — slot %d not queryable (INDEX_UNLOADED)",
+                                 lsm_idx);
+                            /*
+                             * Match the existing dpv_pool_adopt path:
+                             * INDEX_UNLOADED maps to maint_status=2 ("skip,
+                             * files persist on disk for recover_lsm_index_internal").
+                             */
+                            vs_search_result_at(update_task->backend_pgprocno)->maint_status = 2;
+                            client = &ProcGlobal->allProcs[update_task->backend_pgprocno];
+                            break;
+                        }
+
+                        adopt_result = dpv_pool_adopt(update_task->lsm_idx,
+                                                     update_task->index_relid,
+                                                     update_task->start_sid,
+                                                     update_task->end_sid,
+                                                     update_task->expected_version,
+                                                     update_task->memtable_cover,
+                                                     update_task->memtable_cover_count,
+                                                     task->groups,
+                                                     task->n_groups);
+
+                        /*
+                         * Map adoption outcome to the existing maint_status
+                         * protocol:
+                         *   ADOPTED        -> 0 (OK)
+                         *   STALE_DISCARD  -> 1 (fetcher may unlink pulled files)
+                         *   INDEX_UNLOADED -> 2 ("skip, files persist on disk
+                         *                       for recover_lsm_index_internal")
+                         */
+                        vs_search_result_at(update_task->backend_pgprocno)->maint_status =
+                            (adopt_result == DPV_ADOPT_INDEX_UNLOADED) ? 2 :
+                            (adopt_result == DPV_ADOPT_STALE_DISCARD)  ? 1 : 0;
+                        client = &ProcGlobal->allProcs[update_task->backend_pgprocno];
+                        break;
+                    }
+
                     default:
                         fprintf(stderr, "[maintenance_worker] WARNING: Unknown segment update operation type %d\n", update_task->operation_type);
                         break;
@@ -399,8 +627,8 @@ maintenance_worker_thread(void *arg)
                              * cleanup_flushed_segment frees all three when old slot's
                              * ref_count reaches 0 (i.e. once all in-flight mmap searches
                              * finish).  New slot owns its independent deep copies. */
-                            replace_flushed_segment(pool_seg, upg->segment_idx,
-                                                    (uint32_t)-1, new_slot_idx);
+                            replace_flushed_segments_n(pool_seg, &upg->segment_idx, 1,
+                                                       new_slot_idx);
                             pthread_rwlock_unlock(&pool_seg->seg_lock);
 
                             signal_merge_pool();
@@ -454,12 +682,25 @@ maintenance_worker_thread(void *arg)
             if (client != NULL) {
                 SetLatch(&client->procLatch);
             }
-            
+
+            // Plan 3 refactor: release the malloc'd per-sid group payload (ADOPT only).
+            if (task->groups != NULL)
+            {
+                free(task->groups);
+                task->groups   = NULL;
+                task->n_groups = 0;
+            }
+            if (task->groups_tids_buf != NULL)
+            {
+                free(task->groups_tids_buf);
+                task->groups_tids_buf = NULL;
+            }
+
             // Free the task structure
             free(task);
         }
     }
-    
+
     return NULL;
 }
 
@@ -728,7 +969,7 @@ traverse_and_check_priority_pool(int lsm_idx, int priority_type, MergeTaskLocal 
              * holding the read lock so the IDs are stable.  Pool slots are
              * reused after merges, so Min/Max of pool indices can place the
              * higher-SID segment first, producing an underflowing
-             * merged_seg_count and corrupting replace_flushed_segment's
+             * merged_seg_count and corrupting replace_flushed_segments_n's
              * linked-list surgery.
              */
             bool adj_lower;
@@ -769,7 +1010,7 @@ scan_and_claim_merge_task_pool(MergeTaskLocal *task)
     /* Priority 1: FLAT segments → rebuild */
     for (int lsm_idx = 0; lsm_idx < INDEX_BUF_SIZE; lsm_idx++)
     {
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid))
+        if (!slot_is_queryable(lsm_idx))
             continue;
         FlushedSegmentPool *pool = get_flushed_segment_pool(lsm_idx);
         if (pg_atomic_read_u32(&pool->flat_count) > 0)
@@ -778,7 +1019,7 @@ scan_and_claim_merge_task_pool(MergeTaskLocal *task)
     /* Priority 2: small segments (≤ memtable capacity) → merge */
     for (int lsm_idx = 0; lsm_idx < INDEX_BUF_SIZE; lsm_idx++)
     {
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid))
+        if (!slot_is_queryable(lsm_idx))
             continue;
         FlushedSegmentPool *pool = get_flushed_segment_pool(lsm_idx);
         if (pg_atomic_read_u32(&pool->memtable_capacity_le_count) > 0)
@@ -787,14 +1028,14 @@ scan_and_claim_merge_task_pool(MergeTaskLocal *task)
     /* Priority 3: high deletion ratio → rebuild */
     for (int lsm_idx = 0; lsm_idx < INDEX_BUF_SIZE; lsm_idx++)
     {
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid))
+        if (!slot_is_queryable(lsm_idx))
             continue;
         if (traverse_and_check_priority_pool(lsm_idx, 3, task)) return true;
     }
     /* Priority 4: small segments (≤ threshold) → merge */
     for (int lsm_idx = 0; lsm_idx < INDEX_BUF_SIZE; lsm_idx++)
     {
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid))
+        if (!slot_is_queryable(lsm_idx))
             continue;
         FlushedSegmentPool *pool = get_flushed_segment_pool(lsm_idx);
         if (pg_atomic_read_u32(&pool->small_segment_le_count) > 0)
@@ -803,7 +1044,7 @@ scan_and_claim_merge_task_pool(MergeTaskLocal *task)
     /* Priority 5: any segment pair → merge */
     for (int lsm_idx = 0; lsm_idx < INDEX_BUF_SIZE; lsm_idx++)
     {
-        if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[lsm_idx].valid))
+        if (!slot_is_queryable(lsm_idx))
             continue;
         if (traverse_and_check_priority_pool(lsm_idx, 5, task)) return true;
     }
@@ -1006,10 +1247,13 @@ rebuild_index_pool(MergeTaskLocal *task)
     flush_segment_to_disk(index_relid, &prep);
     /* flush_segment_to_disk takes ownership of index_bin; do not free separately */
 
+    /* Safe: caller holds is_compacting (rebuild/merge) or single-threaded flush
+     * worker — no concurrent writer can advance the version between
+     * flush_segment_to_disk and this lookup. */
     new_version = find_latest_segment_version(index_relid, start_sid, end_sid);
 
     /* --- Phase 4: reserve new slot, populate, replace old slot.
-     * replace_flushed_segment decrements old slot's ref_count; its index/bitmap/map
+     * replace_flushed_segments_n decrements old slot's ref_count; its index/bitmap/map
      * are freed by cleanup_flushed_segment when the last in-flight search finishes. */
 
     pthread_rwlock_wrlock(&pool->seg_lock);
@@ -1051,7 +1295,7 @@ rebuild_index_pool(MergeTaskLocal *task)
     }
 
     pthread_rwlock_wrlock(&pool->seg_lock);
-    replace_flushed_segment(pool, task->segment_idx0, (uint32_t)-1, new_slot_idx);
+    replace_flushed_segments_n(pool, &task->segment_idx0, 1, new_slot_idx);
     if (target_type == FLAT)
         pg_atomic_fetch_add_u32(&pool->flat_count, 1);
     if ((uint32_t)new_index_count <= MEMTABLE_MAX_CAPACITY)
@@ -1059,6 +1303,23 @@ rebuild_index_pool(MergeTaskLocal *task)
     if ((uint32_t)new_index_count <= THRESHOLD_SMALL_SEGMENT_SIZE)
         pg_atomic_fetch_add_u32(&pool->small_segment_le_count, 1);
     pthread_rwlock_unlock(&pool->seg_lock);
+
+    if (dpv_replication_role == DPV_ROLE_PRIMARY)
+    {
+        xl_dpv_seg_range old = {
+            .start_sid = start_sid,
+            .end_sid   = end_sid,
+            .version   = version,
+        };
+
+        /* See dpv_wal_emit_mutex declaration for the pthread+WAL fragility note. */
+        pthread_mutex_lock(&dpv_wal_emit_mutex);
+        dpv_emit_segment_replaced(index_relid,
+                                   &old, 1,
+                                   start_sid, end_sid, new_version,
+                                   NULL, 0);
+        pthread_mutex_unlock(&dpv_wal_emit_mutex);
+    }
 
     pthread_mutex_unlock(&seg->per_seg_mutex);
 
@@ -1282,11 +1543,14 @@ merge_adjacent_segments_pool(MergeTaskLocal *task)
     prep.offsets      = merged_offsets;
     flush_segment_to_disk(index_relid, &prep);
 
+    /* Safe: caller holds is_compacting (rebuild/merge) or single-threaded flush
+     * worker — no concurrent writer can advance the version between
+     * flush_segment_to_disk and this lookup. */
     new_version = find_latest_segment_version(index_relid,
                       task->merged_start_sid, task->merged_end_sid);
 
     /* --- Phase 4: reserve new slot, populate, replace both old slots.
-     * replace_flushed_segment decrements both old slots' ref_counts; their
+     * replace_flushed_segments_n decrements both old slots' ref_counts; their
      * index/bitmap/map are freed by cleanup_flushed_segment when the last
      * in-flight search on each slot drops its reference. */
 
@@ -1333,7 +1597,13 @@ merge_adjacent_segments_pool(MergeTaskLocal *task)
     }
 
     pthread_rwlock_wrlock(&pool->seg_lock);
-    replace_flushed_segment(pool, task->segment_idx0, task->segment_idx1, new_slot_idx);
+    {
+        /* segment_idx0 / segment_idx1 are already ordered by segment_id_start
+         * (see the comment around scan_and_claim_merge_task_pool's claim path),
+         * which is what replace_flushed_segments_n requires. */
+        uint32_t merge_olds[2] = { task->segment_idx0, task->segment_idx1 };
+        replace_flushed_segments_n(pool, merge_olds, 2, new_slot_idx);
+    }
     if (larger_type == FLAT)
         pg_atomic_fetch_add_u32(&pool->flat_count, 1);
     {
@@ -1344,6 +1614,42 @@ merge_adjacent_segments_pool(MergeTaskLocal *task)
             pg_atomic_fetch_add_u32(&pool->small_segment_le_count, 1);
     }
     pthread_rwlock_unlock(&pool->seg_lock);
+
+    if (dpv_replication_role == DPV_ROLE_PRIMARY)
+    {
+        xl_dpv_seg_range  old_ranges[2];
+        xl_dpv_seg_offset offsets[2];
+        bool seg0_larger = (seg0->vec_count >= seg1->vec_count);
+
+        /* Order old_ranges by source_sid (ascending) for clarity — order
+         * doesn't affect correctness, but stable order helps debugging. */
+        old_ranges[0] = (xl_dpv_seg_range){ .start_sid = s0_start, .end_sid = s0_end, .version = version0 };
+        old_ranges[1] = (xl_dpv_seg_range){ .start_sid = s1_start, .end_sid = s1_end, .version = version1 };
+
+        Assert(larger_count >= 0);  /* always true from vec_count, but be explicit */
+
+        /* offsets[i].source_sid identifies the source segment by its start_sid;
+         * offsets[i].start_offset is where its first entry lives in the merged file.
+         * Larger segment got placed at offset 0; smaller at offset larger_count. */
+        if (seg0_larger)
+        {
+            offsets[0] = (xl_dpv_seg_offset){ .source_sid = s0_start, .start_offset = 0 };
+            offsets[1] = (xl_dpv_seg_offset){ .source_sid = s1_start, .start_offset = (uint32) larger_count };
+        }
+        else
+        {
+            offsets[0] = (xl_dpv_seg_offset){ .source_sid = s0_start, .start_offset = (uint32) larger_count };
+            offsets[1] = (xl_dpv_seg_offset){ .source_sid = s1_start, .start_offset = 0 };
+        }
+
+        /* See dpv_wal_emit_mutex declaration for the pthread+WAL fragility note. */
+        pthread_mutex_lock(&dpv_wal_emit_mutex);
+        dpv_emit_segment_replaced(index_relid,
+                                   old_ranges, 2,
+                                   task->merged_start_sid, task->merged_end_sid, new_version,
+                                   offsets, 2);
+        pthread_mutex_unlock(&dpv_wal_emit_mutex);
+    }
 
     pthread_mutex_unlock(&second_lock->per_seg_mutex);
     pthread_mutex_unlock(&first_lock->per_seg_mutex);
@@ -1393,6 +1699,22 @@ merge_worker_thread(void *arg)
         fprintf(stderr, "[merge_worker_thread] claimed task op=%d lsm=%d seg0=%u seg1=%u\n",
                 task.operation_type, task.lsm_idx, task.segment_idx0, task.segment_idx1);
 
+        /*
+         * Belt-and-suspenders: scan_and_claim_merge_task_pool (after Task 10)
+         * filters out non-queryable slots, and QUERYABLE never regresses,
+         * so this gate should be unreachable in practice. Use the
+         * non-blocking check (not wait_for_slot_queryable) — merge tasks
+         * are claimed from a pool scan; if the slot isn't queryable yet,
+         * just skip and let the next signal retry.
+         */
+        if (!slot_is_queryable(task.lsm_idx))
+        {
+            elog(DEBUG1, "[merge_worker_thread] skip op=%d — slot %d not queryable",
+                 task.operation_type, task.lsm_idx);
+            signal_merge_pool();
+            continue;
+        }
+
         switch (task.operation_type)
         {
             case SEGMENT_UPDATE_REBUILD_FLAT:
@@ -1440,6 +1762,9 @@ submit_internal_task(VectorTaskType task_type, void *data, size_t data_size)
     task->task_slot = NULL;
     task->task_type = task_type;
     memcpy(&task->task_data, data, data_size);
+    task->groups            = NULL;
+    task->n_groups          = 0;
+    task->groups_tids_buf   = NULL;
     task->next = NULL;
 
     pthread_mutex_lock(&maintenance_pool->queue_mutex);
@@ -1489,7 +1814,10 @@ submit_maintenance_task(TaskSlot *task_slot)
     
     task->task_slot = task_slot;
     task->task_type = task_slot->type;
-    
+    task->groups            = NULL;
+    task->n_groups          = 0;
+    task->groups_tids_buf   = NULL;
+
     // Copy task data from DSM segment based on task type
     switch (task_slot->type) {
         case IndexBuildTaskType:
@@ -1502,6 +1830,78 @@ submit_maintenance_task(TaskSlot *task_slot)
         {
             SegmentUpdateTask src_task = (SegmentUpdateTask) dsm_segment_address(task_seg);
             task->task_data.update_task = *src_task;  // Copy the structure
+
+            /*
+             * Plan 3 refactor: for ADOPT tasks with a non-empty group payload,
+             * parse the DSM trailer (one (sid, n_tids, tids[n_tids]) record per
+             * cover memtable) into task->groups + task->groups_tids_buf. The
+             * pthread reads from task->groups and free()s both buffers when
+             * done — it never touches the DSM segment.
+             *
+             * deletion_tids_count is repurposed as the trailer byte length.
+             */
+            if (src_task->operation_type == SEGMENT_UPDATE_ADOPT &&
+                src_task->deletion_tids_count > 0)
+            {
+                Size  payload_bytes = (Size) src_task->deletion_tids_count;
+                char *src = (char *) src_task + sizeof(SegmentUpdateTaskData);
+                char *src_end = src + payload_bytes;
+
+                uint32 ng;
+                if (payload_bytes < sizeof(uint32))
+                    elog(ERROR, "[submit_maintenance_task] ADOPT trailer too short");
+                memcpy(&ng, src, sizeof(uint32));
+                src += sizeof(uint32);
+
+                if (ng > 0)
+                {
+                    /* Allocate the groups[] array and a single flat tids buffer
+                     * to back all groups' tids[] pointers. */
+                    task->groups = (DpvVacuumGroup *) malloc(ng * sizeof(DpvVacuumGroup));
+                    if (task->groups == NULL)
+                        elog(ERROR, "[submit_maintenance_task] malloc(groups) failed");
+
+                    /* Two-pass: pass 1 counts total tids; pass 2 fills. */
+                    char *scan = src;
+                    Size total_tids = 0;
+                    for (uint32 g = 0; g < ng; g++)
+                    {
+                        if (scan + 2 * sizeof(uint32) > src_end)
+                            elog(ERROR, "[submit_maintenance_task] truncated group header");
+                        uint32 sid_u32, n;
+                        memcpy(&sid_u32, scan, sizeof(uint32)); scan += sizeof(uint32);
+                        memcpy(&n,       scan, sizeof(uint32)); scan += sizeof(uint32);
+                        total_tids += n;
+                        if (scan + (Size) n * sizeof(int64_t) > src_end)
+                            elog(ERROR, "[submit_maintenance_task] truncated group tids");
+                        scan += (Size) n * sizeof(int64_t);
+                    }
+
+                    task->groups_tids_buf = (int64_t *) malloc(
+                        total_tids ? total_tids * sizeof(int64_t) : 1);
+                    if (task->groups_tids_buf == NULL)
+                        elog(ERROR, "[submit_maintenance_task] malloc(tids_buf) failed");
+
+                    scan = src;
+                    int64_t *next_tid = task->groups_tids_buf;
+                    for (uint32 g = 0; g < ng; g++)
+                    {
+                        uint32 sid_u32, n;
+                        memcpy(&sid_u32, scan, sizeof(uint32)); scan += sizeof(uint32);
+                        memcpy(&n,       scan, sizeof(uint32)); scan += sizeof(uint32);
+                        task->groups[g].sid    = (SegmentId) sid_u32;
+                        task->groups[g].n_tids = n;
+                        task->groups[g].tids   = (n > 0) ? next_tid : NULL;
+                        if (n > 0)
+                        {
+                            memcpy(next_tid, scan, (Size) n * sizeof(int64_t));
+                            next_tid += n;
+                            scan     += (Size) n * sizeof(int64_t);
+                        }
+                    }
+                    task->n_groups = (int) ng;
+                }
+            }
             break;
         }
         case IndexLoadTaskType:
@@ -1516,10 +1916,10 @@ submit_maintenance_task(TaskSlot *task_slot)
             dsm_detach(task_seg);
             return;
     }
-    
+
     // Detach DSM segment now that we've copied the data
     dsm_detach(task_seg);
-    
+
     task->next = NULL;
     
     // Enqueue the task
@@ -1567,9 +1967,12 @@ vector_index_worker_main(Datum main_arg)
 {
     elog(DEBUG1, "enter vector_index_worker_main");
 
-    // Initialize the maintenance thread pool in the background worker process
+
     init_maintenance_thread_pool();
-    init_merge_thread_pool();
+    if (!RecoveryInProgress())
+        init_merge_thread_pool();
+    else
+        elog(LOG, "vector_index_worker: standby/recovery — skipping merge thread pool");
     
     // FIXME: check this block
     pqsignal(SIGHUP, vq_sighup);
@@ -1585,10 +1988,18 @@ vector_index_worker_main(Datum main_arg)
     ResetLatch(MyLatch);
     for (;;)
     {
+        /*
+         * Timeout is required for liveness: backends/bgworkers SetLatch on
+         * the procno cached in ring_buffer_shmem->worker_pgprocno, which
+         * starts as 0 after a postmaster restart and is only updated by
+         * this worker above. A submitter racing this worker's startup
+         * latches the wrong proc; without a periodic re-scan we'd sleep
+         * forever on a non-empty ring buffer. See test 112.
+         */
         int rc = WaitLatch(MyLatch,
-                           WL_LATCH_SET | WL_POSTMASTER_DEATH,
-                           0, /* no timeout */
-                           0  /* no wait-event reporting */);
+                           WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                           1000, /* 1s safety timeout */
+                           PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
         
         if (rc & WL_POSTMASTER_DEATH)
@@ -1705,7 +2116,7 @@ static void
 vector_search(VectorSearchTask task, VectorSearchResult result)
 {
     // traverse all flushed segments
-    int lsm_idx = get_lsm_index_idx_no_loading(task->index_relid);
+    int lsm_idx = lookup_lsm_index_idx(task->index_relid);
     FlushedSegmentPool *pool = get_flushed_segment_pool(lsm_idx);
 
     // Acquire segment lock to prevent concurrent segment updates during search

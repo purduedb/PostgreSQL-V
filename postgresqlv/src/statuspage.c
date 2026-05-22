@@ -7,7 +7,9 @@
 #include "storage/bufpage.h"
 #include "storage/lmgr.h"
 #include "access/itup.h"
+#include "miscadmin.h"
 #include <stdbool.h>
+#include "replication_rmgr.h"
 
 
 static Buffer
@@ -176,6 +178,8 @@ ReleaseStatusMemtable(Relation index, SegmentId sid)
                 }
                 found = true;
                 elog(DEBUG1, "[ReleaseStatusMemtable] deleted memtable %d", sid);
+                /* Emit semantic WAL record after all GenericXLog work is done. */
+                dpv_emit_release_memtable(RelationGetRelid(index), sid);
                 break;
             }
         }
@@ -265,11 +269,14 @@ UpdateMaxMemtableSid(Relation index, SegmentId sid)
 
     statuspagemeta = StatusPageGetMeta(page);
     statuspagemeta->max_memtable_sid = sid;
-    
+
     StatusCommitBuffer(buf, state);
+
+    /* Emit semantic WAL record after all GenericXLog work is done. */
+    dpv_emit_update_max_sid(RelationGetRelid(index), sid);
 }
 
-void 
+void
 RegisterStatusMemtable(Relation index, SegmentId sid)
 {
     elog(DEBUG1, "[RegisterStatusMemtable] Registering status memtable, sid: %d", sid);
@@ -385,6 +392,9 @@ RegisterStatusMemtable(Relation index, SegmentId sid)
         UnlockReleaseBuffer(newbuf);
         // elog(DEBUG1, "[RegisterStatusMemtable] added new page %d", BufferGetBlockNumber(newbuf));
     }
+
+    /* Emit semantic WAL record after all GenericXLog work is done. */
+    dpv_emit_register_memtable(RelationGetRelid(index), sid);
 }
 
 static bool
@@ -461,8 +471,9 @@ StatusUpdateInsertPage(Relation index, MemtableInfo info, BlockNumber insertPage
     }
 }
 
-void 
-AddToStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid, ItemPointerData tid)
+void
+AddToStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid,
+                    uint32 slot_index, ItemPointerData tid)
 {
     // elog(DEBUG1, "[AddToStatusMemtable] Adding to status memtable");
 
@@ -562,10 +573,11 @@ AddToStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid, ItemPoint
     
     StatusCommitBuffer(buf, state);
     
-    /* Update the insert page */    
+    /* Update the insert page */
     if (insertPage != originalInsertPage) {
         StatusUpdateInsertPage(index, info, insertPage, originalInsertPage, forkNum);
     }
+
     // elog(DEBUG1, "[AddToStatusMemtable] finished");
 }
 
@@ -748,7 +760,8 @@ GetStatusMemtableTids(Relation index, ForkNumber forkNum, SegmentId sid, int *nu
 
 // TODO: improvement: handle in batch
 bool
-RemoveFromStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid, ItemPointerData tid)
+RemoveFromStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid,
+                         uint32 slot_index, ItemPointerData tid)
 {
     BlockNumber nextblkno = STATUS_MEMTABLE_ARRAY_BLKNO;
     BlockNumber memtablePageHead = InvalidBlockNumber;
@@ -825,6 +838,10 @@ RemoveFromStatusMemtable(Relation index, ForkNumber forkNum, SegmentId sid, Item
                 GenericXLogFinish(state);
                 UnlockReleaseBuffer(buf);
                 UnlockReleaseBuffer(memtableArrayBuf);
+                /* No semantic WAL emission here: the unified xl_dpv_vacuum_tombstones
+                 * record emitted by bulk_delete_lsm_index carries the per-tid
+                 * deletion info. GenericXLog above handles the heap status-page
+                 * page-level WAL. */
                 return true;
             }
         }

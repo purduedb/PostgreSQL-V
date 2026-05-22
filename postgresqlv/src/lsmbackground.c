@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "access/xlog.h"      /* RecoveryInProgress */
 #include "postmaster/postmaster.h"
 #include "postmaster/bgworker.h"
 #include "tcop/tcopprot.h"
@@ -11,6 +12,8 @@
 #include "lsmbackground.h"
 #include "vectorindeximpl.hpp"
 #include "tasksend.h"
+#include "replication_gucs.h"
+#include "replication_rmgr.h"
 // FIXME: the order to flush? check all lsm index? Or scan buffer? Or use message to wake?
 
 // claim the head sealed memtable for flushing(guarantee concurrency between background workers), but do not remove it yet
@@ -206,9 +209,20 @@ lsm_flush_one_pending(LSMIndex lsm, int slot_idx, bool wait)
     // step 3. flush the segment to disk
     flush_segment_to_disk(lsm->indexRelId, &prep);
 
+    if (dpv_replication_role == DPV_ROLE_PRIMARY)
+    {
+        /* Safe: caller holds is_compacting (rebuild/merge) or single-threaded flush
+         * worker — no concurrent writer can advance the version between
+         * flush_segment_to_disk and this lookup. */
+        uint32_t new_version =
+            find_latest_segment_version(lsm->indexRelId, prep.start_sid, prep.end_sid);
+        dpv_emit_segment_created(lsm->indexRelId, prep.start_sid, prep.end_sid, new_version);
+    }
+
     // step 4. notify the vector index worker to load the segment from disk
     (void) segment_update_blocking(slot_idx, lsm->indexRelId, SEGMENT_UPDATE_REGULAR,
-                                   prep.start_sid, prep.end_sid, 0);
+                                   prep.start_sid, prep.end_sid, 0,
+                                   NULL, 0, NULL, 0);
 
     // step 4.5. track flushed but not released memtable
     // Use lock in flush path (less frequent), but write count atomically for lock-free reads
@@ -256,6 +270,18 @@ void lsm_index_bgworker_main(Datum main_arg)
     // enable signals
     BackgroundWorkerUnblockSignals();
 
+    /*
+     * Replication (spec §12): this worker flushes memtables to disk, which
+     * is a primary-only WAL-emitting write operation. On a standby it has
+     * no work; exit. PG will restart the worker on promotion via
+     * bgw_restart_time.
+     */
+    if (RecoveryInProgress())
+    {
+        elog(LOG, "[lsm_index_bgworker_main] standby/recovery — exiting");
+        proc_exit(0);
+    }
+
     // Connect to a database if needed
     // BackgroundWorkerInitializeConnection("your_db", NULL, 0);
 
@@ -271,7 +297,7 @@ void lsm_index_bgworker_main(Datum main_arg)
 
         for (int slot = 0; slot < INDEX_BUF_SIZE; slot++)
         {
-            if (!pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[slot].valid))
+            if (!is_writable(pg_atomic_read_u32(&SharedLSMIndexBuffer->slots[slot].valid)))
             {
                 continue;
             }

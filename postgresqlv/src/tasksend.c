@@ -31,8 +31,9 @@ vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int top
     }
 
     slot = get_ring_buffer_slot();
-    // elog(DEBUG1, "[vector_search_send] enqueued search: index=%u dim=%d topk=%d slot=%d",
-    //      index_oid, dim, topk, slot);
+    // TODO: for debugging
+    elog(DEBUG1, "[vector_search_send] enqueued search: index=%u dim=%d topk=%d slot=%d",
+         index_oid, dim, topk, slot);
     task_slot = vs_task_at(slot);
     task_slot->type = VectorSearchTaskType;
     task_slot->dsm_size = 0;
@@ -72,7 +73,8 @@ vector_search_get_result(void)
 
         if (rc & WL_LATCH_SET)
         {
-            // elog(DEBUG1, "[vector_search_get_result] result received");
+            // TODO: for debugging
+            elog(DEBUG1, "[vector_search_get_result] result received");
             break;
         }
         /* WL_TIMEOUT: keep waiting. */
@@ -169,15 +171,50 @@ index_build_blocking(Oid indexRelId, int lsm_index_idx)
 int
 segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type,
                          SegmentId start_sid, SegmentId end_sid,
-                         uint32_t expected_version)
+                         uint32_t expected_version,
+                         const SegmentId *memtable_cover,
+                         int memtable_cover_count,
+                         const DpvVacuumGroup *groups,
+                         int n_groups)
 {
-    Size task_seg_size = sizeof(SegmentUpdateTaskData);
+    Size task_struct_size = sizeof(SegmentUpdateTaskData);
+    Size task_seg_size;
     dsm_segment *task_seg;
     SegmentUpdateTask task;
     int result;
+    int cover_count;
 
     if (ring_buffer_shmem == NULL)
         ereport(ERROR, (errmsg("[segment_update_blocking] vector search shmem not initialized")));
+
+    /*
+     * Plan 3 refactor: the DSM trailer carries per-sid groups instead of a
+     * flat tid array. Layout (starting at byte offset
+     * sizeof(SegmentUpdateTaskData)):
+     *
+     *   uint32 n_groups
+     *   For each group:
+     *     uint32     sid
+     *     uint32     n_tids
+     *     int64_t    tids[n_tids]
+     *
+     * Sizes use natural alignment; the int64_t arrays land on 8-aligned
+     * offsets because the SegmentUpdateTaskData header is 8-aligned and
+     * we keep (sid, n_tids) as two uint32 (8 bytes) before each tids[].
+     */
+    Size payload_size = sizeof(uint32);     /* n_groups field */
+    if (groups == NULL || n_groups <= 0)
+    {
+        n_groups = 0;
+    }
+    else
+    {
+        for (int g = 0; g < n_groups; g++)
+            payload_size += sizeof(uint32) * 2 +
+                            (Size) groups[g].n_tids * sizeof(int64_t);
+    }
+
+    task_seg_size = task_struct_size + payload_size;
 
     task_seg = dsm_create(task_seg_size, 0);
     if (task_seg == NULL)
@@ -192,6 +229,44 @@ segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type,
     task->end_sid = end_sid;
     task->expected_version = expected_version;
 
+    /* Copy memtable cover for ADOPT tasks; zero it out for all other ops. */
+    if (memtable_cover != NULL && memtable_cover_count > 0)
+    {
+        cover_count = memtable_cover_count;
+        if (cover_count > MEMTABLE_NUM + 1)
+            cover_count = MEMTABLE_NUM + 1;
+        task->memtable_cover_count = (uint8) cover_count;
+        for (int i = 0; i < cover_count; i++)
+            task->memtable_cover[i] = memtable_cover[i];
+    }
+    else
+    {
+        task->memtable_cover_count = 0;
+    }
+
+    /* Pack the per-sid group payload. */
+    {
+        char *p = (char *) dsm_segment_address(task_seg) + task_struct_size;
+        uint32 hdr_ngroups = (uint32) n_groups;
+        memcpy(p, &hdr_ngroups, sizeof(uint32));
+        p += sizeof(uint32);
+        for (int g = 0; g < n_groups; g++)
+        {
+            uint32 sid_u32 = (uint32) groups[g].sid;
+            uint32 n       = groups[g].n_tids;
+            memcpy(p, &sid_u32, sizeof(uint32));  p += sizeof(uint32);
+            memcpy(p, &n,       sizeof(uint32));  p += sizeof(uint32);
+            if (n > 0)
+                memcpy(p, groups[g].tids, (Size) n * sizeof(int64_t));
+            p += (Size) n * sizeof(int64_t);
+        }
+    }
+
+    /* Carry the *byte length* of the group payload so the consumer doesn't
+     * recompute it. Repurpose the existing deletion_tids_count field by
+     * reading it as a byte count (consumer is updated to match). */
+    task->deletion_tids_count = (uint32) payload_size;
+
     /* Clear maint_status before submitting so a stale value cannot be misread */
     vs_search_result_at(MyProcNumber)->maint_status = 0;
 
@@ -203,6 +278,21 @@ segment_update_blocking(int lsm_index_idx, Oid index_relid, int operation_type,
     dsm_detach(task_seg);
     elog(DEBUG1, "[segment_update_blocking] completed, result=%d", result);
     return result;
+}
+
+int
+dpv_send_adopt_task(int lsm_idx, Oid index_relid,
+                    SegmentId start_sid, SegmentId end_sid,
+                    uint32_t version,
+                    const SegmentId *memtable_cover,
+                    int memtable_cover_count,
+                    const DpvVacuumGroup *groups,
+                    int n_groups)
+{
+    return segment_update_blocking(lsm_idx, index_relid, SEGMENT_UPDATE_ADOPT,
+                                    start_sid, end_sid, version,
+                                    memtable_cover, memtable_cover_count,
+                                    groups, n_groups);
 }
 
 void

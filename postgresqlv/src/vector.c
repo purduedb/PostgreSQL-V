@@ -13,19 +13,26 @@
 #include "ivfflat.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "port.h"				/* for strtof() */
 #include "sparsevec.h"
+#include "storage/fd.h"
+#include "storage/ipc.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "vector.h"
-#include "storage/ipc.h"
 
 #include "vector_index_worker.h"
 #include "lsmindex.h"
-#include "index_load_worker.h"
+#include "index_recovery_worker.h"
+#include "replication_server.h"
+#include "replication_rmgr.h"
+#include "replication_gucs.h"
+#include "segment_fetcher.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -84,7 +91,7 @@ vector_shmem_request(void)
 
 	RequestAddinShmemSpace(calculate_ring_buffer_shmem_size());
 	RequestAddinShmemSpace(4000000000L); // 2GB
-	RequestAddinShmemSpace(MAXALIGN(sizeof(IndexLoadCoordinator)));
+	RequestAddinShmemSpace(MAXALIGN(sizeof(IndexRecoveryCoordinator)));
 }
 
 /*
@@ -107,6 +114,37 @@ _PG_init(void)
 	LWLockRegisterTranche(LSM_FLUSHED_RELEASE_LWTRANCHE_ID, LSM_FLUSHED_RELEASE_LWTRANCHE);
 	LWLockRegisterTranche(LSM_INDEX_BUFFER_LWTRANCHE_ID, LSM_INDEX_BUFFER_LWTRANCHE);
 
+    /* Custom rmgr for physical replication of LSM state (spec §7). */
+    vector_replication_rmgr_register();
+
+    /* GUCs for the pgvector replication side channel (Plan 2 §1). */
+    dpv_replication_gucs_register();
+
+    /* GUC for overriding the LSM segment storage directory. */
+    DefineCustomStringVariable("pgvector.storage_base_dir",
+        "Directory for pgvector LSM segment storage (empty = <data_dir>/pgvector_storage).",
+        "If set to a non-empty path, that path is used (with a trailing slash). "
+        "If empty, defaults to a 'pgvector_storage' subdirectory under the PG data directory.",
+        &vector_storage_base_dir,
+        "",
+        PGC_POSTMASTER,
+        0, NULL, NULL, NULL);
+
+    /* Ensure the storage base directory exists. Idempotent. */
+    {
+        const char *base = get_vector_storage_dir();
+        char base_no_slash[MAXPGPATH];
+        size_t base_len;
+        snprintf(base_no_slash, sizeof(base_no_slash), "%s", base);
+        base_len = strlen(base_no_slash);
+        if (base_len > 0 && base_no_slash[base_len - 1] == '/')
+            base_no_slash[base_len - 1] = '\0';
+        if (MakePGDirectory(base_no_slash) != 0 && errno != EEXIST)
+            ereport(WARNING,
+                    (errmsg("could not create pgvector storage directory \"%s\": %m",
+                            base_no_slash)));
+    }
+
 #if PG_VERSION_NUM >= 150000
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = vector_shmem_request;
@@ -122,7 +160,7 @@ _PG_init(void)
 	BackgroundWorker vector_index_worker;
 	memset(&vector_index_worker, 0, sizeof(BackgroundWorker));
 	vector_index_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
-	vector_index_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	vector_index_worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	vector_index_worker.bgw_restart_time = 1;
 	snprintf(vector_index_worker.bgw_name, BGW_MAXLEN, "VectorIndexWorker"); // name
 	snprintf(vector_index_worker.bgw_library_name, BGW_MAXLEN, "vector.so"); // no .so
@@ -147,21 +185,80 @@ _PG_init(void)
 	RegisterBackgroundWorker(&lsm_index_worker);
 	elog(DEBUG1, "[_PG_init]register lsm index worker finished");
 
-	elog(DEBUG1, "[_PG_init] register index load worker");
-	BackgroundWorker index_load_worker;
-	memset(&index_load_worker, 0, sizeof(BackgroundWorker));
-	index_load_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
-	                              BGWORKER_BACKEND_DATABASE_CONNECTION;
-	index_load_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	index_load_worker.bgw_restart_time = 1;
-	snprintf(index_load_worker.bgw_name, BGW_MAXLEN, "IndexLoadWorker");
-	snprintf(index_load_worker.bgw_library_name, BGW_MAXLEN, "vector.so");
-	snprintf(index_load_worker.bgw_function_name, BGW_MAXLEN, "index_load_worker_main");
-	index_load_worker.bgw_main_arg = (Datum) 0;
-	index_load_worker.bgw_notify_pid = 0;
-	RegisterBackgroundWorker(&index_load_worker);
-	elog(DEBUG1, "[_PG_init] register index load worker finished");
+	elog(DEBUG1, "[_PG_init] register index recovery worker");
+	BackgroundWorker index_recovery_worker;
+	memset(&index_recovery_worker, 0, sizeof(BackgroundWorker));
+	index_recovery_worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+	                                  BGWORKER_BACKEND_DATABASE_CONNECTION;
+	index_recovery_worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	index_recovery_worker.bgw_restart_time = 1;
+	snprintf(index_recovery_worker.bgw_name, BGW_MAXLEN, "IndexRecoveryWorker");
+	snprintf(index_recovery_worker.bgw_library_name, BGW_MAXLEN, "vector.so");
+	snprintf(index_recovery_worker.bgw_function_name, BGW_MAXLEN, "index_recovery_worker_main");
+	index_recovery_worker.bgw_main_arg = (Datum) 0;
+	index_recovery_worker.bgw_notify_pid = 0;
+	RegisterBackgroundWorker(&index_recovery_worker);
+	elog(DEBUG1, "[_PG_init] register index recovery worker finished");
 
+	/*
+	 * Register the physical-replication file server bgworker (Plan 2 §5).
+	 * Always registered; self-terminates on standby/disabled roles. Starts
+	 * only after recovery is finished, since by design only the primary
+	 * serves segment files.
+	 */
+	{
+		BackgroundWorker server_worker;
+
+		memset(&server_worker, 0, sizeof(server_worker));
+		server_worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		server_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		server_worker.bgw_restart_time = 5;
+		snprintf(server_worker.bgw_name, BGW_MAXLEN, "DpvReplicationServer");
+		snprintf(server_worker.bgw_type, BGW_MAXLEN, "DpvReplicationServer");
+		snprintf(server_worker.bgw_library_name, BGW_MAXLEN, "vector.so");
+		snprintf(server_worker.bgw_function_name, BGW_MAXLEN, "replication_server_main");
+		server_worker.bgw_main_arg = (Datum) 0;
+		server_worker.bgw_notify_pid = 0;
+		RegisterBackgroundWorker(&server_worker);
+		elog(DEBUG1, "[_PG_init] register dpv replication server worker finished");
+	}
+
+	/*
+	 * Register N standby-side segment fetcher bgworkers (Plan 2 §6b).
+	 * N = pgvector.replication_fetch_parallelism (default 2). Each worker
+	 * self-terminates on startup if the role is not STANDBY. The flag set
+	 * mirrors index_recovery_worker because the fetcher likewise calls a
+	 * *_blocking task helper (dpv_send_adopt_task -> segment_update_blocking)
+	 * that uses MyProcNumber + dsm_create.
+	 */
+	{
+		int i;
+
+		for (i = 0; i < dpv_replication_fetch_parallelism; i++)
+		{
+			BackgroundWorker fetcher;
+
+			memset(&fetcher, 0, sizeof(fetcher));
+			fetcher.bgw_flags = BGWORKER_SHMEM_ACCESS |
+			                    BGWORKER_BACKEND_DATABASE_CONNECTION;
+			/*
+		 * BgWorkerStart_ConsistentState (not _RecoveryFinished): on a hot
+		 * standby recovery never finishes — it stays in continuous-recovery
+		 * mode for the lifetime of the standby — so _RecoveryFinished would
+		 * mean the fetcher is never spawned. Matches IndexRecoveryWorker.
+		 */
+		fetcher.bgw_start_time = BgWorkerStart_ConsistentState;
+			fetcher.bgw_restart_time = 5;
+			snprintf(fetcher.bgw_name, BGW_MAXLEN, "DpvSegmentFetcher%d", i);
+			snprintf(fetcher.bgw_type, BGW_MAXLEN, "DpvSegmentFetcher");
+			snprintf(fetcher.bgw_library_name, BGW_MAXLEN, "vector.so");
+			snprintf(fetcher.bgw_function_name, BGW_MAXLEN, "segment_fetcher_main");
+			fetcher.bgw_main_arg = Int32GetDatum(i);
+			fetcher.bgw_notify_pid = 0;
+			RegisterBackgroundWorker(&fetcher);
+		}
+		elog(DEBUG1, "[_PG_init] register dpv segment fetcher worker(s) finished");
+	}
 }
 
 /*

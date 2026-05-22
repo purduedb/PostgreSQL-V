@@ -372,7 +372,7 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 	char dir_path[MAXPGPATH];
 	
 	// Get directory path and ensure it exists
-	snprintf(dir_path, sizeof(dir_path), VECTOR_STORAGE_BASE_DIR "%u/", relId);
+	snprintf(dir_path, sizeof(dir_path), "%s%u/", get_vector_storage_dir(), relId);
 	struct stat st;
 	if (stat(dir_path, &st) != 0)
 	{
@@ -386,15 +386,15 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
 		elog(ERROR, "[BuildIndex] Path exists but is not a directory: %s", dir_path);
 	}
 
-	// Create data file path: VECTOR_STORAGE_BASE_DIR/indexRelId/diskann_data.bin
-	snprintf(data_path, sizeof(data_path), VECTOR_STORAGE_BASE_DIR "%u/diskann_data.bin", relId);
+	// Create data file path: <storage base>/<indexRelId>/diskann_data.bin
+	snprintf(data_path, sizeof(data_path), "%s%u/diskann_data.bin", get_vector_storage_dir(), relId);
 	// snprintf(data_path, sizeof(data_path), "/ssd_root/dataset/cohere/cohere_large_10m.fbin", relId);
 	
 	// Create index prefix using the same format as GetLSMIndexFilePathWithVersion
 	// index_<START_SEGMENT_ID>_<START_SEGMENT_ID>_v1
 	snprintf(index_prefix, sizeof(index_prefix),
-	         VECTOR_STORAGE_BASE_DIR "%u/index_%u_%u_v%u_diskann",
-	         relId, START_SEGMENT_ID, START_SEGMENT_ID, 1U);
+	         "%s%u/index_%u_%u_v%u_diskann",
+	         get_vector_storage_dir(), relId, START_SEGMENT_ID, START_SEGMENT_ID, 1U);
 
 	// Create disk file
 	buildstate->diskFileHandle = DiskANNCreateDataFile(data_path, dim);

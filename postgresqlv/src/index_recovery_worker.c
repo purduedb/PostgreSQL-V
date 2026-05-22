@@ -1,14 +1,15 @@
 /*
- * index_load_worker.c
+ * index_recovery_worker.c
  *
- * Background worker that processes LSM index load requests.
+ * Background worker that processes LSM index recovery requests.
  *
  * Backends that need to load an index into SharedLSMIndexBuffer claim a slot
- * (CAS 0→2), fill in request_db_oid / request_db_userid, signal this worker
- * via SharedIndexLoadCoordinator->worker_pgprocno, then sleep on the slot's
- * load_cv.  This worker scans for valid==2 slots, calls
- * load_lsm_index_internal(), sets valid=1 (or load_error=1 + valid=0 on
- * failure), then broadcasts the CV so waiting backends wake up.
+ * (CAS FREE→RECOVERING), fill in request_db_oid / request_db_userid, signal
+ * this worker via SharedIndexRecoveryCoordinator->worker_pgprocno, then sleep on
+ * the slot's state_cv.  This worker scans for LSM_SLOT_RECOVERING slots, calls
+ * recover_lsm_index_internal(), sets valid=LSM_SLOT_WRITABLE (or
+ * state_error=1 + valid=LSM_SLOT_FREE on failure), then broadcasts the CV so
+ * waiting backends wake up.
  */
 
 #include "postgres.h"
@@ -26,7 +27,7 @@
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
-#include "index_load_worker.h"
+#include "index_recovery_worker.h"
 #include "lsmindex.h"
 
 static volatile sig_atomic_t ilw_got_sigterm = false;
@@ -51,23 +52,23 @@ ilw_sighup(SIGNAL_ARGS)
 }
 
 /*
- * index_load_worker_init
+ * index_recovery_worker_init
  *
  * Called from shmem_startup() — nothing to do here; the coordinator struct
  * is already initialized in lsm_index_buffer_shmem_initialize().
  */
 void
-index_load_worker_init(void)
+index_recovery_worker_init(void)
 {
 }
 
 /*
- * index_load_worker_main
+ * index_recovery_worker_main
  *
- * Entry point for the IndexLoadWorker background worker.
+ * Entry point for the IndexRecoveryWorker background worker.
  */
 void
-index_load_worker_main(Datum main_arg)
+index_recovery_worker_main(Datum main_arg)
 {
     bool db_connected = false;
     Oid  connected_db_oid = InvalidOid;
@@ -77,14 +78,14 @@ index_load_worker_main(Datum main_arg)
     BackgroundWorkerUnblockSignals();
 
     /* Publish our pgprocno so backends can wake us */
-    SharedIndexLoadCoordinator->worker_pgprocno = MyProcNumber;
-    elog(LOG, "[IndexLoadWorker] started, pgprocno=%d", MyProcNumber);
+    SharedIndexRecoveryCoordinator->worker_pgprocno = MyProcNumber;
+    elog(LOG, "[IndexRecoveryWorker] started, pgprocno=%d", MyProcNumber);
 
     /*
      * Crash recovery: if the previous worker crashed while loading,
-     * some slots may still be in valid==2 state with no one to signal us.
-     * Set our own latch so the first iteration of the main loop will scan
-     * for any such stuck slots immediately.
+     * some slots may still be in LSM_SLOT_RECOVERING state with no one to
+     * signal us.  Set our own latch so the first iteration of the main loop
+     * will scan for any such stuck slots immediately.
      */
     SetLatch(MyLatch);
 
@@ -101,13 +102,13 @@ index_load_worker_main(Datum main_arg)
 
         if (rc & WL_POSTMASTER_DEATH)
         {
-            SharedIndexLoadCoordinator->worker_pgprocno = -1;
+            SharedIndexRecoveryCoordinator->worker_pgprocno = -1;
             proc_exit(0);
         }
 
         if (ilw_got_sigterm)
         {
-            SharedIndexLoadCoordinator->worker_pgprocno = -1;
+            SharedIndexRecoveryCoordinator->worker_pgprocno = -1;
             proc_exit(0);
         }
 
@@ -117,7 +118,7 @@ index_load_worker_main(Datum main_arg)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
-        /* Scan for slots that need loading (valid == 2) */
+        /* Scan for slots that need recovery (LSM_SLOT_RECOVERING) */
         do {
             found_work = false;
 
@@ -126,7 +127,7 @@ index_load_worker_main(Datum main_arg)
                 LSMIndexBufferSlot *slot = &SharedLSMIndexBuffer->slots[i];
                 uint32 v = pg_atomic_read_u32(&slot->valid);
 
-                if (v != 2)
+                if (v != (uint32) LSM_SLOT_RECOVERING)
                     continue;
 
                 found_work = true;
@@ -138,6 +139,17 @@ index_load_worker_main(Datum main_arg)
                  * connected to the first DB we serve.  If a different DB is
                  * requested we error the slot rather than crash.
                  */
+                /*
+                 * TODO(multi-DB): this worker is a single bgworker that
+                 * stickily binds to the first dbOid it serves. With one
+                 * DB on the cluster this is fine. For multi-DB standby
+                 * (or any deployment serving multiple DBs from one
+                 * cluster), this needs to become a per-DB pool — register
+                 * one bgworker per database at extension load time,
+                 * mirroring segment_fetcher_main's per-DB registration in
+                 * vector.c. Until then, requests for a non-matching dbOid
+                 * fail the slot below.
+                 */
                 if (!db_connected)
                 {
                     Oid db_oid   = slot->request_db_oid;
@@ -146,42 +158,42 @@ index_load_worker_main(Datum main_arg)
                     BackgroundWorkerInitializeConnectionByOid(db_oid, db_user, 0);
                     connected_db_oid = db_oid;
                     db_connected = true;
-                    elog(LOG, "[IndexLoadWorker] connected to database %u", db_oid);
+                    elog(LOG, "[IndexRecoveryWorker] connected to database %u", db_oid);
                 }
                 else if (slot->request_db_oid != connected_db_oid)
                 {
                     elog(WARNING,
-                         "[IndexLoadWorker] slot %d requests db %u but worker is connected to db %u — failing slot",
+                         "[IndexRecoveryWorker] slot %d requests db %u but worker is connected to db %u — failing slot",
                          i, slot->request_db_oid, connected_db_oid);
-                    pg_atomic_write_u32(&slot->load_error, 1);
-                    pg_atomic_write_u32(&slot->valid, 0);
-                    ConditionVariableBroadcast(&slot->load_cv);
+                    pg_atomic_write_u32(&slot->state_error, 1);
+                    pg_atomic_write_u32(&slot->valid, (uint32) LSM_SLOT_FREE);
+                    ConditionVariableBroadcast(&slot->state_cv);
                     continue;
                 }
 
-                /* Call the internal load function inside PG_TRY to handle elog(ERROR) */
+                /* Call the internal recovery function inside PG_TRY to handle elog(ERROR) */
                 StartTransactionCommand();
                 PG_TRY();
                 {
-                    load_lsm_index_internal(slot->lsmIndex.indexRelId, (uint32_t) i);
-                    /* load_lsm_index_internal sets valid=1 itself */
+                    recover_lsm_index_internal(slot->lsmIndex.indexRelId, (uint32_t) i);
+                    /* recover_lsm_index_internal sets valid to LSM_SLOT_WRITABLE itself */
                     CommitTransactionCommand();
                 }
                 PG_CATCH();
                 {
-                    /* Loading failed — abort transaction, mark slot as failed and reset to free */
+                    /* Recovery failed — abort transaction, mark slot as failed and reset to free */
                     AbortCurrentTransaction();
                     elog(WARNING,
-                         "[IndexLoadWorker] load_lsm_index_internal failed for index %u slot %d",
+                         "[IndexRecoveryWorker] recover_lsm_index_internal failed for index %u slot %d",
                          slot->lsmIndex.indexRelId, i);
-                    pg_atomic_write_u32(&slot->load_error, 1);
-                    pg_atomic_write_u32(&slot->valid, 0);
+                    pg_atomic_write_u32(&slot->state_error, 1);
+                    pg_atomic_write_u32(&slot->valid, (uint32) LSM_SLOT_FREE);
                     FlushErrorState();
                 }
                 PG_END_TRY();
 
                 /* Wake all backends waiting on this slot's CV */
-                ConditionVariableBroadcast(&slot->load_cv);
+                ConditionVariableBroadcast(&slot->state_cv);
             }
         } while (found_work);
     }
