@@ -327,6 +327,19 @@ public:
         }
         return main_conn;
     }
+
+    // Open a fresh connection owned by the caller. Caller must PQfinish() it.
+    // Used by background tasks (e.g. async VACUUM) that don't want to share
+    // lifecycle with the thread-local pool.
+    static PGconn* make_dedicated() {
+        PGconn* conn = PQconnectdb(conninfo.c_str());
+        if (PQstatus(conn) != CONNECTION_OK) {
+            std::cerr << "Dedicated connection failed: " << PQerrorMessage(conn) << std::endl;
+            PQfinish(conn);
+            return nullptr;
+        }
+        return conn;
+    }
 };
 
 std::string ThreadLocalConnection::conninfo;
@@ -364,6 +377,17 @@ private:
     
     // Transaction batching (only used when mixed mode is disabled)
     size_t transaction_batch_size = 0;  // 0 means disabled (each operation is independent)
+
+    // VACUUM ANALYZE every N delete steps (0 = disabled). Counts both sequential
+    // delete steps and per-step delete sub-steps recorded in mixed mode.
+    size_t vacuum_every_n_deletes = 0;
+    size_t delete_step_counter = 0;
+    // "sync"  — block the driver until VACUUM returns
+    // "async" — dispatch on a background thread with its own connection;
+    //           if a previous async VACUUM is still in flight when the next
+    //           trigger fires, the driver joins it first (back-pressure).
+    std::string vacuum_mode = "sync";
+    std::thread vacuum_thread;
 
     // Statistics structure
     struct DetailedStats {
@@ -592,6 +616,71 @@ private:
         }
     }
 
+    // Run VACUUM ANALYZE on a caller-owned connection. Closes nothing; the
+    // caller decides whether the connection is reusable (sync path uses the
+    // shared main connection; async path uses a dedicated connection).
+    void run_vacuum(PGconn* conn, size_t step_num, size_t counter_value,
+                    const char* tag) {
+        std::string sql = "VACUUM ANALYZE " + table_name;
+        std::cout << "[VACUUM] " << tag << " Running '" << sql << "' after "
+                  << counter_value << " delete step(s) (step " << step_num
+                  << ")..." << std::endl;
+
+        Timer vac_timer;
+        PGresult* res = PQexec(conn, sql.c_str());
+        double elapsed = vac_timer.elapsed_seconds();
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::cerr << "[VACUUM] " << tag << " Failed: "
+                      << PQerrorMessage(conn) << std::endl;
+        } else {
+            std::cout << "[VACUUM] " << tag << " Completed in " << std::fixed
+                      << std::setprecision(2) << elapsed << "s" << std::endl;
+        }
+        PQclear(res);
+    }
+
+    // Trigger VACUUM ANALYZE when delete-step counter hits a multiple of N.
+    // Dispatches synchronously or asynchronously based on vacuum_mode.
+    void maybe_vacuum_after_delete(size_t step_num) {
+        if (vacuum_every_n_deletes == 0) return;
+
+        delete_step_counter++;
+        if (delete_step_counter % vacuum_every_n_deletes != 0) return;
+
+        size_t counter_value = delete_step_counter;
+
+        if (vacuum_mode == "async") {
+            // Back-pressure: if a prior async VACUUM is still running, wait
+            // for it before starting another. Keeps "every N deletes"
+            // semantics without piling up concurrent VACUUMs.
+            if (vacuum_thread.joinable()) {
+                std::cout << "[VACUUM] (async) Previous VACUUM still in flight,"
+                             " waiting before dispatching next..." << std::endl;
+                vacuum_thread.join();
+            }
+            vacuum_thread = std::thread([this, step_num, counter_value]() {
+                PGconn* conn = ThreadLocalConnection::make_dedicated();
+                if (!conn) {
+                    std::cerr << "[VACUUM] (async) No connection, skipping"
+                              << std::endl;
+                    return;
+                }
+                run_vacuum(conn, step_num, counter_value, "(async)");
+                PQfinish(conn);
+            });
+            return;
+        }
+
+        // Sync path
+        PGconn* conn = ThreadLocalConnection::get_main();
+        if (!conn) {
+            std::cerr << "[VACUUM] No main connection available, skipping"
+                      << std::endl;
+            return;
+        }
+        run_vacuum(conn, step_num, counter_value, "(sync)");
+    }
+
 public:
     PGVectorSlidingWindowTest(size_t dimension,
                                const std::string& gt_directory,
@@ -612,7 +701,9 @@ public:
                                bool skip_recall = false,
                                size_t txn_batch_size = 0,
                                const std::string& table_name_param = "vectors",
-                               size_t dataset_offset_param = 0)
+                               size_t dataset_offset_param = 0,
+                               size_t vacuum_every_n_deletes_param = 0,
+                               const std::string& vacuum_mode_param = "sync")
         : dim(dimension), table_name(table_name_param), gt_dir(gt_directory),
           dataset_offset(dataset_offset_param),
           index_type(index_type_param),
@@ -620,7 +711,9 @@ public:
           ivfflat_lists(ivfflat_lists_param), ivfflat_probes(ivfflat_probes_param),
           simulate_crash(enable_crash_simulation), crash_target_step(crash_step),
           crash_target_operation(crash_operation), db_host(db_host), db_port(db_port),
-          skip_recall_computation(skip_recall), transaction_batch_size(txn_batch_size) {
+          skip_recall_computation(skip_recall), transaction_batch_size(txn_batch_size),
+          vacuum_every_n_deletes(vacuum_every_n_deletes_param),
+          vacuum_mode(vacuum_mode_param) {
         
         // Initialize connection manager
         ThreadLocalConnection::init(
@@ -633,6 +726,13 @@ public:
     }
 
     ~PGVectorSlidingWindowTest() {
+        // Wait for any in-flight async VACUUM before tearing down connections
+        // — the thread captures `this`, so member references must stay valid.
+        if (vacuum_thread.joinable()) {
+            std::cout << "[VACUUM] Waiting for in-flight async VACUUM to finish..."
+                      << std::endl;
+            vacuum_thread.join();
+        }
         ThreadLocalConnection::cleanup();
     }
 
@@ -1024,6 +1124,8 @@ public:
         stats.operations.push_back(op_stats);
         updateCategoryStats(stats.delete_stats, op_stats);
 
+        maybe_vacuum_after_delete(step_num);
+
         return {
             {"successful", (double)successful_deletes},
             {"failed", (double)failed_deletes},
@@ -1068,11 +1170,20 @@ public:
         }
         std::cout << std::endl;
 
+        // Canonical recall@k = |returned ∩ true_topk| / k, averaged across queries
+        // (equivalently, sum-of-hits / (num_queries * k)). Counting per returned
+        // row would compute precision-over-returned, which masks any truncation
+        // when the executor surfaces fewer than k visible rows (e.g. tombstones
+        // filtered at heap level between vacuum cycles).
         size_t total_correct = 0;
-        size_t total_total = 0;
-
+        // Truncation counters: how many queries returned < k visible rows, and
+        // the sum of their returned-row counts (for the post-search hint).
+        size_t truncated_count = 0;
+        size_t truncated_returned_sum = 0;
         // Fine-grained parallel search
-        #pragma omp parallel for num_threads(num_threads) reduction(+:total_correct,total_total) schedule(dynamic, 1)
+        #pragma omp parallel for num_threads(num_threads) \
+            reduction(+:total_correct,truncated_count,truncated_returned_sum) \
+            schedule(dynamic, 1)
         for (size_t q = 0; q < num_queries; q++) {
             PGconn* conn = ThreadLocalConnection::get();
             if (!conn) continue;
@@ -1109,23 +1220,32 @@ public:
             
             if (PQresultStatus(res) == PGRES_TUPLES_OK && !skip_recall) {
                 int nrows = PQntuples(res);
-                
-                // Calculate recall
-                std::unordered_set<int> gt_set(gt[q].begin(), gt[q].end());
+                if (nrows < (int)k) {
+                    truncated_count++;
+                    truncated_returned_sum += (size_t)nrows;
+                }
+                // Compare against the true top-k (gt[q] is k-wide from load_gt_npy,
+                // but use min(k, gt[q].size()) defensively).
+                std::unordered_set<int> gt_set(
+                    gt[q].begin(),
+                    gt[q].begin() + std::min((size_t)k, gt[q].size()));
                 for (int i = 0; i < nrows; i++) {
                     int id = std::stoi(PQgetvalue(res, i, 0));
                     if (gt_set.find(id) != gt_set.end()) {
                         total_correct++;
                     }
-                    total_total++;
                 }
+                // Denominator (num_queries * k) is fixed; failed/skipped queries
+                // contribute 0 hits (so they pull recall down — same convention as
+                // replica_recall_eval), which is why we don't accumulate it here.
             }
             
             PQclear(res);
         }
 
         double elapsed = timer.elapsed_seconds();
-        double recall = skip_recall ? 0.0 : (total_total > 0 ? (double)total_correct / (double)total_total : 0.0);
+        double recall = skip_recall ? 0.0
+            : (num_queries > 0 ? (double)total_correct / ((double)num_queries * (double)k) : 0.0);
         double qps = num_queries / elapsed;
         double qps_per_thread = qps / num_threads;
 
@@ -1135,6 +1255,15 @@ public:
         }
         std::cout << "\n  QPS: " << std::fixed << std::setprecision(0) << qps
                   << " (total), " << qps_per_thread << " q/s/thread" << std::endl;
+        if (!skip_recall && truncated_count > 0) {
+            double avg_returned = (double)truncated_returned_sum / (double)truncated_count;
+            std::cout << "  Hint: " << truncated_count << "/" << num_queries
+                      << " queries returned fewer than k=" << k
+                      << " rows (avg returned in truncated: "
+                      << std::fixed << std::setprecision(1) << avg_returned
+                      << ") — likely tombstones filtered at heap level; VACUUM may help."
+                      << std::endl;
+        }
 
         // Record statistics
         DetailedStats::OperationStats op_stats;
@@ -1155,7 +1284,7 @@ public:
         return {
             {"recall", recall},
             {"total_correct", (double)total_correct},
-            {"total_total", (double)total_total},
+            {"total_total", (double)num_queries * (double)k},   // denominator of recall@k
             {"time", elapsed}
         };
     }
@@ -1572,6 +1701,7 @@ public:
                             updateCategoryStats(stats.insert_stats, op_stats);
                         } else if (step_info.op == "delete") {
                             updateCategoryStats(stats.delete_stats, op_stats);
+                            maybe_vacuum_after_delete(step_info.step_num);
                         } else if (step_info.op == "search") {
                             updateCategoryStats(stats.search_stats, op_stats);
                         }
@@ -1728,6 +1858,9 @@ void print_usage(const char* prog_name) {
     std::cerr << "  --skip-recall               Skip recall computation for search operations (default: false)" << std::endl;
     std::cerr << "  --transaction-batch-size <n> Group n operations per transaction (default: 0, disabled)" << std::endl;
     std::cerr << "                               Only applies when mixed mode is NOT enabled" << std::endl;
+    std::cerr << "  --vacuum-every-n-deletes <n> Run VACUUM ANALYZE after every n delete steps (default: 0, disabled)" << std::endl;
+    std::cerr << "  --vacuum-mode <sync|async>  VACUUM dispatch: sync blocks the driver, async runs on a background" << std::endl;
+    std::cerr << "                               thread with its own connection (default: sync)" << std::endl;
 }
 
 int main(int argc, char** argv) {
@@ -1747,6 +1880,8 @@ int main(int argc, char** argv) {
     bool simulate_crash = false;
     bool skip_recall = false;
     size_t transaction_batch_size = 0;
+    size_t vacuum_every_n_deletes = 0;
+    std::string vacuum_mode = "sync";
 
     // Parse command line arguments
     for (int i = 2; i < argc; i++) {
@@ -1809,6 +1944,14 @@ int main(int argc, char** argv) {
             skip_recall = true;
         } else if (arg == "--transaction-batch-size" && i + 1 < argc) {
             transaction_batch_size = (size_t)std::atoi(argv[++i]);
+        } else if (arg == "--vacuum-every-n-deletes" && i + 1 < argc) {
+            vacuum_every_n_deletes = (size_t)std::atoi(argv[++i]);
+        } else if (arg == "--vacuum-mode" && i + 1 < argc) {
+            vacuum_mode = argv[++i];
+            if (vacuum_mode != "sync" && vacuum_mode != "async") {
+                std::cerr << "Error: --vacuum-mode must be 'sync' or 'async'" << std::endl;
+                return 1;
+            }
         } else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             print_usage(argv[0]);
@@ -1869,8 +2012,12 @@ int main(int argc, char** argv) {
         std::cout << "  Skip recall computation: ENABLED" << std::endl;
     }
     if (transaction_batch_size > 0) {
-        std::cout << "  Transaction batching: enabled (" << transaction_batch_size 
+        std::cout << "  Transaction batching: enabled (" << transaction_batch_size
                   << " operations per transaction)" << std::endl;
+    }
+    if (vacuum_every_n_deletes > 0) {
+        std::cout << "  VACUUM ANALYZE every " << vacuum_every_n_deletes
+                  << " delete step(s) (" << vacuum_mode << ")" << std::endl;
     }
     std::cout << "  Table name: " << config.TABLE_NAME << std::endl;
     if (config.DATASET_OFFSET > 0) {
@@ -1933,7 +2080,9 @@ int main(int argc, char** argv) {
             skip_recall,
             transaction_batch_size,
             config.TABLE_NAME,
-            config.DATASET_OFFSET
+            config.DATASET_OFFSET,
+            vacuum_every_n_deletes,
+            vacuum_mode
         );
 
         // Execute test

@@ -462,10 +462,10 @@ int main(int argc, char** argv) {
 }
 
 
-// ./compute_ground_truth
-//   --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs
-//   --queries /ssd_root/dataset/turing10m/msturing-query.fvecs
-//   --runbook msturing-10M_slidingwindow_runbook.yaml
-//   --dataset-name msturing-10M
-//   --gt-dir /ssd_root/liu4127/msturing_runbook_gt
+// ./compute_ground_truth \
+//   --dataset /ssd_root/dataset/turing10m/msturing-10M.fvecs \
+//   --queries /ssd_root/dataset/turing10m/msturing-query.fvecs \
+//   --runbook msturing-10M_slidingwindow_runbook.yaml \
+//   --dataset-name msturing-10M \
+//   --gt-dir /ssd_root/liu4127/msturing_runbook_gt \
 //   --num-threads 32

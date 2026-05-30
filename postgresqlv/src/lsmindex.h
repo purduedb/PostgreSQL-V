@@ -72,7 +72,7 @@ typedef enum IndexType
 typedef struct ConcurrentMemTableData {
     // VectorId start_vid;
     Oid rel;
-    SegmentId memtable_id;
+    SegmentId memtable_id;                                        
     uint32 capacity;
     pg_atomic_uint32 current_size; 
     pg_atomic_uint32 ready_cnt; 

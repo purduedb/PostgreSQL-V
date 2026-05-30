@@ -96,6 +96,7 @@ void ConcurrentVectorSearchOnSegments(
     SegmentSearchInfo* segments,
     uint32_t segment_count,
     const float* query_vector,
+    int dim,
     int topk,
     int efs_nprobe,
     VectorSearchResult result,

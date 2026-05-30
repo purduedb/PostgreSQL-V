@@ -1521,8 +1521,16 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
                 res_dist[i] = ctx->final_pairs[i].distance;
                 res_id[i] = ctx->final_pairs[i].id;
             }
+
+            // Publish the result: make result_count + payload visible, THEN
+            // flip status to 1.  The backend's vector_search_get_result()
+            // spins on status; without this it could wake on an unrelated
+            // latch, read an empty/stale slot, and silently drop the segment
+            // portion of the search (recall collapse under load).
+            std::atomic_thread_fence(std::memory_order_release);
+            result->status = 1;
         }
-        
+
         // Set latch to notify the client backend
         if (ctx->result_info && ctx->result_info->client_proc) {
             SetLatch(&ctx->result_info->client_proc->procLatch);
@@ -1539,6 +1547,9 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
         }
         if (ctx->segments) {
             free(ctx->segments);
+        }
+        if (ctx->query_vector) {
+            free((void*) ctx->query_vector);  // ctx-owned copy of the query
         }
         free(ctx);
     }
@@ -1560,10 +1571,11 @@ ConcurrentVectorSearchOnSegments(
     SegmentSearchInfo* segments,
     uint32_t segment_count,
     const float* query_vector,
+    int dim,
     int topk,
     int efs_nprobe,
     VectorSearchResult result,
-    PGPROC* client_proc,    
+    PGPROC* client_proc,
     FlushedSegmentPool* pool) {
     // Get the dedicated outer search executor (separate from Knowhere's internal pool)
     auto& exec = GetPgOuterSearchExecutor();
@@ -1572,7 +1584,16 @@ ConcurrentVectorSearchOnSegments(
     ConcurrentSearchContext* ctx = (ConcurrentSearchContext*) 
         malloc(sizeof(ConcurrentSearchContext));
     
-    ctx->query_vector = query_vector;
+    // Copy the query vector into ctx-owned memory.  The caller passes a
+    // pointer into a single static worker scratch buffer that is reused for
+    // the next search task; the folly threads below read the vector
+    // asynchronously after this function returns, so holding the caller's
+    // pointer would race a concurrent search overwriting the buffer.
+    {
+        float* query_copy = (float*) malloc(sizeof(float) * (size_t) dim);
+        memcpy(query_copy, query_vector, sizeof(float) * (size_t) dim);
+        ctx->query_vector = query_copy;
+    }
     ctx->topk = topk;
     ctx->efs_nprobe = efs_nprobe;
     ctx->segment_count = segment_count;

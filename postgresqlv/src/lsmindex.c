@@ -1733,6 +1733,51 @@ merge_top_k(DistancePair *pairs_1, DistancePair *pairs_2, int num_1, int num_2, 
     return k;
 }
 
+/*
+ * Same streaming top-K merge as merge_top_k, but drops duplicate TIDs:
+ * before appending a candidate, linearly scan the already-output prefix and
+ * skip if the id was already emitted. O(top_k^2) worst case; fine for the
+ * typical k=10..100 search width.
+ *
+ * Needed at the memtable+segment merge in search_lsm_index because a merged
+ * segment whose [start..end] range partially overlaps the backend's memtable
+ * snapshot is now searched on both sides (the worker because the segment is
+ * not fully covered, the backend because some of its sids still belong to
+ * sealed memtables). The overlapping slice produces identical TIDs from
+ * both sources; this dedup keeps each TID exactly once.
+ */
+static int
+merge_top_k_dedup(DistancePair *pairs_1, DistancePair *pairs_2,
+                  int num_1, int num_2, int top_k, DistancePair *merge_pair)
+{
+    int i = 0, j = 0, k = 0;
+
+    while (k < top_k && (i < num_1 || j < num_2))
+    {
+        DistancePair candidate;
+        bool dup = false;
+        int m;
+
+        if (i < num_1 && (j >= num_2 || pairs_1[i].distance <= pairs_2[j].distance))
+            candidate = pairs_1[i++];
+        else
+            candidate = pairs_2[j++];
+
+        for (m = 0; m < k; m++)
+        {
+            if (merge_pair[m].id == candidate.id)
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup)
+            merge_pair[k++] = candidate;
+    }
+
+    return k;
+}
+
 // Use BruteForceSearch for contiguous ready range + ComputeDistance for remaining slots
 static int
 search_memtable_common(ConcurrentMemTable mt, const void *query_vector, int k, DistancePair *top_k_pairs, bool check_ready)
@@ -1897,10 +1942,33 @@ search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs)
 
     // step 1. get a snapshot of the current memtables
     LSMSnapshot lsm_snapshot;
-    
-    LWLockAcquire(lsm->mt_lock, LW_SHARED);
 
-    lsm_snapshot.gidx = lsm->growing_memtable_idx;
+    /*
+     * [DIAG-H1] insert_lsm_index / bulk_delete_lsm_index both treat
+     * MT_IDX_ROTATING (-2) and MT_IDX_INVALID (-1) as a transient state and
+     * spin until growing_memtable_idx becomes a valid slot index. The search
+     * path previously dereferenced MT_FROM_SLOTIDX(gidx) and indexed
+     * SharedMemtableBuffer->slots[gidx] unconditionally, which is an OOB
+     * read/atomic-write into shared memory whenever rotate_growing_memtable
+     * is between line ~1583 (set ROTATING, release lock) and line ~1593
+     * (set new idx). Spin-retry to match the insert/vacuum paths and log
+     * every occurrence so we can correlate with the recall drop.
+     */
+    for (;;)
+    {
+        LWLockAcquire(lsm->mt_lock, LW_SHARED);
+
+        lsm_snapshot.gidx = lsm->growing_memtable_idx;
+        if (lsm_snapshot.gidx >= 0 && lsm_snapshot.gidx < MEMTABLE_BUF_SIZE)
+            break;  /* valid slot, proceed under the held SHARED lock */
+
+        LWLockRelease(lsm->mt_lock);
+        fprintf(stderr,
+                "[search_lsm_index][DIAG-H1] hit transient gidx=%d (ROTATING=-2/INVALID=-1), retrying\n",
+                lsm_snapshot.gidx);
+        pg_usleep(50);
+    }
+
     lsm_snapshot.gmt_id = MT_FROM_SLOTIDX(lsm_snapshot.gidx)->memtable_id;
     pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[lsm_snapshot.gidx].ref_count, 1);
     lsm_snapshot.scount = lsm->memtable_count;
@@ -1952,8 +2020,11 @@ search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs)
         segment_pairs[i].distance = res_dist[i];
     }
     // merge segment_pairs into pair_1
+    // dedup by TID: a merged segment that partially overlaps the snapshot is
+    // now searched on both sides, so the overlapping slice yields identical
+    // TIDs from memtable and segment results.
     final_pairs = palloc(sizeof(DistancePair) * k);
-    int final_num = merge_top_k(pair_1, segment_pairs, num_1, vs_result->result_count, k, final_pairs);
+    int final_num = merge_top_k_dedup(pair_1, segment_pairs, num_1, vs_result->result_count, k, final_pairs);
     pfree(pair_1);
     pfree(segment_pairs);
 

@@ -1,10 +1,25 @@
-# Object files
+# ---- Editor / IDE / tooling (machine-generated) ----
+.vscode/
+.clangd
+.cache/
+compile_commands.json
+
+# ---- Python (test/benchmark scripts) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- C/C++ build artifacts (root-level safety net; pgvector/ has its own) ----
 *.o
+*.so
+*.a
+*.bc
+*.dylib
 *.obj
 
-# Executable files
-*.out
-*.exe
-
-# Editor/IDE settings
-.vscode/
+# ---- Local env / scratch ----
+*.log
+*.tmp
+.DS_Store

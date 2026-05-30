@@ -154,7 +154,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		// conduct hnsw search
 		Vector *query_vector = (Vector *) PointerGetDatum(value);
 		// FIXME: how are we going to set top_k?
-		int top_k = 100;
+		int top_k = 150;
 
 		so->topkTuples = search_lsm_index(scan->indexRelation, query_vector->x, top_k, hnsw_ef_search);
 		so->topkTuplesIdx = 0;	

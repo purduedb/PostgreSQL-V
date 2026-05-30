@@ -31,9 +31,8 @@ vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int top
     }
 
     slot = get_ring_buffer_slot();
-    // TODO: for debugging
-    elog(DEBUG1, "[vector_search_send] enqueued search: index=%u dim=%d topk=%d slot=%d",
-         index_oid, dim, topk, slot);
+    // elog(DEBUG1, "[vector_search_send] enqueued search: index=%u dim=%d topk=%d slot=%d",
+    //      index_oid, dim, topk, slot);
     task_slot = vs_task_at(slot);
     task_slot->type = VectorSearchTaskType;
     task_slot->dsm_size = 0;
@@ -50,6 +49,17 @@ vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int top
     vec = vs_search_task_vector_at(task);
     memcpy(vec, query, sizeof(float) * (Size)task->vector_dim);
 
+    /*
+     * Publish "result not ready" before the worker can possibly run.  The
+     * matching loop in vector_search_get_result() spins on status and uses
+     * the latch only as a wakeup hint, so a spurious MyLatch set (sinval
+     * catchup, procsignal, ...) can no longer make the backend read a
+     * stale/half-written result slot.  Written under the ring lock:
+     * LWLockRelease has release semantics, ordering this store before the
+     * worker dequeues the task under the same lock.
+     */
+    vs_search_result_at(MyProcNumber)->status = 0;
+
     LWLockRelease(ring_buffer_shmem->lock);
 
     notify_worker();
@@ -58,29 +68,40 @@ vector_search_send(Oid index_oid, float *query, int dim, Size elem_size, int top
 VectorSearchResult
 vector_search_get_result(void)
 {
-    int rc;
+    VectorSearchResult result = vs_search_result_at(MyProcNumber);
 
+    /*
+     * Wait until the worker (or its last-finishing folly thread) flips
+     * status to 1.  A bare latch wakeup cannot be trusted: MyLatch is the
+     * backend's shared process latch and PostgreSQL sets it for many
+     * unrelated reasons whose traffic scales with backend count.  We use
+     * reset-before-check to avoid a lost wakeup: if the worker sets
+     * status + latch between our ResetLatch and WaitLatch, WaitLatch
+     * returns immediately and the next iteration observes status == 1.
+     */
     for (;;)
     {
+        int rc;
+
+        ResetLatch(MyLatch);
+
+        if (result->status == 1)
+        {
+            pg_read_barrier();  /* observe result_count + payload after status */
+            break;
+        }
+
         rc = WaitLatch(MyLatch,
                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
                        WAIT_LATCH_TIMEOUT_MS,
                        0);
-        ResetLatch(MyLatch);
 
         if (rc & WL_POSTMASTER_DEATH)
             ereport(ERROR, (errmsg("[vector_search_get_result] postmaster died")));
-
-        if (rc & WL_LATCH_SET)
-        {
-            // TODO: for debugging
-            elog(DEBUG1, "[vector_search_get_result] result received");
-            break;
-        }
-        /* WL_TIMEOUT: keep waiting. */
+        /* WL_LATCH_SET / WL_TIMEOUT: loop and re-check status. */
     }
 
-    return vs_search_result_at(MyProcNumber);
+    return result;
 }
 
 /*

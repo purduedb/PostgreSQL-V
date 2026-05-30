@@ -2151,29 +2151,65 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
     // Note: this should be freed after the search is complete by the last-finisher thread, but not in this function
     SegmentSearchInfo *segments_to_search = malloc(sizeof(SegmentSearchInfo) * segment_count);
     uint32_t search_count = 0;
-    
+
+    /*
+     * [DIAG] per-call classification counters mirroring the historical
+     * [vec_search] log line in logfile_try1. State-change-only emission to
+     * keep volume manageable across the 300 search steps × 10K queries.
+     *
+     *   multi   — # segments with start_sid != end_sid (i.e. produced by
+     *             merge). Tells us how aggressively the merge worker has
+     *             been running.
+     *   partial — # segments where SOME sids are covered by the snapshot
+     *             and SOME aren't. Hypothesis H2 (merge took a stale
+     *             bitmap snapshot) should show partial>0 around the
+     *             recall-collapse steps.
+     */
+    int multi_count = 0;
+    int partial_count = 0;
+
     for (uint32_t i = 0; i < segment_count; i++) {
         uint32_t seg_idx = segment_indices[i];
         FlushedSegment segment = &pool->flushed_segments[seg_idx];
-        
-        // Check if this segment should be skipped (if its segment id is in the snapshot)
-        bool found = false;
-        for (int j = 0; j < task->snapshot.scount; j++)
+        /*
+         * Skip the segment only if every sid in [start..end] is already
+         * covered by the backend's memtable snapshot. Partial overlap (a
+         * merged segment whose range contains both snapshot memtables and
+         * data the backend never saw) means the segment must be searched;
+         * duplicate TIDs from the overlapping slice are removed by
+         * merge_top_k_dedup at the final memtable+segment merge.
+         */
+        bool fully_covered = true;
+        bool any_covered = false;
+
+        if (segment->segment_id_start != segment->segment_id_end)
+            multi_count++;
+        for (SegmentId sid = segment->segment_id_start;
+             sid <= segment->segment_id_end;
+             sid++)
         {
-            if (task->snapshot.smt_ids[j] <= segment->segment_id_end &&
-                task->snapshot.smt_ids[j] >= segment->segment_id_start)
+            bool sid_covered = (sid == task->snapshot.gmt_id);
+            if (!sid_covered)
             {
-                // FIXME: how is this guaranteed?
-                Assert(segment->segment_id_end == segment->segment_id_start);
-                found = true;
-                break;
+                for (int j = 0; j < task->snapshot.scount; j++)
+                {
+                    if ((SegmentId) task->snapshot.smt_ids[j] == sid)
+                    {
+                        sid_covered = true;
+                        break;
+                    }
+                }
             }
+            if (sid_covered)
+                any_covered = true;
+            else
+                fully_covered = false;
         }
-        found = found || (task->snapshot.gmt_id <= segment->segment_id_end &&
-                        task->snapshot.gmt_id >= segment->segment_id_start);
-        
-        if (!found)
-        {   
+        if (any_covered && !fully_covered)
+            partial_count++;
+
+        if (!fully_covered)
+        {
             // This segment needs to be searched - add it to the search list
             segments_to_search[search_count].index_type = segment->index_type;
             segments_to_search[search_count].index_ptr = segment->index_ptr;
@@ -2183,8 +2219,42 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
             segments_to_search[search_count].segment_idx = seg_idx;
             search_count++;
         } else {
-            // Skip this segment - decrement reference count
+            // Fully covered by backend's memtable search - skip and release ref
             decrement_flushed_segment_ref_count(pool, seg_idx);
+        }
+    }
+
+    /*
+     * [DIAG] Emit a [vec_search] line on state change. Per-process static
+     * (worker thread is single-threaded for this code path), so this fires
+     * once per distinct (gmt, scnt, pool, searched, skipped, multi, partial)
+     * tuple, not per query. State changes track flush/merge events as they
+     * happen, which lets us correlate with the recall curve.
+     */
+    {
+        static int last_gmt = -1, last_scnt = -1;
+        static uint32_t last_pool = (uint32_t) -1, last_search = (uint32_t) -1;
+        static int last_multi = -1, last_partial = -1;
+        uint32_t skipped = segment_count - search_count;
+        if ((int) task->snapshot.gmt_id != last_gmt ||
+            task->snapshot.scount      != last_scnt ||
+            segment_count              != last_pool ||
+            search_count               != last_search ||
+            multi_count                != last_multi ||
+            partial_count              != last_partial)
+        {
+            fprintf(stderr,
+                    "[vec_search] pid=%d gmt=%d scnt=%d pool=%u searched=%u skipped=%u multi=%d partial=%d\n",
+                    task->backend_pgprocno,
+                    task->snapshot.gmt_id, task->snapshot.scount,
+                    segment_count, search_count, skipped,
+                    multi_count, partial_count);
+            last_gmt = task->snapshot.gmt_id;
+            last_scnt = task->snapshot.scount;
+            last_pool = segment_count;
+            last_search = search_count;
+            last_multi = multi_count;
+            last_partial = partial_count;
         }
     }
 
@@ -2201,6 +2271,7 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
             segments_to_search,
             search_count,
             vs_search_task_vector_at(task),
+            (int) task->vector_dim,
             task->topk,
             task->efs_nprobe,
             result,
@@ -2211,8 +2282,13 @@ vector_search(VectorSearchTask task, VectorSearchResult result)
         // Note: Reference counts will be decremented by the last-finisher thread
         // after all searches complete. Do not decrement them here.
     } else {
-        // No segments to search - set empty result and notify client
+        // No segments to search - set empty result and notify client.
+        // Publish result_count before flipping status so the backend's
+        // status-gated wait in vector_search_get_result() doesn't read a
+        // stale slot.
         result->result_count = 0;
+        pg_write_barrier();
+        result->status = 1;
         SetLatch(&client->procLatch);
     }
 }
